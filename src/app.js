@@ -1665,8 +1665,6 @@ async function initDatabase() {
   await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_messages_thread_created ON messages(thread_id, created_at)");
   await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_message_threads_updated_at ON message_threads(updated_at)");
   await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_auth_roster_role_department ON auth_roster(role, department)");
-  await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_department_checklists_department ON department_checklists(department)");
-  await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_student_checklist_progress_username ON student_checklist_progress(username)");
 
   await run(`
     CREATE TABLE IF NOT EXISTS user_profiles (
@@ -1716,6 +1714,9 @@ async function initDatabase() {
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   `);
+
+  await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_department_checklists_department ON department_checklists(department)");
+  await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_student_checklist_progress_username ON student_checklist_progress(username)");
 
   const userColumns = await all("PRAGMA table_info(users)");
   if (!userColumns.some((column) => column.name === "role")) {
