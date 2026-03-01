@@ -31,8 +31,9 @@
     <main class="container">
       <section class="page-title">
         <h1>Roster CSV Import</h1>
-        <p>Upload CSV files to provision student and lecturer accounts.</p>
-        <p>Required columns: students (matric_number,surname,name), lecturers (lecturer_code,surname,name).</p>
+        <p>Upload CSV files to provision student, lecturer, and departmental checklist data.</p>
+        <p>Required columns: students (matric_number,surname,name,department), lecturers (teacher_code,surname,name,department).</p>
+        <p>Checklist CSV required columns: department,task (optional: order).</p>
         <p>The <code>name</code> column powers the greeting on the student home page and now also the lecturer dashboard.</p>
       </section>
 
@@ -87,6 +88,33 @@
                 </tr>
               </thead>
               <tbody id="lecturerImportRows"></tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="card">
+          <h2>Import Department Checklist</h2>
+          <p id="checklistImportStatus" class="auth-subtitle"></p>
+          <form id="checklistImportForm" class="auth-form">
+            <label for="checklistCsv">Checklist CSV File</label>
+            <input id="checklistCsv" name="checklistCsv" type="file" accept=".csv,text/csv" required />
+            <div class="cta-row">
+              <button id="checklistPreviewButton" type="button" class="btn btn-secondary">Preview Checklist</button>
+              <button type="submit" class="btn">Import Checklist</button>
+              <button id="checklistDownloadReport" type="button" class="btn" hidden>Download Report</button>
+            </div>
+          </form>
+          <div class="table-wrap" style="margin-top: 0.75rem;">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Row</th>
+                  <th>Identifier</th>
+                  <th>Status</th>
+                  <th>Message</th>
+                </tr>
+              </thead>
+              <tbody id="checklistImportRows"></tbody>
             </table>
           </div>
         </article>

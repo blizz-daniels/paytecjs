@@ -40,21 +40,12 @@ window.addEventListener("DOMContentLoaded", () => {
       </div>
       <p class="profile-panel__status" data-profile-status aria-live="polite"></p>
       <div class="profile-panel__quick-links">
-        <a href="/">Home</a>
-        <a href="/notifications.html">Notifications</a>
-        <a href="/handouts.html">Handouts</a>
-        <a href="/payments.html">Payments</a>
-        <a href="/messages">Messages</a>
+        <a href="/profile" class="btn btn-secondary profile-panel__profile-link">View My Profile</a>
         <form method="post" action="/logout" class="logout-form">
           <input type="hidden" name="_csrf" value="" />
           <button type="submit" class="logout-btn">Log out</button>
         </form>
       </div>
-      <form id="profileDisplayForm" class="profile-panel__form">
-        <label for="profileDisplayName">Display name</label>
-        <input id="profileDisplayName" name="displayName" type="text" maxlength="60" placeholder="How should we call you?" />
-        <button type="submit" class="btn">Save name</button>
-      </form>
       <form id="profileEmailForm" class="profile-panel__form">
         <label for="profileEmailAddress">Email address (used for Paystack)</label>
         <input
@@ -81,8 +72,6 @@ window.addEventListener("DOMContentLoaded", () => {
   const profileRoleEl = panel.querySelector("[data-profile-role]");
   const profileImageEl = panel.querySelector("[data-profile-image]");
   const profileInitialEl = panel.querySelector("[data-profile-initial]");
-  const displayNameInput = panel.querySelector("#profileDisplayName");
-  const displayForm = panel.querySelector("#profileDisplayForm");
   const emailInput = panel.querySelector("#profileEmailAddress");
   const emailForm = panel.querySelector("#profileEmailForm");
   const avatarForm = panel.querySelector("#profileAvatarForm");
@@ -148,9 +137,6 @@ window.addEventListener("DOMContentLoaded", () => {
           : "Member";
       profileRoleEl.textContent = roleText;
     }
-    if (displayNameInput) {
-      displayNameInput.value = displayName;
-    }
     if (emailInput) {
       emailInput.value = profile.email || "";
     }
@@ -208,49 +194,6 @@ window.addEventListener("DOMContentLoaded", () => {
       closePanel();
     }
   });
-
-  if (displayForm) {
-    displayForm.addEventListener("submit", async (event) => {
-      event.preventDefault();
-      const value = displayNameInput?.value?.trim() || "";
-      if (!value) {
-        setStatus("Display name cannot be empty.", true);
-        if (window.showToast) {
-          window.showToast("Display name cannot be empty.", { type: "error" });
-        }
-        return;
-      }
-      const submitButton = displayForm.querySelector('button[type="submit"]');
-      const loadingToast = window.showToast
-        ? window.showToast("Saving profile name...", { type: "loading", sticky: true })
-        : null;
-      setButtonBusy(submitButton, true, "Saving...");
-      setStatus("Saving display name...", false);
-      try {
-        const response = await fetch("/api/profile", {
-          method: "POST",
-          credentials: "same-origin",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ displayName: value }),
-        });
-        const payload = await response.json();
-        if (!response.ok) {
-          throw new Error(payload.error || "Could not save your name.");
-        }
-        await loadProfile({ showStatus: true });
-      } catch (err) {
-        setStatus(err?.message || "Could not save display name.", true);
-        if (window.showToast) {
-          window.showToast(err?.message || "Could not save display name.", { type: "error" });
-        }
-      } finally {
-        setButtonBusy(submitButton, false, "");
-        if (loadingToast) {
-          loadingToast.close();
-        }
-      }
-    });
-  }
 
   if (avatarForm) {
     avatarForm.addEventListener("submit", async (event) => {

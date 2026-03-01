@@ -2,6 +2,7 @@ function registerAdminImportRoutes(app, deps) {
   const {
     requireAdmin,
     processRosterCsv,
+    processDepartmentChecklistCsv,
   } = deps;
 
   app.post("/api/admin/import/students", requireAdmin, async (req, res) => {
@@ -105,6 +106,52 @@ function registerAdminImportRoutes(app, deps) {
       }
     }
   );
+
+  app.post("/api/admin/import/checklists", requireAdmin, async (req, res) => {
+    const csvText = String(req.body.csvText || "");
+    if (!csvText.trim()) {
+      return res.status(400).json({ error: "Checklist CSV is required." });
+    }
+
+    try {
+      const result = await processDepartmentChecklistCsv(csvText, {
+        sourceName: "admin-upload-checklists.csv",
+        actorUsername: req.session?.user?.username || "admin",
+        applyChanges: true,
+      });
+      return res.status(200).json({
+        ok: true,
+        summary: result.summary,
+        rows: result.rows,
+        reportCsv: result.reportCsv,
+      });
+    } catch (err) {
+      return res.status(400).json({ error: err.message || "Could not import checklist CSV." });
+    }
+  });
+
+  app.post("/api/admin/import/checklists/preview", requireAdmin, async (req, res) => {
+    const csvText = String(req.body.csvText || "");
+    if (!csvText.trim()) {
+      return res.status(400).json({ error: "Checklist CSV is required." });
+    }
+
+    try {
+      const result = await processDepartmentChecklistCsv(csvText, {
+        sourceName: "admin-preview-checklists.csv",
+        actorUsername: req.session?.user?.username || "admin",
+        applyChanges: false,
+      });
+      return res.status(200).json({
+        ok: true,
+        summary: result.summary,
+        rows: result.rows,
+        reportCsv: result.reportCsv,
+      });
+    } catch (err) {
+      return res.status(400).json({ error: err.message || "Could not preview checklist CSV." });
+    }
+  });
 }
 
 module.exports = {

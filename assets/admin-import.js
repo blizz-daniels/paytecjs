@@ -227,3 +227,15 @@ bindImportSection({
   previewEndpoint: "/api/admin/import/lecturers/preview",
   importEndpoint: "/api/admin/import/lecturers",
 });
+
+bindImportSection({
+  role: "checklists",
+  formId: "checklistImportForm",
+  inputId: "checklistCsv",
+  statusId: "checklistImportStatus",
+  rowsId: "checklistImportRows",
+  previewButtonId: "checklistPreviewButton",
+  reportButtonId: "checklistDownloadReport",
+  previewEndpoint: "/api/admin/import/checklists/preview",
+  importEndpoint: "/api/admin/import/checklists",
+});

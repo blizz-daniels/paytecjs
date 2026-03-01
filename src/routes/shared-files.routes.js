@@ -14,20 +14,31 @@ function registerSharedFileRoutes(app, deps) {
     removeStoredContentFile,
     isValidHttpUrl,
     isValidLocalContentUrl,
+    getSessionUserDepartment,
+    departmentScopeMatchesStudent,
+    resolveContentTargetDepartment,
   } = deps;
 
   app.get("/api/shared-files", requireAuth, async (req, res) => {
     try {
       const rows = await all(
         `
-          SELECT id, title, description, file_url, created_by, created_at
+          SELECT id, title, description, file_url, target_department, created_by, created_at
           FROM shared_files
           ORDER BY created_at DESC, id DESC
         `
       );
-      const ids = rows.map((row) => Number(row.id)).filter((id) => Number.isFinite(id) && id > 0);
+      const actorRole = String(req.session?.user?.role || "")
+        .trim()
+        .toLowerCase();
+      const actorDepartment = actorRole === "student" ? await getSessionUserDepartment(req) : "";
+      const scopedRows =
+        actorRole === "student"
+          ? rows.filter((row) => departmentScopeMatchesStudent(row.target_department, actorDepartment))
+          : rows;
+      const ids = scopedRows.map((row) => Number(row.id)).filter((id) => Number.isFinite(id) && id > 0);
       if (!ids.length) {
-        return res.json(rows);
+        return res.json(scopedRows);
       }
 
       const placeholders = ids.map(() => "?").join(", ");
@@ -78,7 +89,7 @@ function registerSharedFileRoutes(app, deps) {
       }
 
       return res.json(
-        rows.map((row) => ({
+        scopedRows.map((row) => ({
           ...row,
           user_reaction: userById.get(Number(row.id || 0)) || null,
           reaction_counts: countsById.get(Number(row.id || 0)) || {},
@@ -122,12 +133,13 @@ function registerSharedFileRoutes(app, deps) {
 
       const relativeUrl = `/content-files/shared/${req.file.filename}`;
       try {
+        const targetDepartment = await resolveContentTargetDepartment(req, req.body?.targetDepartment || "");
         const result = await run(
           `
-            INSERT INTO shared_files (title, description, file_url, created_by)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO shared_files (title, description, file_url, target_department, created_by)
+            VALUES (?, ?, ?, ?, ?)
           `,
-          [title, description, relativeUrl, req.session.user.username]
+          [title, description, relativeUrl, targetDepartment, req.session.user.username]
         );
         await logAuditEvent(
           req,
@@ -142,9 +154,12 @@ function registerSharedFileRoutes(app, deps) {
           created_by: req.session.user.username,
         });
         return res.status(201).json({ ok: true });
-      } catch (_err) {
+      } catch (innerErr) {
         if (req.file?.path) {
           fs.unlink(req.file.path, () => {});
+        }
+        if (innerErr && innerErr.status && innerErr.error) {
+          return res.status(innerErr.status).json({ error: innerErr.error });
         }
         return res.status(500).json({ error: "Could not save shared file." });
       }
@@ -178,14 +193,18 @@ function registerSharedFileRoutes(app, deps) {
       if (access.error === "forbidden") {
         return res.status(403).json({ error: "You can only edit your own shared file." });
       }
+      const targetDepartment = await resolveContentTargetDepartment(
+        req,
+        req.body?.targetDepartment || access.row.target_department || ""
+      );
 
       await run(
         `
           UPDATE shared_files
-          SET title = ?, description = ?, file_url = ?
+          SET title = ?, description = ?, file_url = ?, target_department = ?
           WHERE id = ?
         `,
-        [title, description, fileUrl, id]
+        [title, description, fileUrl, targetDepartment, id]
       );
       await logAuditEvent(
         req,
@@ -199,7 +218,10 @@ function registerSharedFileRoutes(app, deps) {
         id,
       });
       return res.status(200).json({ ok: true });
-    } catch (_err) {
+    } catch (err) {
+      if (err && err.status && err.error) {
+        return res.status(err.status).json({ error: err.error });
+      }
       return res.status(500).json({ error: "Could not update shared file." });
     }
   });

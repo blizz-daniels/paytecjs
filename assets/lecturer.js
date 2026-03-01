@@ -72,7 +72,7 @@ const manageConfigs = [
       const reactedBy = formatReactionDetails(item);
       return `
         <p>${escapeHtml(item.body || "")}</p>
-        <small>${escapeHtml(item.category || "General")} | Urgent: ${item.is_urgent ? "Yes" : "No"} | Pinned: ${item.is_pinned ? "Yes" : "No"} | Unread (students): ${Number(item.unread_count || 0)} | By ${escapeHtml(item.created_by || "-")}</small>
+        <small>${escapeHtml(item.category || "General")} | Department: ${escapeHtml(item.target_department || "all")} | Urgent: ${item.is_urgent ? "Yes" : "No"} | Pinned: ${item.is_pinned ? "Yes" : "No"} | Unread (students): ${Number(item.unread_count || 0)} | By ${escapeHtml(item.created_by || "-")}</small>
         ${reactedBy}
       `;
     },
@@ -116,7 +116,7 @@ const manageConfigs = [
       const reactedBy = formatReactionDetails(item);
       return `
         <p>${escapeHtml(item.description || "")}</p>
-        <small>File: ${escapeHtml(item.file_url || "-")} | By ${escapeHtml(item.created_by || "-")}</small>
+        <small>File: ${escapeHtml(item.file_url || "-")} | Department: ${escapeHtml(item.target_department || "all")} | By ${escapeHtml(item.created_by || "-")}</small>
         ${reactedBy}
       `;
     },
@@ -150,7 +150,7 @@ const manageConfigs = [
       const reactedBy = formatReactionDetails(item);
       return `
         <p>${escapeHtml(item.description || "")}</p>
-        <small>File: ${escapeHtml(item.file_url || "(none)")} | By ${escapeHtml(item.created_by || "-")}</small>
+        <small>File: ${escapeHtml(item.file_url || "(none)")} | Department: ${escapeHtml(item.target_department || "all")} | By ${escapeHtml(item.created_by || "-")}</small>
         ${reactedBy}
       `;
     },

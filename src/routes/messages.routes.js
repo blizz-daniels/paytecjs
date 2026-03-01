@@ -17,6 +17,7 @@ function registerMessageRoutes(app, deps) {
     getMessageThreadAccess,
     markMessageThreadReadForUser,
     listMessageStudentDirectory,
+    getSessionUserDepartment,
   } = deps;
 
   app.get("/api/messages/threads", requireAuth, async (req, res) => {
@@ -73,7 +74,11 @@ function registerMessageRoutes(app, deps) {
     try {
       const subject = validateMessageSubjectOrThrow(req.body?.subject || "");
       const messageBody = validateMessageBodyOrThrow(req.body?.message || "");
-      const recipients = await validateMessageRecipients(req.body?.recipients);
+      const actorDepartment = await getSessionUserDepartment(req);
+      const recipients = await validateMessageRecipients(req.body?.recipients, {
+        actorRole,
+        actorDepartment,
+      });
 
       const result = await withSqlTransaction(async () => {
         const threadInsert = await run(
@@ -265,7 +270,11 @@ function registerMessageRoutes(app, deps) {
       return res.status(403).json({ error: "Only lecturers or admins can list student recipients." });
     }
     try {
-      const students = await listMessageStudentDirectory();
+      const actorDepartment = await getSessionUserDepartment(req);
+      const students = await listMessageStudentDirectory({
+        actorRole,
+        actorDepartment,
+      });
       return res.json({ students });
     } catch (_err) {
       return res.status(500).json({ error: "Could not load students." });

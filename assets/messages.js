@@ -283,7 +283,9 @@ async function loadComposeStudents() {
       .map((student) => {
         const username = String(student.username || "").trim();
         const display = String(student.display_name || username).trim();
-        return `<option value="${escapeHtml(username)}">${escapeHtml(`${display} (${username})`)}</option>`;
+        const department = String(student.department_label || student.department || "").trim();
+        const suffix = department ? ` - ${department}` : "";
+        return `<option value="${escapeHtml(username)}">${escapeHtml(`${display} (${username})${suffix}`)}</option>`;
       })
       .join("");
     if (!students.length) {

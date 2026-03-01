@@ -41,6 +41,9 @@ const STUDENT_ROSTER_PATH = path.resolve(process.env.STUDENT_ROSTER_PATH || path
 const LECTURER_ROSTER_PATH = path.resolve(
   process.env.LECTURER_ROSTER_PATH || process.env.TEACHER_ROSTER_PATH || path.join(PROJECT_ROOT, "data", "teachers.csv")
 );
+const DEPARTMENT_GROUPS_PATH = path.resolve(
+  process.env.DEPARTMENT_GROUPS_PATH || path.join(PROJECT_ROOT, "data", "department-groups.csv")
+);
 
 if (isProduction && !process.env.SESSION_SECRET) {
   throw new Error("SESSION_SECRET is required when NODE_ENV=production");
@@ -76,6 +79,10 @@ const LOGIN_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_RATE_LIMIT_MAX_ATTEMPTS = 8;
 const LOGIN_RATE_LIMIT_BLOCK_MS = 15 * 60 * 1000;
 const loginAttempts = new Map();
+let departmentGroupsCache = {
+  mtimeMs: -1,
+  groups: new Map(),
+};
 let contentStreamClientSequence = 0;
 const contentStreamClients = new Map();
 const CONTENT_STREAM_KEEPALIVE_MS = 25 * 1000;
@@ -355,6 +362,177 @@ function normalizeDisplayName(value) {
   return String(value || "").trim();
 }
 
+function normalizeDepartment(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+function isValidDepartment(value) {
+  const normalized = normalizeDepartment(value);
+  if (!normalized || normalized.length > 80) {
+    return false;
+  }
+  return /^[a-z0-9][a-z0-9 &'()/-]{1,79}$/.test(normalized);
+}
+
+function formatDepartmentLabel(value) {
+  const normalized = normalizeDepartment(value);
+  if (!normalized) {
+    return "";
+  }
+  return normalized
+    .split(" ")
+    .map((word) => (word ? `${word.charAt(0).toUpperCase()}${word.slice(1)}` : ""))
+    .join(" ");
+}
+
+function withGeneralDepartmentAliases(groups) {
+  const next = new Map();
+  for (const [key, values] of groups.entries()) {
+    const normalizedKey = normalizeDepartment(key);
+    if (!normalizedKey) {
+      continue;
+    }
+    const normalizedValues = new Set(Array.from(values || []).map((value) => normalizeDepartment(value)).filter(Boolean));
+    normalizedValues.add(normalizedKey);
+    next.set(normalizedKey, normalizedValues);
+
+    if (!normalizedKey.startsWith("general ")) {
+      const alias = normalizeDepartment(`general ${normalizedKey}`);
+      if (!next.has(alias)) {
+        const aliasValues = new Set(normalizedValues);
+        aliasValues.add(alias);
+        next.set(alias, aliasValues);
+      }
+    }
+  }
+  return next;
+}
+
+function getDefaultDepartmentGroups() {
+  const defaults = new Map();
+  defaults.set("science", new Set(["science", "computer science", "chemistry", "physics", "biology", "mathematics"]));
+  defaults.set("art", new Set(["art", "creative art", "fine art", "music", "theatre art"]));
+  defaults.set("business", new Set(["business", "accounting", "economics", "marketing", "management"]));
+  return withGeneralDepartmentAliases(defaults);
+}
+
+function parseDepartmentGroupsCsv(csvText) {
+  const text = String(csvText || "");
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => String(line || "").trim())
+    .filter(Boolean);
+  if (!lines.length) {
+    return getDefaultDepartmentGroups();
+  }
+
+  const headers = parseCsvLine(lines[0]).map((header) => normalizeDepartment(header));
+  const groups = new Map();
+  headers.forEach((header) => {
+    if (!header) {
+      return;
+    }
+    if (!groups.has(header)) {
+      groups.set(header, new Set([header]));
+    }
+  });
+
+  for (let i = 1; i < lines.length; i += 1) {
+    const row = parseCsvLine(lines[i]);
+    headers.forEach((header, index) => {
+      if (!header) {
+        return;
+      }
+      const value = normalizeDepartment(row[index] || "");
+      if (!value) {
+        return;
+      }
+      if (!groups.has(header)) {
+        groups.set(header, new Set([header]));
+      }
+      groups.get(header).add(value);
+    });
+  }
+
+  if (!groups.size) {
+    return getDefaultDepartmentGroups();
+  }
+  return withGeneralDepartmentAliases(groups);
+}
+
+function getDepartmentGroups() {
+  try {
+    const stat = fs.statSync(DEPARTMENT_GROUPS_PATH);
+    const mtimeMs = Number(stat.mtimeMs || 0);
+    if (departmentGroupsCache.groups.size && departmentGroupsCache.mtimeMs === mtimeMs) {
+      return departmentGroupsCache.groups;
+    }
+    const raw = fs.readFileSync(DEPARTMENT_GROUPS_PATH, "utf8");
+    const parsed = parseDepartmentGroupsCsv(raw);
+    departmentGroupsCache = {
+      mtimeMs,
+      groups: parsed,
+    };
+    return parsed;
+  } catch (_err) {
+    if (!departmentGroupsCache.groups.size) {
+      departmentGroupsCache = {
+        mtimeMs: -1,
+        groups: getDefaultDepartmentGroups(),
+      };
+    }
+    return departmentGroupsCache.groups;
+  }
+}
+
+function expandDepartmentScope(departmentValue) {
+  const normalized = normalizeDepartment(departmentValue);
+  if (!normalized || normalized === "all") {
+    return null;
+  }
+  const groups = getDepartmentGroups();
+  const scope = new Set([normalized]);
+  if (groups.has(normalized)) {
+    groups.get(normalized).forEach((value) => scope.add(normalizeDepartment(value)));
+  }
+  return scope;
+}
+
+function departmentScopeMatchesStudent(targetDepartment, studentDepartment) {
+  const target = normalizeDepartment(targetDepartment);
+  if (!target || target === "all") {
+    return true;
+  }
+  const student = normalizeDepartment(studentDepartment);
+  if (!student) {
+    return false;
+  }
+  if (target === student) {
+    return true;
+  }
+  const scope = expandDepartmentScope(target);
+  return !!(scope && scope.has(student));
+}
+
+function doesDepartmentScopeOverlap(targetDepartment, actorDepartment) {
+  const target = normalizeDepartment(targetDepartment);
+  const actor = normalizeDepartment(actorDepartment);
+  if (!target || target === "all" || !actor || actor === "all") {
+    return true;
+  }
+  const targetScope = expandDepartmentScope(target) || new Set([target]);
+  const actorScope = expandDepartmentScope(actor) || new Set([actor]);
+  for (const candidate of targetScope) {
+    if (actorScope.has(candidate)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function normalizeProfileEmail(value) {
   return String(value || "").trim().toLowerCase();
 }
@@ -589,6 +767,159 @@ function buildImportReportCsv(results) {
   return lines.join("\n");
 }
 
+async function processDepartmentChecklistCsv(csvText, options = {}) {
+  const sourceName = String(options.sourceName || "admin-upload-checklists.csv");
+  const actorUsername = normalizeIdentifier(options.actorUsername || "admin");
+  const applyChanges = !!options.applyChanges;
+  const raw = String(csvText || "");
+  const lines = raw
+    .split(/\r?\n/)
+    .map((line) => String(line || "").trim())
+    .filter((line) => line.length > 0);
+
+  if (!lines.length) {
+    throw new Error("CSV is empty.");
+  }
+
+  const headers = parseCsvLine(lines[0]).map((header) => String(header || "").trim().toLowerCase());
+  const departmentIndex = headers.indexOf("department");
+  const itemCandidates = ["task", "item", "checklist_item", "checklist", "description"];
+  const itemIndex =
+    itemCandidates.reduce((foundIndex, candidate) => {
+      if (foundIndex !== -1) {
+        return foundIndex;
+      }
+      return headers.indexOf(candidate);
+    }, -1);
+  const orderCandidates = ["order", "position", "item_order"];
+  const orderIndex =
+    orderCandidates.reduce((foundIndex, candidate) => {
+      if (foundIndex !== -1) {
+        return foundIndex;
+      }
+      return headers.indexOf(candidate);
+    }, -1);
+
+  if (departmentIndex === -1 || itemIndex === -1) {
+    throw new Error("Invalid checklist header. Expected columns: department,task");
+  }
+
+  const results = [];
+  const validRows = [];
+  const seenInFile = new Set();
+  const summary = {
+    totalRows: Math.max(0, lines.length - 1),
+    validRows: 0,
+    invalidRows: 0,
+    duplicateRows: 0,
+    inserts: 0,
+    updates: 0,
+    imported: 0,
+  };
+
+  for (let i = 1; i < lines.length; i += 1) {
+    const lineNumber = i + 1;
+    const row = parseCsvLine(lines[i]);
+    const department = normalizeDepartment(row[departmentIndex] || "");
+    const itemText = String(row[itemIndex] || "").trim().replace(/\s+/g, " ");
+    const orderRaw = orderIndex === -1 ? "" : String(row[orderIndex] || "").trim();
+    const parsedOrder = Number.parseInt(orderRaw, 10);
+    const itemOrder =
+      Number.isFinite(parsedOrder) && parsedOrder > 0 ? parsedOrder : validRows.filter((entry) => entry.department === department).length + 1;
+    const dedupeKey = `${department}::${itemText.toLowerCase()}`;
+
+    if (!isValidDepartment(department)) {
+      summary.invalidRows += 1;
+      results.push({
+        lineNumber,
+        identifier: department,
+        status: "error",
+        message: "Invalid department value.",
+      });
+      continue;
+    }
+    if (!itemText || itemText.length > 220) {
+      summary.invalidRows += 1;
+      results.push({
+        lineNumber,
+        identifier: department,
+        status: "error",
+        message: "Checklist task is required and must be 220 characters or less.",
+      });
+      continue;
+    }
+    if (seenInFile.has(dedupeKey)) {
+      summary.invalidRows += 1;
+      summary.duplicateRows += 1;
+      results.push({
+        lineNumber,
+        identifier: department,
+        status: "duplicate_in_file",
+        message: "Duplicate department/task row in this upload.",
+      });
+      continue;
+    }
+    seenInFile.add(dedupeKey);
+
+    validRows.push({
+      lineNumber,
+      department,
+      itemText,
+      itemOrder,
+    });
+    summary.validRows += 1;
+    summary.inserts += 1;
+    summary.imported += 1;
+    results.push({
+      lineNumber,
+      identifier: department,
+      status: "insert",
+      message: "Will import checklist task.",
+    });
+  }
+
+  if (applyChanges && validRows.length) {
+    await withSqlTransaction(async () => {
+      const touchedDepartments = Array.from(new Set(validRows.map((row) => row.department)));
+      for (const department of touchedDepartments) {
+        await run(
+          `
+            DELETE FROM student_checklist_progress
+            WHERE checklist_id IN (
+              SELECT id FROM department_checklists WHERE department = ?
+            )
+          `,
+          [department]
+        );
+        await run("DELETE FROM department_checklists WHERE department = ?", [department]);
+      }
+
+      for (const row of validRows) {
+        await run(
+          `
+            INSERT INTO department_checklists (department, item_text, item_order, source_file, created_by)
+            VALUES (?, ?, ?, ?, ?)
+          `,
+          [row.department, row.itemText, row.itemOrder, sourceName, actorUsername || "admin"]
+        );
+      }
+    });
+
+    validRows.forEach((row) => {
+      const existing = results.find((entry) => Number(entry.lineNumber) === Number(row.lineNumber));
+      if (existing) {
+        existing.message = "Checklist task imported.";
+      }
+    });
+  }
+
+  return {
+    summary,
+    rows: results,
+    reportCsv: buildImportReportCsv(results),
+  };
+}
+
 async function processRosterCsv(csvText, options) {
   const { role, idHeader, sourceName, applyChanges } = options;
   const raw = String(csvText || "");
@@ -602,8 +933,26 @@ async function processRosterCsv(csvText, options) {
   }
 
   const headers = parseCsvLine(lines[0]).map((header) => header.toLowerCase());
-  const idIndex = headers.indexOf(idHeader);
+  const idCandidates = [idHeader];
+  if (idHeader === "teacher_code") {
+    idCandidates.push("lecturer_code");
+  }
+  const idIndex =
+    idCandidates.reduce((foundIndex, candidate) => {
+      if (foundIndex !== -1) {
+        return foundIndex;
+      }
+      return headers.indexOf(candidate);
+    }, -1);
   const surnameIndex = headers.indexOf("surname");
+  const departmentColumnCandidates = ["department", "dept"];
+  const departmentIndex =
+    departmentColumnCandidates.reduce((foundIndex, candidate) => {
+      if (foundIndex !== -1) {
+        return foundIndex;
+      }
+      return headers.indexOf(candidate);
+    }, -1);
   const preferredNameColumns = ["name", "full_name", "display_name", "student_name"];
   const nameIndex =
     preferredNameColumns.reduce((foundIndex, candidate) => {
@@ -613,8 +962,8 @@ async function processRosterCsv(csvText, options) {
       return headers.indexOf(candidate);
     }, -1);
 
-  if (idIndex === -1 || surnameIndex === -1) {
-    throw new Error(`Invalid roster header. Expected columns: ${idHeader},surname`);
+  if (idIndex === -1 || surnameIndex === -1 || departmentIndex === -1) {
+    throw new Error(`Invalid roster header. Expected columns: ${idHeader},surname,department`);
   }
 
   const existingRows = await all("SELECT auth_id FROM auth_roster WHERE role = ?", [role]);
@@ -637,6 +986,7 @@ async function processRosterCsv(csvText, options) {
     const identifier = normalizeIdentifier(row[idIndex]);
     const surnamePassword = normalizeSurnamePassword(row[surnameIndex]);
     const rawDisplayName = nameIndex !== -1 ? normalizeDisplayName(row[nameIndex]) : "";
+    const department = normalizeDepartment(row[departmentIndex] || "");
 
     if (!isValidIdentifier(identifier)) {
       summary.invalidRows += 1;
@@ -673,6 +1023,17 @@ async function processRosterCsv(csvText, options) {
       continue;
     }
 
+    if (!isValidDepartment(department)) {
+      summary.invalidRows += 1;
+      results.push({
+        lineNumber,
+        identifier,
+        status: "error",
+        message: "Invalid department value.",
+      });
+      continue;
+    }
+
     const exists = existingIds.has(identifier);
     const result = {
       lineNumber,
@@ -685,13 +1046,14 @@ async function processRosterCsv(csvText, options) {
       const passwordHash = await bcrypt.hash(surnamePassword, 12);
       await run(
         `
-          INSERT INTO auth_roster (auth_id, role, password_hash, source_file)
-          VALUES (?, ?, ?, ?)
+          INSERT INTO auth_roster (auth_id, role, password_hash, source_file, department)
+          VALUES (?, ?, ?, ?, ?)
           ON CONFLICT(auth_id, role) DO UPDATE SET
             password_hash = excluded.password_hash,
-            source_file = excluded.source_file
+            source_file = excluded.source_file,
+            department = excluded.department
         `,
-        [identifier, role, passwordHash, sourceName]
+        [identifier, role, passwordHash, sourceName, department]
       );
       if (rawDisplayName) {
         await upsertProfileDisplayName(identifier, rawDisplayName);
@@ -804,6 +1166,89 @@ async function getUserProfile(username) {
   );
 }
 
+async function getRosterUserDepartment(username, role) {
+  const normalizedUsername = normalizeIdentifier(username);
+  const normalizedRole = String(role || "")
+    .trim()
+    .toLowerCase();
+  if (!normalizedUsername) {
+    return "";
+  }
+  const rolesToTry = [];
+  if (normalizedRole === "student" || normalizedRole === "teacher") {
+    rolesToTry.push(normalizedRole);
+  }
+  if (!rolesToTry.length) {
+    rolesToTry.push("student", "teacher");
+  }
+  for (const candidateRole of rolesToTry) {
+    const row = await get(
+      `
+        SELECT department
+        FROM auth_roster
+        WHERE auth_id = ?
+          AND role = ?
+        LIMIT 1
+      `,
+      [normalizedUsername, candidateRole]
+    );
+    if (row && row.department) {
+      return normalizeDepartment(row.department);
+    }
+  }
+  return "";
+}
+
+async function getSessionUserDepartment(req) {
+  const username = normalizeIdentifier(req?.session?.user?.username || "");
+  const role = String(req?.session?.user?.role || "")
+    .trim()
+    .toLowerCase();
+  if (!username || role === "admin") {
+    return "";
+  }
+  return getRosterUserDepartment(username, role);
+}
+
+async function resolveContentTargetDepartment(req, providedDepartment) {
+  const role = String(req?.session?.user?.role || "")
+    .trim()
+    .toLowerCase();
+  const normalizedProvided = normalizeDepartment(providedDepartment);
+  if (role === "admin") {
+    if (!normalizedProvided || normalizedProvided === "all") {
+      return "all";
+    }
+    if (!isValidDepartment(normalizedProvided)) {
+      throw { status: 400, error: "Department scope is invalid." };
+    }
+    return normalizedProvided;
+  }
+  const actorDepartment = await getSessionUserDepartment(req);
+  if (!actorDepartment) {
+    return "all";
+  }
+  return actorDepartment;
+}
+
+async function listStudentDepartmentRows() {
+  return all(
+    `
+      SELECT auth_id, department
+      FROM auth_roster
+      WHERE role = 'student'
+      ORDER BY auth_id ASC
+    `
+  );
+}
+
+function rowMatchesStudentDepartmentScope(row, studentDepartment) {
+  if (!row || typeof row !== "object") {
+    return false;
+  }
+  return departmentScopeMatchesStudent(String(row.target_department || ""), studentDepartment);
+}
+
 async function initDatabase() {
   await run("PRAGMA foreign_keys = ON");
 
@@ -821,6 +1266,7 @@ async function initDatabase() {
       auth_id TEXT NOT NULL,
       role TEXT NOT NULL,
       password_hash TEXT NOT NULL,
+      department TEXT,
       source_file TEXT,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (auth_id, role)
@@ -849,6 +1295,7 @@ async function initDatabase() {
       expires_at TEXT,
       related_payment_item_id INTEGER,
       auto_generated INTEGER NOT NULL DEFAULT 0,
+      target_department TEXT NOT NULL DEFAULT 'all',
       created_by TEXT NOT NULL,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
@@ -899,6 +1346,7 @@ async function initDatabase() {
       title TEXT NOT NULL,
       description TEXT NOT NULL,
       file_url TEXT,
+      target_department TEXT NOT NULL DEFAULT 'all',
       created_by TEXT NOT NULL,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
@@ -910,6 +1358,7 @@ async function initDatabase() {
       title TEXT NOT NULL,
       description TEXT NOT NULL,
       file_url TEXT NOT NULL,
+      target_department TEXT NOT NULL DEFAULT 'all',
       created_by TEXT NOT NULL,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
@@ -960,6 +1409,7 @@ async function initDatabase() {
       due_date TEXT,
       available_until TEXT,
       availability_days INTEGER,
+      target_department TEXT NOT NULL DEFAULT 'all',
       created_by TEXT NOT NULL,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
@@ -1204,12 +1654,19 @@ async function initDatabase() {
   await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_audit_events_entity ON audit_events(entity_type, entity_id)");
   await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_notifications_payment_item ON notifications(related_payment_item_id)");
   await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_payment_items_created_by ON payment_items(created_by)");
+  await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_payment_items_target_department ON payment_items(target_department)");
+  await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_notifications_target_department ON notifications(target_department)");
   await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_notification_reactions_notification ON notification_reactions(notification_id)");
+  await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_handouts_target_department ON handouts(target_department)");
   await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_handout_reactions_handout ON handout_reactions(handout_id)");
+  await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_shared_files_target_department ON shared_files(target_department)");
   await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_shared_file_reactions_shared_file ON shared_file_reactions(shared_file_id)");
   await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_message_participants_user_thread ON message_participants(username, thread_id)");
   await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_messages_thread_created ON messages(thread_id, created_at)");
   await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_message_threads_updated_at ON message_threads(updated_at)");
+  await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_auth_roster_role_department ON auth_roster(role, department)");
+  await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_department_checklists_department ON department_checklists(department)");
+  await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_student_checklist_progress_username ON student_checklist_progress(username)");
 
   await run(`
     CREATE TABLE IF NOT EXISTS user_profiles (
@@ -1219,6 +1676,30 @@ async function initDatabase() {
       profile_image_url TEXT,
       email TEXT,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  await run(`
+    CREATE TABLE IF NOT EXISTS department_checklists (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      department TEXT NOT NULL,
+      item_text TEXT NOT NULL,
+      item_order INTEGER NOT NULL DEFAULT 1,
+      source_file TEXT,
+      created_by TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  await run(`
+    CREATE TABLE IF NOT EXISTS student_checklist_progress (
+      checklist_id INTEGER NOT NULL,
+      username TEXT NOT NULL,
+      completed INTEGER NOT NULL DEFAULT 0,
+      completed_at TEXT,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (checklist_id, username),
+      FOREIGN KEY (checklist_id) REFERENCES department_checklists(id) ON UPDATE CASCADE ON DELETE CASCADE
     )
   `);
 
@@ -1239,6 +1720,11 @@ async function initDatabase() {
   const userColumns = await all("PRAGMA table_info(users)");
   if (!userColumns.some((column) => column.name === "role")) {
     await run("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'student'");
+  }
+
+  const rosterColumns = await all("PRAGMA table_info(auth_roster)");
+  if (!rosterColumns.some((column) => column.name === "department")) {
+    await run("ALTER TABLE auth_roster ADD COLUMN department TEXT");
   }
 
   const profileColumns = await all("PRAGMA table_info(user_profiles)");
@@ -1271,6 +1757,16 @@ async function initDatabase() {
   if (!notificationColumns.some((column) => column.name === "read_at")) {
     await run("ALTER TABLE notifications ADD COLUMN read_at TEXT");
   }
+  if (!notificationColumns.some((column) => column.name === "target_department")) {
+    await run("ALTER TABLE notifications ADD COLUMN target_department TEXT NOT NULL DEFAULT 'all'");
+  }
+  await run(
+    `
+      UPDATE notifications
+      SET target_department = 'all'
+      WHERE target_department IS NULL OR TRIM(target_department) = ''
+    `
+  );
 
   const paymentItemsColumns = await all("PRAGMA table_info(payment_items)");
   if (!paymentItemsColumns.some((column) => column.name === "description")) {
@@ -1288,6 +1784,40 @@ async function initDatabase() {
   if (!paymentItemsColumns.some((column) => column.name === "availability_days")) {
     await run("ALTER TABLE payment_items ADD COLUMN availability_days INTEGER");
   }
+  if (!paymentItemsColumns.some((column) => column.name === "target_department")) {
+    await run("ALTER TABLE payment_items ADD COLUMN target_department TEXT NOT NULL DEFAULT 'all'");
+  }
+  await run(
+    `
+      UPDATE payment_items
+      SET target_department = 'all'
+      WHERE target_department IS NULL OR TRIM(target_department) = ''
+    `
+  );
+
+  const handoutColumns = await all("PRAGMA table_info(handouts)");
+  if (!handoutColumns.some((column) => column.name === "target_department")) {
+    await run("ALTER TABLE handouts ADD COLUMN target_department TEXT NOT NULL DEFAULT 'all'");
+  }
+  await run(
+    `
+      UPDATE handouts
+      SET target_department = 'all'
+      WHERE target_department IS NULL OR TRIM(target_department) = ''
+    `
+  );
+
+  const sharedFileColumns = await all("PRAGMA table_info(shared_files)");
+  if (!sharedFileColumns.some((column) => column.name === "target_department")) {
+    await run("ALTER TABLE shared_files ADD COLUMN target_department TEXT NOT NULL DEFAULT 'all'");
+  }
+  await run(
+    `
+      UPDATE shared_files
+      SET target_department = 'all'
+      WHERE target_department IS NULL OR TRIM(target_department) = ''
+    `
+  );
 
   const paymentReceiptColumns = await all("PRAGMA table_info(payment_receipts)");
   if (!paymentReceiptColumns.some((column) => column.name === "reviewed_by")) {
@@ -2572,7 +3102,7 @@ function normalizeMessageRecipients(rawRecipients) {
   return recipients;
 }
 
-async function validateMessageRecipients(rawRecipients) {
+async function validateMessageRecipients(rawRecipients, actorContext = {}) {
   const recipients = normalizeMessageRecipients(rawRecipients);
   if (!recipients.length) {
     throw { status: 400, error: "At least one student recipient is required." };
@@ -2586,7 +3116,7 @@ async function validateMessageRecipients(rawRecipients) {
   }
   const placeholders = recipients.map(() => "?").join(",");
   const rows = await all(
-    `SELECT auth_id FROM auth_roster WHERE role = 'student' AND auth_id IN (${placeholders})`,
+    `SELECT auth_id, department FROM auth_roster WHERE role = 'student' AND auth_id IN (${placeholders})`,
     recipients
   );
   const existing = new Set(rows.map((row) => normalizeIdentifier(row.auth_id)));
@@ -2594,24 +3124,52 @@ async function validateMessageRecipients(rawRecipients) {
   if (missing.length) {
     throw { status: 400, error: `Recipients must be valid student accounts: ${missing.join(", ")}` };
   }
+
+  const actorRole = String(actorContext.actorRole || "")
+    .trim()
+    .toLowerCase();
+  const actorDepartment = normalizeDepartment(actorContext.actorDepartment || "");
+  if (actorRole === "teacher" && actorDepartment && actorDepartment !== "all") {
+    const outOfScope = rows
+      .filter((row) => !departmentScopeMatchesStudent(actorDepartment, normalizeDepartment(row.department || "")))
+      .map((row) => normalizeIdentifier(row.auth_id || ""))
+      .filter(Boolean);
+    if (outOfScope.length) {
+      throw {
+        status: 403,
+        error: `You can only message students in your department scope: ${outOfScope.join(", ")}`,
+      };
+    }
+  }
   return recipients;
 }
 
-async function listMessageStudentDirectory() {
+async function listMessageStudentDirectory(actorContext = {}) {
   const rows = await all(
     `
       SELECT
         ar.auth_id AS username,
-        COALESCE(NULLIF(TRIM(up.display_name), ''), ar.auth_id) AS display_name
+        COALESCE(NULLIF(TRIM(up.display_name), ''), ar.auth_id) AS display_name,
+        COALESCE(ar.department, '') AS department
       FROM auth_roster ar
       LEFT JOIN user_profiles up ON up.username = ar.auth_id
       WHERE ar.role = 'student'
       ORDER BY ar.auth_id ASC
     `
   );
-  return rows.map((row) => ({
+  const actorRole = String(actorContext.actorRole || "")
+    .trim()
+    .toLowerCase();
+  const actorDepartment = normalizeDepartment(actorContext.actorDepartment || "");
+  const scopedRows =
+    actorRole === "teacher" && actorDepartment && actorDepartment !== "all"
+      ? rows.filter((row) => departmentScopeMatchesStudent(actorDepartment, normalizeDepartment(row.department || "")))
+      : rows;
+  return scopedRows.map((row) => ({
     username: String(row.username || ""),
     display_name: String(row.display_name || row.username || ""),
+    department: normalizeDepartment(row.department || ""),
+    department_label: formatDepartmentLabel(row.department || ""),
   }));
 }
 
@@ -3121,10 +3679,18 @@ async function syncPaymentItemNotification(req, paymentItem) {
             is_urgent = 0,
             is_pinned = 0,
             expires_at = ?,
+            target_department = ?,
             created_by = ?
         WHERE id = ?
       `,
-      [title.slice(0, 120), body.slice(0, 2000), paymentItem.available_until || null, req.session.user.username, existing.id]
+      [
+        title.slice(0, 120),
+        body.slice(0, 2000),
+        paymentItem.available_until || null,
+        normalizeDepartment(paymentItem.target_department || "all") || "all",
+        req.session.user.username,
+        existing.id,
+      ]
     );
     return existing.id;
   }
@@ -3139,11 +3705,19 @@ async function syncPaymentItemNotification(req, paymentItem) {
         expires_at,
         related_payment_item_id,
         auto_generated,
+        target_department,
         created_by
       )
-      VALUES (?, ?, 'Payments', 0, 0, ?, ?, 1, ?)
+      VALUES (?, ?, 'Payments', 0, 0, ?, ?, 1, ?, ?)
     `,
-    [title.slice(0, 120), body.slice(0, 2000), paymentItem.available_until || null, paymentItem.id, req.session.user.username]
+    [
+      title.slice(0, 120),
+      body.slice(0, 2000),
+      paymentItem.available_until || null,
+      paymentItem.id,
+      normalizeDepartment(paymentItem.target_department || "all") || "all",
+      req.session.user.username,
+    ]
   );
   return result.lastID;
 }
@@ -3352,10 +3926,15 @@ async function ensurePaymentObligationsForPaymentItem(paymentItemId) {
   if (!paymentItem) {
     return 0;
   }
-  const students = await listStudentUsernames();
+  const students = await listStudentDepartmentRows();
   let count = 0;
   for (const student of students) {
-    const row = await upsertPaymentObligation(paymentItem, student);
+    const username = normalizeIdentifier(student.auth_id || "");
+    const department = normalizeDepartment(student.department || "");
+    if (!departmentScopeMatchesStudent(paymentItem.target_department, department)) {
+      continue;
+    }
+    const row = await upsertPaymentObligation(paymentItem, username);
     if (row) {
       count += 1;
     }
@@ -3377,9 +3956,23 @@ async function ensurePaymentObligationsForStudent(studentUsername) {
   if (!normalized) {
     return 0;
   }
+  const studentRow = await get(
+    `
+      SELECT department
+      FROM auth_roster
+      WHERE auth_id = ?
+        AND role = 'student'
+      LIMIT 1
+    `,
+    [normalized]
+  );
+  const studentDepartment = normalizeDepartment(studentRow?.department || "");
   const items = await all("SELECT * FROM payment_items ORDER BY id ASC");
   let total = 0;
   for (const item of items) {
+    if (!departmentScopeMatchesStudent(item.target_department, studentDepartment)) {
+      continue;
+    }
     const row = await upsertPaymentObligation(item, normalized);
     if (row) {
       total += 1;
@@ -4020,10 +4613,15 @@ async function listPaystackReferenceRequests(options = {}) {
         prr.*,
         po.payment_item_id,
         pi.title AS payment_item_title,
-        pi.created_by AS payment_item_owner
+        pi.created_by AS payment_item_owner,
+        COALESCE(pi.target_department, 'all') AS payment_target_department,
+        COALESCE(ar_student.department, '') AS student_department
       FROM paystack_reference_requests prr
       LEFT JOIN payment_obligations po ON po.id = prr.obligation_id
       LEFT JOIN payment_items pi ON pi.id = po.payment_item_id
+      LEFT JOIN auth_roster ar_student
+        ON ar_student.auth_id = prr.student_username
+       AND ar_student.role = 'student'
       ${whereSql}
       ORDER BY
         CASE
@@ -4037,7 +4635,15 @@ async function listPaystackReferenceRequests(options = {}) {
     `,
     params.concat(limit)
   );
-  return rows.map((row) => formatPaystackReferenceRequestRow(row));
+  const actorRole = String(options.actorRole || "")
+    .trim()
+    .toLowerCase();
+  const actorDepartment = normalizeDepartment(options.actorDepartment || "");
+  const scopedRows =
+    actorRole === "teacher" && actorDepartment && actorDepartment !== "all"
+      ? rows.filter((row) => departmentScopeMatchesStudent(actorDepartment, row.student_department))
+      : rows;
+  return scopedRows.map((row) => formatPaystackReferenceRequestRow(row));
 }
 
 async function verifyAndIngestPaystackReference(reference, options = {}) {
@@ -5193,6 +5799,8 @@ app.get("/health", (_req, res) => {
 app.get("/api/me", requireAuth, async (req, res) => {
   try {
     const profile = await getUserProfile(req.session.user.username);
+    const department = await getSessionUserDepartment(req);
+    const departmentScope = expandDepartmentScope(department);
     const displayName =
       profile && profile.display_name
         ? profile.display_name
@@ -5204,6 +5812,12 @@ app.get("/api/me", requireAuth, async (req, res) => {
       displayName,
       profileImageUrl: profile ? profile.profile_image_url : null,
       email,
+      department,
+      departmentLabel: formatDepartmentLabel(department),
+      departmentsCovered:
+        req.session.user.role === "teacher"
+          ? Array.from(departmentScope || []).filter(Boolean).sort((a, b) => a.localeCompare(b))
+          : [],
     });
   } catch (_err) {
     return res.status(500).json({ error: "Could not load profile." });
@@ -5255,6 +5869,9 @@ app.get("/api/content-stream", requireAuth, (req, res) => {
 });
 
 app.post("/api/profile", requireAuth, async (req, res) => {
+  if (req.session.user.role === "student") {
+    return res.status(403).json({ error: "Students cannot change display names." });
+  }
   const displayName = normalizeDisplayName(req.body.displayName || "");
   if (!displayName) {
     return res.status(400).json({ error: "Display name cannot be empty." });
@@ -5314,6 +5931,116 @@ app.post("/api/profile/avatar", requireAuth, (req, res) => {
   });
 });
 
+app.get("/api/profile/checklist", requireAuth, async (req, res) => {
+  try {
+    const actorRole = String(req.session?.user?.role || "")
+      .trim()
+      .toLowerCase();
+    const actorDepartment = await getSessionUserDepartment(req);
+    const rows = await all(
+      `
+        SELECT
+          dc.id,
+          dc.department,
+          dc.item_text,
+          dc.item_order,
+          dc.created_at,
+          COALESCE(scp.completed, 0) AS completed,
+          scp.completed_at
+        FROM department_checklists dc
+        LEFT JOIN student_checklist_progress scp
+          ON scp.checklist_id = dc.id
+         AND scp.username = ?
+        ORDER BY dc.department ASC, dc.item_order ASC, dc.id ASC
+      `,
+      [req.session.user.username]
+    );
+
+    let scopedRows = rows;
+    if (actorRole === "student") {
+      scopedRows = rows.filter((row) => departmentScopeMatchesStudent(row.department, actorDepartment));
+    } else if (actorRole === "teacher") {
+      scopedRows = rows.filter((row) => doesDepartmentScopeOverlap(row.department, actorDepartment));
+    }
+
+    return res.json({
+      department: actorDepartment || "",
+      departmentLabel: formatDepartmentLabel(actorDepartment || ""),
+      items: scopedRows.map((row) => ({
+        id: Number(row.id || 0),
+        department: String(row.department || ""),
+        departmentLabel: formatDepartmentLabel(row.department || ""),
+        item_text: String(row.item_text || ""),
+        item_order: Number(row.item_order || 0),
+        completed: Number(row.completed || 0) === 1,
+        completed_at: row.completed_at || null,
+        created_at: row.created_at || "",
+      })),
+    });
+  } catch (_err) {
+    return res.status(500).json({ error: "Could not load checklist." });
+  }
+});
+
+app.post("/api/profile/checklist/:id/toggle", requireAuth, async (req, res) => {
+  if (req.session.user.role !== "student") {
+    return res.status(403).json({ error: "Only students can update checklist progress." });
+  }
+  const checklistId = parseResourceId(req.params.id);
+  if (!checklistId) {
+    return res.status(400).json({ error: "Invalid checklist item ID." });
+  }
+  const completedRaw = req.body?.completed;
+  const completed = (() => {
+    if (typeof completedRaw === "boolean") {
+      return completedRaw;
+    }
+    const normalized = String(completedRaw || "")
+      .trim()
+      .toLowerCase();
+    return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
+  })();
+
+  try {
+    const item = await get(
+      `
+        SELECT id, department
+        FROM department_checklists
+        WHERE id = ?
+        LIMIT 1
+      `,
+      [checklistId]
+    );
+    if (!item) {
+      return res.status(404).json({ error: "Checklist item not found." });
+    }
+    const studentDepartment = await getSessionUserDepartment(req);
+    if (!departmentScopeMatchesStudent(item.department, studentDepartment)) {
+      return res.status(403).json({ error: "You do not have access to this checklist item." });
+    }
+
+    await run(
+      `
+        INSERT INTO student_checklist_progress (checklist_id, username, completed, completed_at, updated_at)
+        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(checklist_id, username) DO UPDATE SET
+          completed = excluded.completed,
+          completed_at = excluded.completed_at,
+          updated_at = CURRENT_TIMESTAMP
+      `,
+      [checklistId, req.session.user.username, completed ? 1 : 0, completed ? new Date().toISOString() : null]
+    );
+
+    return res.json({
+      ok: true,
+      checklistId,
+      completed,
+    });
+  } catch (_err) {
+    return res.status(500).json({ error: "Could not update checklist progress." });
+  }
+});
+
 registerMessageRoutes(app, {
   requireAuth,
   normalizeIdentifier,
@@ -5332,6 +6059,7 @@ registerMessageRoutes(app, {
   getMessageThreadAccess,
   markMessageThreadReadForUser,
   listMessageStudentDirectory,
+  getSessionUserDepartment,
 });
 
 app.get("/admin", requireAdmin, (_req, res) => {
@@ -5432,6 +6160,7 @@ app.get("/api/admin/audit-logs", requireAdmin, async (_req, res) => {
 app.get("/api/payment-items", requireAuth, async (_req, res) => {
   try {
     const isStudent = _req.session?.user?.role === "student";
+    const studentDepartment = isStudent ? await getSessionUserDepartment(_req) : "";
     let rows = [];
     if (isStudent) {
       const student = normalizeIdentifier(_req.session.user.username);
@@ -5447,6 +6176,7 @@ app.get("/api/payment-items", requireAuth, async (_req, res) => {
             pi.due_date,
             pi.available_until,
             pi.availability_days,
+            pi.target_department,
             pi.created_by,
             pi.created_at,
             po.payment_reference AS my_reference,
@@ -5461,6 +6191,7 @@ app.get("/api/payment-items", requireAuth, async (_req, res) => {
         `,
         [student]
       );
+      rows = rows.filter((row) => rowMatchesStudentDepartmentScope(row, studentDepartment));
     } else {
       rows = await all(
         `
@@ -5473,6 +6204,7 @@ app.get("/api/payment-items", requireAuth, async (_req, res) => {
             pi.due_date,
             pi.available_until,
             pi.availability_days,
+            pi.target_department,
             pi.created_by,
             pi.created_at
           FROM payment_items pi
@@ -5514,6 +6246,7 @@ app.post("/api/payment-items", requireTeacher, async (req, res) => {
   }
 
   try {
+    const targetDepartment = await resolveContentTargetDepartment(req, req.body?.targetDepartment || "");
     const result = await run(
       `
         INSERT INTO payment_items (
@@ -5524,11 +6257,22 @@ app.post("/api/payment-items", requireTeacher, async (req, res) => {
           due_date,
           available_until,
           availability_days,
+          target_department,
           created_by
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
-      [title, description, expectedAmount, currency, dueDate, availableUntil, availabilityDays, req.session.user.username]
+      [
+        title,
+        description,
+        expectedAmount,
+        currency,
+        dueDate,
+        availableUntil,
+        availabilityDays,
+        targetDepartment,
+        req.session.user.username,
+      ]
     );
     const inserted = await get("SELECT * FROM payment_items WHERE id = ? LIMIT 1", [result.lastID]);
     await syncPaymentItemNotification(req, inserted);
@@ -5542,7 +6286,10 @@ app.post("/api/payment-items", requireTeacher, async (req, res) => {
       `Created payment item "${title.slice(0, 80)}" (${currency} ${expectedAmount})`
     );
     return res.status(201).json({ ok: true, id: result.lastID });
-  } catch (_err) {
+  } catch (err) {
+    if (err && err.status && err.error) {
+      return res.status(err.status).json({ error: err.error });
+    }
     return res.status(500).json({ error: "Could not create payment item." });
   }
 });
@@ -5586,6 +6333,10 @@ app.put("/api/payment-items/:id", requireTeacher, async (req, res) => {
     if (access.error === "forbidden") {
       return res.status(403).json({ error: "You can only edit your own payment item." });
     }
+    const targetDepartment = await resolveContentTargetDepartment(
+      req,
+      req.body?.targetDepartment || access.row.target_department || ""
+    );
 
     await run(
       `
@@ -5596,10 +6347,11 @@ app.put("/api/payment-items/:id", requireTeacher, async (req, res) => {
             currency = ?,
             due_date = ?,
             available_until = ?,
-            availability_days = ?
+            availability_days = ?,
+            target_department = ?
         WHERE id = ?
       `,
-      [title, description, expectedAmount, currency, dueDate, availableUntil, availabilityDays, id]
+      [title, description, expectedAmount, currency, dueDate, availableUntil, availabilityDays, targetDepartment, id]
     );
     const updated = await get("SELECT * FROM payment_items WHERE id = ? LIMIT 1", [id]);
     await syncPaymentItemNotification(req, updated);
@@ -5613,7 +6365,10 @@ app.put("/api/payment-items/:id", requireTeacher, async (req, res) => {
       `Edited payment item "${title.slice(0, 80)}" (${currency} ${expectedAmount})`
     );
     return res.json({ ok: true });
-  } catch (_err) {
+  } catch (err) {
+    if (err && err.status && err.error) {
+      return res.status(err.status).json({ error: err.error });
+    }
     return res.status(500).json({ error: "Could not update payment item." });
   }
 });
@@ -5978,9 +6733,15 @@ app.get("/api/my/payments/paystack/reference-requests", requireStudent, async (r
 async function handlePaystackReferenceRequestList(req, res) {
   try {
     const status = String(req.query?.status || "all").trim().toLowerCase();
+    const actorRole = String(req.session?.user?.role || "")
+      .trim()
+      .toLowerCase();
+    const actorDepartment = await getSessionUserDepartment(req);
     const items = await listPaystackReferenceRequests({
       status,
       limit: req.query?.limit,
+      actorRole,
+      actorDepartment,
     });
     return res.json({ items });
   } catch (_err) {
@@ -6642,6 +7403,7 @@ app.get("/api/my/payment-receipts", requireAuth, async (req, res) => {
     return res.status(403).json({ error: "Only students can view this resource." });
   }
   try {
+    const studentDepartment = await getSessionUserDepartment(req);
     const rowsSql = `
         SELECT
           pr.id,
@@ -6665,7 +7427,8 @@ app.get("/api/my/payment-receipts", requireAuth, async (req, res) => {
           pi.title AS payment_item_title,
           pi.expected_amount,
           pi.currency,
-          pi.due_date
+          pi.due_date,
+          pi.target_department
         FROM payment_receipts pr
         JOIN payment_items pi ON pi.id = pr.payment_item_id
         LEFT JOIN approved_receipt_dispatches ard ON ard.payment_receipt_id = pr.id
@@ -6674,7 +7437,7 @@ app.get("/api/my/payment-receipts", requireAuth, async (req, res) => {
         ORDER BY COALESCE(pr.reviewed_at, pr.submitted_at) DESC, pr.id DESC
       `;
     const queryRows = () => all(rowsSql, [req.session.user.username]);
-    let rows = await queryRows();
+    let rows = (await queryRows()).filter((row) => rowMatchesStudentDepartmentScope(row, studentDepartment));
     const pendingApprovedReceiptIds = rows
       .filter((row) => String(row.status || "").toLowerCase() === "approved" && Number(row.approved_receipt_available || 0) !== 1)
       .map((row) => parseResourceId(row.id))
@@ -6694,7 +7457,7 @@ app.get("/api/my/payment-receipts", requireAuth, async (req, res) => {
           );
         }
       }
-      rows = await queryRows();
+      rows = (await queryRows()).filter((row) => rowMatchesStudentDepartmentScope(row, studentDepartment));
     }
     return res.json(rows);
   } catch (_err) {
@@ -6704,6 +7467,7 @@ app.get("/api/my/payment-receipts", requireAuth, async (req, res) => {
 
 app.get("/api/my/payment-ledger", requireStudent, async (req, res) => {
   try {
+    const studentDepartment = await getSessionUserDepartment(req);
     await ensurePaymentObligationsForStudent(req.session.user.username);
     const rows = await all(
       `
@@ -6716,6 +7480,7 @@ app.get("/api/my/payment-ledger", requireStudent, async (req, res) => {
           pi.due_date,
           pi.available_until,
           pi.availability_days,
+          pi.target_department,
           pi.created_by,
           po.id AS obligation_id,
           COALESCE(po.amount_paid_total, 0) AS approved_paid,
@@ -6787,7 +7552,9 @@ app.get("/api/my/payment-ledger", requireStudent, async (req, res) => {
       ]
     );
 
-    for (const row of rows) {
+    const scopedRows = rows.filter((row) => rowMatchesStudentDepartmentScope(row, studentDepartment));
+
+    for (const row of scopedRows) {
       const paymentItemId = parseResourceId(row.id);
       const obligationId = parseResourceId(row.obligation_id);
       const expectedAmount = Number(row.expected_amount || 0);
@@ -6840,7 +7607,7 @@ app.get("/api/my/payment-ledger", requireStudent, async (req, res) => {
       }
     }
 
-    const items = rows.map((row) => {
+    const items = scopedRows.map((row) => {
       const expectedAmount = Number(row.expected_amount || 0);
       const approvedPaid = Number(row.approved_paid || 0);
       const pendingPaid = Number(row.pending_paid || 0);
@@ -6896,7 +7663,8 @@ app.get("/api/my/payment-ledger", requireStudent, async (req, res) => {
           re.action,
           re.note,
           re.created_at,
-          pi.title AS payment_item_title
+          pi.title AS payment_item_title,
+          pi.target_department
         FROM reconciliation_events re
         JOIN payment_obligations po ON po.id = re.obligation_id
         LEFT JOIN payment_items pi ON pi.id = po.payment_item_id
@@ -6906,12 +7674,13 @@ app.get("/api/my/payment-ledger", requireStudent, async (req, res) => {
       `,
       [req.session.user.username]
     );
+    const scopedTimeline = timeline.filter((row) => rowMatchesStudentDepartmentScope(row, studentDepartment));
 
     return res.json({
       summary,
       nextDueItem,
       items,
-      timeline,
+      timeline: scopedTimeline,
       generatedAt: new Date().toISOString(),
     });
   } catch (_err) {
@@ -7377,6 +8146,7 @@ app.get(["/lecturer", "/teacher"], requireTeacher, (_req, res) => {
 app.get("/api/notifications", requireAuth, async (req, res) => {
   try {
     const isStudent = req.session.user.role === "student";
+    const studentDepartment = isStudent ? await getSessionUserDepartment(req) : "";
     const whereClause = isStudent ? "WHERE (n.expires_at IS NULL OR datetime(n.expires_at) > CURRENT_TIMESTAMP)" : "";
     const rows = await all(
       `
@@ -7390,6 +8160,8 @@ app.get("/api/notifications", requireAuth, async (req, res) => {
           n.expires_at,
           n.related_payment_item_id,
           n.auto_generated,
+          n.target_department,
+          n.user_id,
           n.created_by,
           n.created_at,
           CASE WHEN nr.notification_id IS NULL THEN 0 ELSE 1 END AS is_read,
@@ -7408,7 +8180,16 @@ app.get("/api/notifications", requireAuth, async (req, res) => {
       [req.session.user.username, req.session.user.username]
     );
 
-    const notificationIds = rows.map((row) => Number(row.id)).filter((id) => Number.isFinite(id) && id > 0);
+    const scopedRows = isStudent
+      ? rows.filter((row) => {
+          const directUserMatch =
+            !row.user_id ||
+            normalizeIdentifier(row.user_id || "") === normalizeIdentifier(req.session.user.username || "");
+          return directUserMatch && departmentScopeMatchesStudent(row.target_department, studentDepartment);
+        })
+      : rows;
+
+    const notificationIds = scopedRows.map((row) => Number(row.id)).filter((id) => Number.isFinite(id) && id > 0);
     let reactionCountRows = [];
     if (notificationIds.length) {
       const placeholders = notificationIds.map(() => "?").join(", ");
@@ -7430,7 +8211,7 @@ app.get("/api/notifications", requireAuth, async (req, res) => {
       }
       reactionsByNotification.get(notificationId)[String(row.reaction || "")] = Number(row.total || 0);
     });
-    const rowsWithReactions = rows.map((row) => ({
+    const rowsWithReactions = scopedRows.map((row) => ({
       ...row,
       reaction_counts: reactionsByNotification.get(Number(row.id || 0)) || {},
     }));
@@ -7439,22 +8220,49 @@ app.get("/api/notifications", requireAuth, async (req, res) => {
       return res.json(rowsWithReactions);
     }
 
-    const unreadRows = await all(
-      `
-        SELECT
-          n.id,
-          (
-            (SELECT COUNT(*) FROM auth_roster WHERE role = 'student')
-            - COUNT(nr.username)
-          ) AS unread_count
-        FROM notifications n
-        LEFT JOIN notification_reads nr
-          ON nr.notification_id = n.id
-         AND nr.username IN (SELECT auth_id FROM auth_roster WHERE role = 'student')
-        GROUP BY n.id
-      `
-    );
-    const unreadById = new Map(unreadRows.map((row) => [row.id, Number(row.unread_count || 0)]));
+    const unreadById = new Map();
+    if (notificationIds.length) {
+      const students = await listStudentDepartmentRows();
+      const placeholders = notificationIds.map(() => "?").join(", ");
+      const readRows = await all(
+        `
+          SELECT notification_id, username
+          FROM notification_reads
+          WHERE notification_id IN (${placeholders})
+        `,
+        notificationIds
+      );
+      const readSetById = new Map();
+      readRows.forEach((row) => {
+        const key = Number(row.notification_id || 0);
+        if (!readSetById.has(key)) {
+          readSetById.set(key, new Set());
+        }
+        readSetById.get(key).add(normalizeIdentifier(row.username || ""));
+      });
+
+      rowsWithReactions.forEach((row) => {
+        const notificationId = Number(row.id || 0);
+        if (!notificationId) {
+          return;
+        }
+        const directUser = normalizeIdentifier(row.user_id || "");
+        const eligibleStudents = directUser
+          ? students.filter((studentRow) => normalizeIdentifier(studentRow.auth_id || "") === directUser)
+          : students.filter((studentRow) =>
+              departmentScopeMatchesStudent(row.target_department, normalizeDepartment(studentRow.department || ""))
+            );
+        const readUsers = readSetById.get(notificationId) || new Set();
+        let readEligibleCount = 0;
+        eligibleStudents.forEach((studentRow) => {
+          const username = normalizeIdentifier(studentRow.auth_id || "");
+          if (username && readUsers.has(username)) {
+            readEligibleCount += 1;
+          }
+        });
+        unreadById.set(notificationId, Math.max(0, eligibleStudents.length - readEligibleCount));
+      });
+    }
     let reactionDetailRows = [];
     if (notificationIds.length) {
       const placeholders = notificationIds.map(() => "?").join(", ");
@@ -7497,11 +8305,19 @@ app.post("/api/notifications/:id/reaction", requireAuth, async (req, res) => {
 
   try {
     const row = await get(
-      "SELECT id, auto_generated, related_payment_item_id FROM notifications WHERE id = ? LIMIT 1",
+      "SELECT id, auto_generated, related_payment_item_id, target_department, user_id FROM notifications WHERE id = ? LIMIT 1",
       [id]
     );
     if (!row) {
       return res.status(404).json({ error: "Notification not found." });
+    }
+    if (req.session.user.role === "student") {
+      const studentDepartment = await getSessionUserDepartment(req);
+      const directUserMatch =
+        !row.user_id || normalizeIdentifier(row.user_id || "") === normalizeIdentifier(req.session.user.username || "");
+      if (!directUserMatch || !departmentScopeMatchesStudent(row.target_department, studentDepartment)) {
+        return res.status(403).json({ error: "You do not have access to this notification." });
+      }
     }
     if (Number(row.auto_generated || 0) === 1 || Number(row.related_payment_item_id || 0) > 0) {
       return res.status(400).json({ error: "Payment item notifications cannot be reacted to." });
@@ -7547,9 +8363,15 @@ app.post("/api/handouts/:id/reaction", requireAuth, async (req, res) => {
     return res.status(400).json({ error: "Invalid reaction." });
   }
   try {
-    const row = await get("SELECT id FROM handouts WHERE id = ? LIMIT 1", [id]);
+    const row = await get("SELECT id, target_department FROM handouts WHERE id = ? LIMIT 1", [id]);
     if (!row) {
       return res.status(404).json({ error: "Handout not found." });
+    }
+    if (req.session.user.role === "student") {
+      const studentDepartment = await getSessionUserDepartment(req);
+      if (!departmentScopeMatchesStudent(row.target_department, studentDepartment)) {
+        return res.status(403).json({ error: "You do not have access to this handout." });
+      }
     }
     if (!rawReaction) {
       await run("DELETE FROM handout_reactions WHERE handout_id = ? AND username = ?", [
@@ -7584,9 +8406,15 @@ app.post("/api/shared-files/:id/reaction", requireAuth, async (req, res) => {
     return res.status(400).json({ error: "Invalid reaction." });
   }
   try {
-    const row = await get("SELECT id FROM shared_files WHERE id = ? LIMIT 1", [id]);
+    const row = await get("SELECT id, target_department FROM shared_files WHERE id = ? LIMIT 1", [id]);
     if (!row) {
       return res.status(404).json({ error: "Shared file not found." });
+    }
+    if (req.session.user.role === "student") {
+      const studentDepartment = await getSessionUserDepartment(req);
+      if (!departmentScopeMatchesStudent(row.target_department, studentDepartment)) {
+        return res.status(403).json({ error: "You do not have access to this shared file." });
+      }
     }
     if (!rawReaction) {
       await run("DELETE FROM shared_file_reactions WHERE shared_file_id = ? AND username = ?", [
@@ -7626,12 +8454,13 @@ app.post("/api/notifications", requireTeacher, async (req, res) => {
   }
 
   try {
+    const targetDepartment = await resolveContentTargetDepartment(req, req.body?.targetDepartment || "");
     const result = await run(
       `
-        INSERT INTO notifications (title, body, category, is_urgent, is_pinned, created_by)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO notifications (title, body, category, is_urgent, is_pinned, target_department, created_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
       `,
-      [title, body, category, isUrgent, isPinned, req.session.user.username]
+      [title, body, category, isUrgent, isPinned, targetDepartment, req.session.user.username]
     );
     await logAuditEvent(
       req,
@@ -7646,7 +8475,10 @@ app.post("/api/notifications", requireTeacher, async (req, res) => {
       created_by: req.session.user.username,
     });
     return res.status(201).json({ ok: true });
-  } catch (_err) {
+  } catch (err) {
+    if (err && err.status && err.error) {
+      return res.status(err.status).json({ error: err.error });
+    }
     return res.status(500).json({ error: "Could not save notification." });
   }
 });
@@ -7677,14 +8509,18 @@ app.put("/api/notifications/:id", requireTeacher, async (req, res) => {
     if (access.error === "forbidden") {
       return res.status(403).json({ error: "You can only edit your own notification." });
     }
+    const targetDepartment = await resolveContentTargetDepartment(
+      req,
+      req.body?.targetDepartment || access.row.target_department || ""
+    );
 
     await run(
       `
         UPDATE notifications
-        SET title = ?, body = ?, category = ?, is_urgent = ?, is_pinned = ?
+        SET title = ?, body = ?, category = ?, is_urgent = ?, is_pinned = ?, target_department = ?
         WHERE id = ?
       `,
-      [title, body, category, isUrgent, isPinned, id]
+      [title, body, category, isUrgent, isPinned, targetDepartment, id]
     );
     await logAuditEvent(
       req,
@@ -7698,7 +8534,10 @@ app.put("/api/notifications/:id", requireTeacher, async (req, res) => {
       id,
     });
     return res.status(200).json({ ok: true });
-  } catch (_err) {
+  } catch (err) {
+    if (err && err.status && err.error) {
+      return res.status(err.status).json({ error: err.error });
+    }
     return res.status(500).json({ error: "Could not update notification." });
   }
 });
@@ -7713,9 +8552,15 @@ app.post("/api/notifications/:id/read", requireAuth, async (req, res) => {
   }
 
   try {
-    const row = await get("SELECT id FROM notifications WHERE id = ? LIMIT 1", [id]);
+    const row = await get("SELECT id, target_department, user_id FROM notifications WHERE id = ? LIMIT 1", [id]);
     if (!row) {
       return res.status(404).json({ error: "Notification not found." });
+    }
+    const studentDepartment = await getSessionUserDepartment(req);
+    const directUserMatch =
+      !row.user_id || normalizeIdentifier(row.user_id || "") === normalizeIdentifier(req.session.user.username || "");
+    if (!directUserMatch || !departmentScopeMatchesStudent(row.target_department, studentDepartment)) {
+      return res.status(403).json({ error: "You do not have access to this notification." });
     }
 
     await run(
@@ -7786,11 +8631,15 @@ registerHandoutRoutes(app, {
   removeStoredContentFile,
   isValidHttpUrl,
   isValidLocalContentUrl,
+  getSessionUserDepartment,
+  departmentScopeMatchesStudent,
+  resolveContentTargetDepartment,
 });
 
 registerAdminImportRoutes(app, {
   requireAdmin,
   processRosterCsv,
+  processDepartmentChecklistCsv,
 });
 
 registerSharedFileRoutes(app, {
@@ -7808,6 +8657,9 @@ registerSharedFileRoutes(app, {
   removeStoredContentFile,
   isValidHttpUrl,
   isValidLocalContentUrl,
+  getSessionUserDepartment,
+  departmentScopeMatchesStudent,
+  resolveContentTargetDepartment,
 });
 
 registerPageRoutes(app, {

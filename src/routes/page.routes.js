@@ -34,6 +34,14 @@ function registerPageRoutes(app, deps) {
     res.sendFile(path.join(PROJECT_ROOT, "messages.html"));
   });
 
+  app.get("/profile", requireAuth, (req, res) => {
+    res.sendFile(path.join(PROJECT_ROOT, "profile.html"));
+  });
+
+  app.get("/profile.html", requireAuth, (req, res) => {
+    res.sendFile(path.join(PROJECT_ROOT, "profile.html"));
+  });
+
   app.get("/analytics", requireTeacher, (req, res) => {
     res.sendFile(path.join(PROJECT_ROOT, "analytics.html"));
   });

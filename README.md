@@ -20,6 +20,14 @@ The payment system runs in strict Paystack mode:
 - `lecturer` (stored as `teacher` role value): manage payment items, verify delayed Paystack references, review reconciliation exceptions.
 - `admin`: all lecturer capabilities + broader monitoring.
 
+## Department Scoping
+
+- Student and lecturer roster CSVs now require a `department` column.
+- Lecturer content (notifications, handouts, shared files, payment items) is automatically scoped to the lecturer department.
+- Superdepartment targeting is supported through `data/department-groups.csv` (for example, `science` can cover multiple science departments).
+- Student feeds and payment views are filtered by department scope.
+- Admin import also supports department checklist CSV uploads (`department,task[,order]`), consumed on the profile checklist page.
+
 ## Core APIs
 
 ### Payment Items + Obligations
