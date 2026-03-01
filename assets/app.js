@@ -200,6 +200,92 @@ function arrangeSidebarNav() {
   }
 }
 
+function buildFileInputButtonLabel(input) {
+  const id = String(input?.id || "")
+    .trim()
+    .toLowerCase();
+  const name = String(input?.name || "")
+    .trim()
+    .toLowerCase();
+  const token = `${id} ${name}`;
+  if (token.includes("avatar") || token.includes("profile")) {
+    return "Upload Photo";
+  }
+  if (token.includes("csv")) {
+    return "Choose CSV File";
+  }
+  if (token.includes("handout")) {
+    return "Choose Handout File";
+  }
+  if (token.includes("shared")) {
+    return "Choose Media File";
+  }
+  return "Choose File";
+}
+
+function formatSelectedFileNames(fileList) {
+  const files = Array.from(fileList || []);
+  if (!files.length) {
+    return "No file selected";
+  }
+  if (files.length === 1) {
+    return files[0].name || "1 file selected";
+  }
+  if (files.length === 2) {
+    return `${files[0].name}, ${files[1].name}`;
+  }
+  return `${files[0].name}, ${files[1].name} +${files.length - 2} more`;
+}
+
+function enhanceFileInputs(root = document) {
+  const scope = root instanceof Element || root instanceof Document ? root : document;
+  const inputs = scope.querySelectorAll('input[type="file"]:not([data-file-theme="ready"])');
+  inputs.forEach((input, index) => {
+    if (!(input instanceof HTMLInputElement)) {
+      return;
+    }
+
+    let id = String(input.id || "").trim();
+    if (!id) {
+      id = `fileInput-${Date.now()}-${index}`;
+      input.id = id;
+    }
+
+    input.dataset.fileTheme = "ready";
+    input.classList.add("file-input-theme__native");
+
+    const wrapper = document.createElement("div");
+    wrapper.className = "file-input-theme";
+
+    const control = document.createElement("div");
+    control.className = "file-input-theme__control";
+
+    const button = document.createElement("label");
+    button.className = "btn btn-secondary file-input-theme__button";
+    button.setAttribute("for", id);
+    button.textContent = buildFileInputButtonLabel(input);
+
+    const filename = document.createElement("span");
+    filename.className = "file-input-theme__name";
+    filename.textContent = formatSelectedFileNames(input.files);
+
+    control.append(button, filename);
+    wrapper.append(control);
+
+    const parent = input.parentElement;
+    if (!parent) {
+      return;
+    }
+    parent.insertBefore(wrapper, input.nextSibling);
+
+    input.addEventListener("change", () => {
+      filename.textContent = formatSelectedFileNames(input.files);
+    });
+  });
+}
+
+window.enhanceFileInputs = enhanceFileInputs;
+
 async function toggleTeacherRoleLinks() {
   const teacherLinks = document.querySelectorAll('[data-role-link="lecturer"], [data-role-link="analytics"]');
   if (!teacherLinks.length) {
@@ -223,6 +309,17 @@ async function toggleTeacherRoleLinks() {
 }
 
 toggleTeacherRoleLinks();
+enhanceFileInputs(document);
+
+if (document.body && typeof MutationObserver === "function") {
+  const fileInputObserver = new MutationObserver(() => {
+    enhanceFileInputs(document);
+  });
+  fileInputObserver.observe(document.body, {
+    childList: true,
+    subtree: true,
+  });
+}
 
 (function initThemeToggle() {
   const storageKey = "campuspay-theme";

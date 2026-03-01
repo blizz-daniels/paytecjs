@@ -737,6 +737,45 @@ body {
   transform: translateY(0);
 }
 
+.file-input-theme__native {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  margin: -1px !important;
+  padding: 0 !important;
+  overflow: hidden !important;
+  clip: rect(0 0 0 0) !important;
+  border: 0 !important;
+}
+
+.file-input-theme {
+  display: block;
+  width: 100%;
+}
+
+.file-input-theme__control {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.file-input-theme__button {
+  margin: 0;
+  cursor: pointer;
+}
+
+.file-input-theme__name {
+  font-size: 0.9rem;
+  color: var(--muted);
+  line-height: 1.3;
+  word-break: break-word;
+}
+
+[data-theme="dark"] .file-input-theme__name {
+  color: #bdd0ee;
+}
+
 body.has-profile-panel {
   overflow: hidden;
 }
