@@ -397,6 +397,7 @@ function createAnalyticsHelpers(options = {}) {
   }
 
   async function getAnalyticsStatusBreakdownPayload(req, filters) {
+    const normalizedStatusExpr = "COALESCE(NULLIF(TRIM(pt.status), ''), 'unknown')";
     const scoped = buildAnalyticsScopedWhereClause(req, filters, {
       dateExpression: "COALESCE(pt.paid_at, pt.created_at)",
       paymentItemExpression: "COALESCE(po.payment_item_id, pt.payment_item_hint_id)",
@@ -405,14 +406,14 @@ function createAnalyticsHelpers(options = {}) {
     const rows = await all(
       `
         SELECT
-          COALESCE(NULLIF(TRIM(pt.status), ''), 'unknown') AS status,
+          ${normalizedStatusExpr} AS status,
           COUNT(*) AS count
         FROM payment_transactions pt
         LEFT JOIN payment_obligations po ON po.id = pt.matched_obligation_id
         LEFT JOIN payment_items pi ON pi.id = COALESCE(po.payment_item_id, pt.payment_item_hint_id)
         ${scoped.whereClause}
-        GROUP BY status
-        ORDER BY count DESC, status ASC
+        GROUP BY ${normalizedStatusExpr}
+        ORDER BY COUNT(*) DESC, ${normalizedStatusExpr} ASC
       `,
       scoped.params
     );
