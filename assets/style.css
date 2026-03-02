@@ -2117,6 +2117,10 @@ body.has-mobile-nav {
   color: #f5f9ff;
 }
 
+[data-theme="dark"] .nav-link__icon {
+  filter: brightness(0) invert(1);
+}
+
 [data-theme="dark"] .card,
 [data-theme="dark"] .auth-card,
 [data-theme="dark"] .page-title {
