@@ -359,152 +359,181 @@ async function submitFormData(url, formData) {
   return data;
 }
 
-const notificationForm = document.getElementById("notificationForm");
-if (notificationForm) {
-  notificationForm.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const submitButton = notificationForm.querySelector('button[type="submit"]');
-    const loadingToast = window.showToast
-      ? window.showToast("Publishing notification...", { type: "loading", sticky: true })
-      : null;
-    setButtonBusy(submitButton, true, "Publishing...");
-    setStatus("notificationStatus", "Publishing...", false);
-
-    const payload = {
-      title: document.getElementById("notificationTitle").value.trim(),
-      category: document.getElementById("notificationCategory").value.trim(),
-      body: document.getElementById("notificationBody").value.trim(),
-      isUrgent: document.getElementById("notificationUrgent").checked,
-      isPinned: document.getElementById("notificationPinned").checked,
-    };
-
-    try {
-      await submitJson("/api/notifications", payload);
-      notificationForm.reset();
-      document.getElementById("notificationCategory").value = "General";
-      document.getElementById("notificationPinned").checked = false;
-      setStatus("notificationStatus", "Notification published.", false);
-      if (window.showToast) {
-        window.showToast("Notification published.", { type: "success" });
-      }
-      await loadManageData();
-    } catch (err) {
-      setStatus("notificationStatus", err.message, true);
-      if (window.showToast) {
-        window.showToast(err.message || "Could not publish notification.", { type: "error" });
-      }
-    } finally {
-      setButtonBusy(submitButton, false, "");
-      if (loadingToast) {
-        loadingToast.close();
-      }
-    }
-  });
+function isLecturerPageActive() {
+  const page = String(document.body?.dataset?.page || "")
+    .trim()
+    .toLowerCase();
+  if (page === "lecturer") {
+    return true;
+  }
+  const pathname = String(window.location.pathname || "")
+    .trim()
+    .toLowerCase();
+  return pathname === "/lecturer" || pathname === "/teacher" || pathname === "/lecturer.html" || pathname === "/teacher.html";
 }
 
-const handoutForm = document.getElementById("handoutForm");
-if (handoutForm) {
-  handoutForm.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const submitButton = handoutForm.querySelector('button[type="submit"]');
-    const loadingToast = window.showToast
-      ? window.showToast("Saving handout...", { type: "loading", sticky: true })
-      : null;
-    setButtonBusy(submitButton, true, "Saving...");
-    setStatus("handoutStatus", "Saving...", false);
-
-    const fileInput = document.getElementById("handoutFileInput");
-    const selectedFile = fileInput && fileInput.files ? fileInput.files[0] : null;
-    if (!selectedFile) {
-      setStatus("handoutStatus", "Please select a handout file.", true);
-      if (window.showToast) {
-        window.showToast("Please select a handout file.", { type: "error" });
-      }
-      setButtonBusy(submitButton, false, "");
-      if (loadingToast) {
-        loadingToast.close();
-      }
+function initLecturerPage() {
+  if (!isLecturerPageActive()) {
+    return;
+  }
+  const root = document.querySelector("main.container");
+  if (root instanceof HTMLElement) {
+    if (root.dataset.lecturerInitialized === "1") {
       return;
     }
+    root.dataset.lecturerInitialized = "1";
+  }
 
-    const formData = new FormData();
-    formData.append("title", document.getElementById("handoutTitle").value.trim());
-    formData.append("description", document.getElementById("handoutDescription").value.trim());
-    formData.append("file", selectedFile);
+  const notificationForm = document.getElementById("notificationForm");
+  if (notificationForm) {
+    notificationForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const submitButton = notificationForm.querySelector('button[type="submit"]');
+      const loadingToast = window.showToast
+        ? window.showToast("Publishing notification...", { type: "loading", sticky: true })
+        : null;
+      setButtonBusy(submitButton, true, "Publishing...");
+      setStatus("notificationStatus", "Publishing...", false);
 
-    try {
-      await submitFormData("/api/handouts", formData);
-      handoutForm.reset();
-      setStatus("handoutStatus", "Handout saved.", false);
-      if (window.showToast) {
-        window.showToast("Handout saved.", { type: "success" });
+      const payload = {
+        title: document.getElementById("notificationTitle").value.trim(),
+        category: document.getElementById("notificationCategory").value.trim(),
+        body: document.getElementById("notificationBody").value.trim(),
+        isUrgent: document.getElementById("notificationUrgent").checked,
+        isPinned: document.getElementById("notificationPinned").checked,
+      };
+
+      try {
+        await submitJson("/api/notifications", payload);
+        notificationForm.reset();
+        document.getElementById("notificationCategory").value = "General";
+        document.getElementById("notificationPinned").checked = false;
+        setStatus("notificationStatus", "Notification published.", false);
+        if (window.showToast) {
+          window.showToast("Notification published.", { type: "success" });
+        }
+        await loadManageData();
+      } catch (err) {
+        setStatus("notificationStatus", err.message, true);
+        if (window.showToast) {
+          window.showToast(err.message || "Could not publish notification.", { type: "error" });
+        }
+      } finally {
+        setButtonBusy(submitButton, false, "");
+        if (loadingToast) {
+          loadingToast.close();
+        }
       }
-      await loadManageData();
-    } catch (err) {
-      setStatus("handoutStatus", err.message, true);
-      if (window.showToast) {
-        window.showToast(err.message || "Could not save handout.", { type: "error" });
+    });
+  }
+
+  const handoutForm = document.getElementById("handoutForm");
+  if (handoutForm) {
+    handoutForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const submitButton = handoutForm.querySelector('button[type="submit"]');
+      const loadingToast = window.showToast
+        ? window.showToast("Saving handout...", { type: "loading", sticky: true })
+        : null;
+      setButtonBusy(submitButton, true, "Saving...");
+      setStatus("handoutStatus", "Saving...", false);
+
+      const fileInput = document.getElementById("handoutFileInput");
+      const selectedFile = fileInput && fileInput.files ? fileInput.files[0] : null;
+      if (!selectedFile) {
+        setStatus("handoutStatus", "Please select a handout file.", true);
+        if (window.showToast) {
+          window.showToast("Please select a handout file.", { type: "error" });
+        }
+        setButtonBusy(submitButton, false, "");
+        if (loadingToast) {
+          loadingToast.close();
+        }
+        return;
       }
-    } finally {
-      setButtonBusy(submitButton, false, "");
-      if (loadingToast) {
-        loadingToast.close();
+
+      const formData = new FormData();
+      formData.append("title", document.getElementById("handoutTitle").value.trim());
+      formData.append("description", document.getElementById("handoutDescription").value.trim());
+      formData.append("file", selectedFile);
+
+      try {
+        await submitFormData("/api/handouts", formData);
+        handoutForm.reset();
+        setStatus("handoutStatus", "Handout saved.", false);
+        if (window.showToast) {
+          window.showToast("Handout saved.", { type: "success" });
+        }
+        await loadManageData();
+      } catch (err) {
+        setStatus("handoutStatus", err.message, true);
+        if (window.showToast) {
+          window.showToast(err.message || "Could not save handout.", { type: "error" });
+        }
+      } finally {
+        setButtonBusy(submitButton, false, "");
+        if (loadingToast) {
+          loadingToast.close();
+        }
       }
-    }
-  });
+    });
+  }
+
+  const sharedFileForm = document.getElementById("sharedFileForm");
+  if (sharedFileForm) {
+    sharedFileForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const submitButton = sharedFileForm.querySelector('button[type="submit"]');
+      const loadingToast = window.showToast
+        ? window.showToast("Publishing file...", { type: "loading", sticky: true })
+        : null;
+      setButtonBusy(submitButton, true, "Publishing...");
+      setStatus("sharedFileStatus", "Publishing...", false);
+
+      const fileInput = document.getElementById("sharedFileInput");
+      const selectedFile = fileInput && fileInput.files ? fileInput.files[0] : null;
+      if (!selectedFile) {
+        setStatus("sharedFileStatus", "Please select a shared file.", true);
+        if (window.showToast) {
+          window.showToast("Please select a shared file.", { type: "error" });
+        }
+        setButtonBusy(submitButton, false, "");
+        if (loadingToast) {
+          loadingToast.close();
+        }
+        return;
+      }
+
+      const formData = new FormData();
+      formData.append("title", document.getElementById("sharedFileTitle").value.trim());
+      formData.append("description", document.getElementById("sharedFileDescription").value.trim());
+      formData.append("file", selectedFile);
+
+      try {
+        await submitFormData("/api/shared-files", formData);
+        sharedFileForm.reset();
+        setStatus("sharedFileStatus", "Shared file published.", false);
+        if (window.showToast) {
+          window.showToast("Shared file published.", { type: "success" });
+        }
+        await loadManageData();
+      } catch (err) {
+        setStatus("sharedFileStatus", err.message, true);
+        if (window.showToast) {
+          window.showToast(err.message || "Could not publish file.", { type: "error" });
+        }
+      } finally {
+        setButtonBusy(submitButton, false, "");
+        if (loadingToast) {
+          loadingToast.close();
+        }
+      }
+    });
+  }
+
+  manageConfigs.forEach(bindManageActions);
+  loadCurrentUser().then(loadManageData);
 }
 
-const sharedFileForm = document.getElementById("sharedFileForm");
-if (sharedFileForm) {
-  sharedFileForm.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const submitButton = sharedFileForm.querySelector('button[type="submit"]');
-    const loadingToast = window.showToast
-      ? window.showToast("Publishing file...", { type: "loading", sticky: true })
-      : null;
-    setButtonBusy(submitButton, true, "Publishing...");
-    setStatus("sharedFileStatus", "Publishing...", false);
-
-    const fileInput = document.getElementById("sharedFileInput");
-    const selectedFile = fileInput && fileInput.files ? fileInput.files[0] : null;
-    if (!selectedFile) {
-      setStatus("sharedFileStatus", "Please select a shared file.", true);
-      if (window.showToast) {
-        window.showToast("Please select a shared file.", { type: "error" });
-      }
-      setButtonBusy(submitButton, false, "");
-      if (loadingToast) {
-        loadingToast.close();
-      }
-      return;
-    }
-
-    const formData = new FormData();
-    formData.append("title", document.getElementById("sharedFileTitle").value.trim());
-    formData.append("description", document.getElementById("sharedFileDescription").value.trim());
-    formData.append("file", selectedFile);
-
-    try {
-      await submitFormData("/api/shared-files", formData);
-      sharedFileForm.reset();
-      setStatus("sharedFileStatus", "Shared file published.", false);
-      if (window.showToast) {
-        window.showToast("Shared file published.", { type: "success" });
-      }
-      await loadManageData();
-    } catch (err) {
-      setStatus("sharedFileStatus", err.message, true);
-      if (window.showToast) {
-        window.showToast(err.message || "Could not publish file.", { type: "error" });
-      }
-    } finally {
-      setButtonBusy(submitButton, false, "");
-      if (loadingToast) {
-        loadingToast.close();
-      }
-    }
-  });
-}
-
-manageConfigs.forEach(bindManageActions);
-loadCurrentUser().then(loadManageData);
+window.initLecturerPage = initLecturerPage;
+initLecturerPage();

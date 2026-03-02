@@ -1448,6 +1448,13 @@ async function initPaymentsPage() {
   if (page !== "payments") {
     return;
   }
+  const root = document.querySelector("main.container");
+  if (root instanceof HTMLElement) {
+    if (root.dataset.paymentsInitialized === "1") {
+      return;
+    }
+    root.dataset.paymentsInitialized = "1";
+  }
   try {
     paymentState.me = await requestJson("/api/me");
     await loadPaymentItems();
@@ -1485,6 +1492,9 @@ async function initPaymentsPage() {
     bindQueueActions();
     await Promise.all([loadQueue(), loadReconciliationSummary(), loadPaystackReferenceRequests()]);
   } catch (err) {
+    if (root instanceof HTMLElement) {
+      delete root.dataset.paymentsInitialized;
+    }
     const errorNode = document.getElementById("paymentsError");
     if (errorNode) {
       errorNode.textContent = err.message || "Could not load payments page.";
@@ -1496,4 +1506,5 @@ async function initPaymentsPage() {
   }
 }
 
+window.initPaymentsPage = initPaymentsPage;
 initPaymentsPage();

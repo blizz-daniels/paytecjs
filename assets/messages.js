@@ -448,6 +448,16 @@ function bindRefreshButton() {
 }
 
 async function initMessagesPage() {
+  if (document.body?.dataset?.page !== "messages") {
+    return;
+  }
+  const root = document.querySelector("main.messages-layout") || document.querySelector("main.container");
+  if (root instanceof HTMLElement) {
+    if (root.dataset.messagesInitialized === "1") {
+      return;
+    }
+    root.dataset.messagesInitialized = "1";
+  }
   try {
     messagingState.me = await requestJson("/api/me");
     bindRefreshButton();
@@ -456,6 +466,9 @@ async function initMessagesPage() {
     await loadComposeStudents();
     await loadThreads({ preserveSelection: true });
   } catch (err) {
+    if (root instanceof HTMLElement) {
+      delete root.dataset.messagesInitialized;
+    }
     setStatus("messagesListStatus", err?.message || "Could not load messaging page.", true);
     const placeholder = document.getElementById("messagePlaceholderState");
     if (placeholder) {
@@ -464,6 +477,16 @@ async function initMessagesPage() {
   }
 }
 
-window.addEventListener("DOMContentLoaded", () => {
+window.initMessagesPage = initMessagesPage;
+
+if (document.readyState === "loading") {
+  window.addEventListener(
+    "DOMContentLoaded",
+    () => {
+      initMessagesPage();
+    },
+    { once: true }
+  );
+} else {
   initMessagesPage();
-});
+}

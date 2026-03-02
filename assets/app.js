@@ -134,17 +134,50 @@ function getNavItemPath(node) {
 }
 
 const homeNavPaths = new Set(["/", "/index.html"]);
-const contentPartialPaths = new Set(["/", "/index.html", "/notifications.html", "/handouts.html"]);
+const sidebarPartialPaths = new Set([
+  "/",
+  "/index.html",
+  "/notifications.html",
+  "/handouts.html",
+  "/payments",
+  "/payments.html",
+  "/messages",
+  "/messages.html",
+  "/lecturer",
+  "/teacher",
+  "/lecturer.html",
+  "/teacher.html",
+  "/analytics",
+  "/analytics.html",
+]);
+const partialNavCoreScriptPaths = new Set(["/assets/csrf.js", "/assets/app.js", "/assets/profile.js"]);
+const loadedPageScripts = new Map();
 let partialContentNavigationToken = 0;
 
 function isSameActivePath(leftPath, rightPath) {
   if (!leftPath || !rightPath) {
     return false;
   }
-  if (leftPath === rightPath) {
-    return true;
-  }
-  return homeNavPaths.has(leftPath) && homeNavPaths.has(rightPath);
+  const canonicalize = (path) => {
+    const normalized = normalizePath(path);
+    if (homeNavPaths.has(normalized)) {
+      return "/";
+    }
+    if (normalized === "/payments" || normalized === "/payments.html") {
+      return "/payments";
+    }
+    if (normalized === "/messages" || normalized === "/messages.html") {
+      return "/messages";
+    }
+    if (normalized === "/lecturer" || normalized === "/teacher" || normalized === "/lecturer.html" || normalized === "/teacher.html") {
+      return "/lecturer";
+    }
+    if (normalized === "/analytics" || normalized === "/analytics.html") {
+      return "/analytics";
+    }
+    return normalized;
+  };
+  return canonicalize(leftPath) === canonicalize(rightPath);
 }
 
 function updateActiveNavLinks(pathname = window.location.pathname) {
@@ -168,7 +201,153 @@ function updateActiveNavLinks(pathname = window.location.pathname) {
   });
 }
 
-function canUseContentPartialNavigation(url) {
+function inferPageKeyFromPath(pathname) {
+  const path = normalizePath(pathname);
+  if (homeNavPaths.has(path)) {
+    return "home";
+  }
+  if (path === "/notifications.html") {
+    return "notifications";
+  }
+  if (path === "/handouts.html") {
+    return "handouts";
+  }
+  if (path === "/payments" || path === "/payments.html") {
+    return "payments";
+  }
+  if (path === "/messages" || path === "/messages.html") {
+    return "messages";
+  }
+  if (path === "/lecturer" || path === "/teacher" || path === "/lecturer.html" || path === "/teacher.html") {
+    return "lecturer";
+  }
+  if (path === "/analytics" || path === "/analytics.html") {
+    return "analytics";
+  }
+  return "";
+}
+
+function resolvePageKey(pathname, datasetPage = "") {
+  const explicit = String(datasetPage || "")
+    .trim()
+    .toLowerCase();
+  if (explicit) {
+    return explicit;
+  }
+  return inferPageKeyFromPath(pathname);
+}
+
+function seedLoadedScriptsFromDocument() {
+  const scripts = document.querySelectorAll("script[src]");
+  scripts.forEach((script) => {
+    const rawSrc = String(script.getAttribute("src") || "").trim();
+    if (!rawSrc) {
+      return;
+    }
+    let url;
+    try {
+      url = new URL(rawSrc, window.location.origin).toString();
+    } catch (_err) {
+      return;
+    }
+    if (!loadedPageScripts.has(url)) {
+      loadedPageScripts.set(url, Promise.resolve());
+    }
+  });
+}
+
+function parsePageScriptUrls(doc) {
+  const scripts = doc.querySelectorAll("script[src]");
+  const urls = [];
+  const seen = new Set();
+  scripts.forEach((script) => {
+    const rawSrc = String(script.getAttribute("src") || "").trim();
+    if (!rawSrc) {
+      return;
+    }
+    let url;
+    try {
+      url = new URL(rawSrc, window.location.origin);
+    } catch (_err) {
+      return;
+    }
+    const normalizedPath = normalizePath(url.pathname);
+    if (partialNavCoreScriptPaths.has(normalizedPath)) {
+      return;
+    }
+    const absoluteUrl = url.toString();
+    if (seen.has(absoluteUrl)) {
+      return;
+    }
+    seen.add(absoluteUrl);
+    urls.push(absoluteUrl);
+  });
+  return urls;
+}
+
+function ensureScriptLoaded(scriptUrl) {
+  if (loadedPageScripts.has(scriptUrl)) {
+    return loadedPageScripts.get(scriptUrl);
+  }
+  const promise = new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = scriptUrl;
+    script.async = false;
+    script.dataset.partialNavLoaded = "1";
+    script.addEventListener("load", () => {
+      resolve();
+    });
+    script.addEventListener("error", () => {
+      loadedPageScripts.delete(scriptUrl);
+      script.remove();
+      reject(new Error(`Could not load script ${scriptUrl}`));
+    });
+    document.body.appendChild(script);
+  });
+  loadedPageScripts.set(scriptUrl, promise);
+  return promise;
+}
+
+async function ensurePageScriptsLoaded(doc) {
+  const urls = parsePageScriptUrls(doc);
+  for (const scriptUrl of urls) {
+    await ensureScriptLoaded(scriptUrl);
+  }
+}
+
+function runPageInitializer(pageKey) {
+  if (pageKey === "home" || pageKey === "notifications" || pageKey === "handouts") {
+    if (typeof window.initContentPage === "function") {
+      window.initContentPage({ preserveFilters: false });
+    }
+    return;
+  }
+  if (pageKey === "payments") {
+    if (typeof window.initPaymentsPage === "function") {
+      window.initPaymentsPage();
+    }
+    return;
+  }
+  if (pageKey === "messages") {
+    if (typeof window.initMessagesPage === "function") {
+      window.initMessagesPage();
+    }
+    return;
+  }
+  if (pageKey === "lecturer") {
+    if (typeof window.initLecturerPage === "function") {
+      window.initLecturerPage();
+    }
+    return;
+  }
+  if (pageKey === "analytics") {
+    if (typeof window.initAnalyticsPage === "function") {
+      window.initAnalyticsPage();
+    }
+  }
+}
+
+function canUseSidebarPartialNavigation(url) {
   if (!(url instanceof URL)) {
     return false;
   }
@@ -177,7 +356,7 @@ function canUseContentPartialNavigation(url) {
   }
   const currentPath = normalizePath(window.location.pathname);
   const targetPath = normalizePath(url.pathname);
-  if (!contentPartialPaths.has(currentPath) || !contentPartialPaths.has(targetPath)) {
+  if (!sidebarPartialPaths.has(currentPath) || !sidebarPartialPaths.has(targetPath)) {
     return false;
   }
   return true;
@@ -216,7 +395,7 @@ function applyPartialContentDocument(doc, url) {
     document.body.appendChild(incomingFooter.cloneNode(true));
   }
 
-  const nextPage = String(doc.body?.dataset?.page || "").trim();
+  const nextPage = resolvePageKey(url.pathname, doc.body?.dataset?.page || "");
   if (nextPage) {
     document.body.dataset.page = nextPage;
   } else {
@@ -231,9 +410,7 @@ function applyPartialContentDocument(doc, url) {
   if (typeof window.enhanceFileInputs === "function") {
     window.enhanceFileInputs(document);
   }
-  if (typeof window.initContentPage === "function") {
-    window.initContentPage({ preserveFilters: false });
-  }
+  return nextPage;
 }
 
 async function navigateWithPartialContent(url, { pushHistory = true } = {}) {
@@ -249,16 +426,31 @@ async function navigateWithPartialContent(url, { pushHistory = true } = {}) {
     if (partialContentNavigationToken !== requestToken) {
       return;
     }
-    applyPartialContentDocument(doc, url);
+    const nextPage = applyPartialContentDocument(doc, url);
+    await ensurePageScriptsLoaded(doc);
+    if (partialContentNavigationToken !== requestToken) {
+      return;
+    }
+    runPageInitializer(nextPage);
+    toggleTeacherRoleLinks();
     if (pushHistory) {
       const nextUrl = `${url.pathname}${url.search}${url.hash}`;
       window.history.pushState({ partialContent: true }, "", nextUrl);
     }
   } catch (_err) {
+    if (partialContentNavigationToken !== requestToken) {
+      return;
+    }
     window.location.assign(url.toString());
   } finally {
-    if (partialContentNavigationToken === requestToken && main) {
-      main.removeAttribute("aria-busy");
+    if (partialContentNavigationToken === requestToken) {
+      if (main) {
+        main.removeAttribute("aria-busy");
+      }
+      const latestMain = document.querySelector("main.container");
+      if (latestMain) {
+        latestMain.removeAttribute("aria-busy");
+      }
     }
   }
 }
@@ -275,12 +467,16 @@ function isUnmodifiedPrimaryClick(event) {
 }
 
 function bindPartialContentNavigation() {
+  seedLoadedScriptsFromDocument();
   document.addEventListener("click", (event) => {
     if (!(event.target instanceof Element) || !isUnmodifiedPrimaryClick(event)) {
       return;
     }
     const anchor = event.target.closest("a[href]");
     if (!(anchor instanceof HTMLAnchorElement)) {
+      return;
+    }
+    if (!anchor.closest("#mainNav")) {
       return;
     }
     if (anchor.hasAttribute("download")) {
@@ -304,7 +500,7 @@ function bindPartialContentNavigation() {
     } catch (_err) {
       return;
     }
-    if (!canUseContentPartialNavigation(url)) {
+    if (!canUseSidebarPartialNavigation(url)) {
       return;
     }
 
@@ -319,7 +515,7 @@ function bindPartialContentNavigation() {
 
   window.addEventListener("popstate", () => {
     const target = new URL(window.location.href);
-    if (!canUseContentPartialNavigation(target)) {
+    if (!canUseSidebarPartialNavigation(target)) {
       return;
     }
     navigateWithPartialContent(target, { pushHistory: false });
@@ -345,7 +541,7 @@ function arrangeSidebarNav() {
   const homePaths = homeNavPaths;
   const notificationPaths = new Set(["/notifications.html"]);
   const handoutPaths = new Set(["/handouts.html"]);
-  const paymentPaths = new Set(["/payments.html"]);
+  const paymentPaths = new Set(["/payments", "/payments.html"]);
   const messagePaths = new Set(["/messages", "/messages.html"]);
   const analyticsPaths = new Set(["/analytics", "/analytics.html"]);
 

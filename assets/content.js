@@ -962,6 +962,13 @@ function initContentPage({ preserveFilters = true } = {}) {
   if (!realtimePages.has(page)) {
     return;
   }
+  const root = document.querySelector("main.container");
+  if (root instanceof HTMLElement) {
+    if (root.dataset.contentInitialized === "1") {
+      return;
+    }
+    root.dataset.contentInitialized = "1";
+  }
   if (!preserveFilters) {
     resetContentFilters();
   }

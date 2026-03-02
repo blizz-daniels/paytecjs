@@ -687,6 +687,13 @@ async function initAnalyticsPage() {
   if (document.body?.dataset?.page !== "analytics") {
     return;
   }
+  const root = document.querySelector("main.analytics-layout") || document.querySelector("main.container");
+  if (root instanceof HTMLElement) {
+    if (root.dataset.analyticsInitialized === "1") {
+      return;
+    }
+    root.dataset.analyticsInitialized = "1";
+  }
   try {
     analyticsState.me = await requestJson("/api/me");
     const role = String(analyticsState.me?.role || "").trim().toLowerCase();
@@ -698,6 +705,9 @@ async function initAnalyticsPage() {
     await loadPaymentItems();
     await loadAnalytics();
   } catch (err) {
+    if (root instanceof HTMLElement) {
+      delete root.dataset.analyticsInitialized;
+    }
     setStatus(err.message || "Could not initialize analytics page.", true);
     setLoadingState(false);
     if (window.showToast) {
@@ -706,4 +716,5 @@ async function initAnalyticsPage() {
   }
 }
 
+window.initAnalyticsPage = initAnalyticsPage;
 initAnalyticsPage();
