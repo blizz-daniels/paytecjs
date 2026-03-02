@@ -133,6 +133,199 @@ function getNavItemPath(node) {
   }
 }
 
+const homeNavPaths = new Set(["/", "/index.html"]);
+const contentPartialPaths = new Set(["/", "/index.html", "/notifications.html", "/handouts.html"]);
+let partialContentNavigationToken = 0;
+
+function isSameActivePath(leftPath, rightPath) {
+  if (!leftPath || !rightPath) {
+    return false;
+  }
+  if (leftPath === rightPath) {
+    return true;
+  }
+  return homeNavPaths.has(leftPath) && homeNavPaths.has(rightPath);
+}
+
+function updateActiveNavLinks(pathname = window.location.pathname) {
+  if (!nav) {
+    return;
+  }
+  const activePath = normalizePath(pathname);
+  const links = nav.querySelectorAll("a[href]");
+  links.forEach((link) => {
+    const linkPath = getNavItemPath(link);
+    if (!linkPath) {
+      return;
+    }
+    const isActive = isSameActivePath(linkPath, activePath);
+    link.classList.toggle("active", isActive);
+    if (isActive) {
+      link.setAttribute("aria-current", "page");
+      return;
+    }
+    link.removeAttribute("aria-current");
+  });
+}
+
+function canUseContentPartialNavigation(url) {
+  if (!(url instanceof URL)) {
+    return false;
+  }
+  if (url.origin !== window.location.origin) {
+    return false;
+  }
+  const currentPath = normalizePath(window.location.pathname);
+  const targetPath = normalizePath(url.pathname);
+  if (!contentPartialPaths.has(currentPath) || !contentPartialPaths.has(targetPath)) {
+    return false;
+  }
+  return true;
+}
+
+async function loadDocumentForPartialNavigation(url) {
+  const response = await fetch(url.toString(), {
+    credentials: "same-origin",
+    headers: {
+      "X-Requested-With": "partial-navigation",
+    },
+  });
+  if (!response.ok) {
+    throw new Error(`Could not load ${url.pathname}.`);
+  }
+  const html = await response.text();
+  const parser = new DOMParser();
+  return parser.parseFromString(html, "text/html");
+}
+
+function applyPartialContentDocument(doc, url) {
+  const currentMain = document.querySelector("main.container");
+  const incomingMain = doc.querySelector("main.container");
+  if (!currentMain || !incomingMain) {
+    throw new Error("Could not locate page container for partial navigation.");
+  }
+  currentMain.replaceWith(incomingMain.cloneNode(true));
+
+  const currentFooter = document.querySelector("footer.footer");
+  const incomingFooter = doc.querySelector("footer.footer");
+  if (currentFooter && incomingFooter) {
+    currentFooter.replaceWith(incomingFooter.cloneNode(true));
+  } else if (currentFooter && !incomingFooter) {
+    currentFooter.remove();
+  } else if (!currentFooter && incomingFooter && document.body) {
+    document.body.appendChild(incomingFooter.cloneNode(true));
+  }
+
+  const nextPage = String(doc.body?.dataset?.page || "").trim();
+  if (nextPage) {
+    document.body.dataset.page = nextPage;
+  } else {
+    delete document.body.dataset.page;
+  }
+  if (doc.title) {
+    document.title = doc.title;
+  }
+
+  updateActiveNavLinks(url.pathname);
+  closeMobileNav();
+  if (typeof window.enhanceFileInputs === "function") {
+    window.enhanceFileInputs(document);
+  }
+  if (typeof window.initContentPage === "function") {
+    window.initContentPage({ preserveFilters: false });
+  }
+}
+
+async function navigateWithPartialContent(url, { pushHistory = true } = {}) {
+  const requestToken = partialContentNavigationToken + 1;
+  partialContentNavigationToken = requestToken;
+  const main = document.querySelector("main.container");
+  if (main) {
+    main.setAttribute("aria-busy", "true");
+  }
+
+  try {
+    const doc = await loadDocumentForPartialNavigation(url);
+    if (partialContentNavigationToken !== requestToken) {
+      return;
+    }
+    applyPartialContentDocument(doc, url);
+    if (pushHistory) {
+      const nextUrl = `${url.pathname}${url.search}${url.hash}`;
+      window.history.pushState({ partialContent: true }, "", nextUrl);
+    }
+  } catch (_err) {
+    window.location.assign(url.toString());
+  } finally {
+    if (partialContentNavigationToken === requestToken && main) {
+      main.removeAttribute("aria-busy");
+    }
+  }
+}
+
+function isUnmodifiedPrimaryClick(event) {
+  return (
+    event.button === 0 &&
+    !event.defaultPrevented &&
+    !event.metaKey &&
+    !event.ctrlKey &&
+    !event.shiftKey &&
+    !event.altKey
+  );
+}
+
+function bindPartialContentNavigation() {
+  document.addEventListener("click", (event) => {
+    if (!(event.target instanceof Element) || !isUnmodifiedPrimaryClick(event)) {
+      return;
+    }
+    const anchor = event.target.closest("a[href]");
+    if (!(anchor instanceof HTMLAnchorElement)) {
+      return;
+    }
+    if (anchor.hasAttribute("download")) {
+      return;
+    }
+    const targetAttr = String(anchor.getAttribute("target") || "").trim().toLowerCase();
+    if (targetAttr && targetAttr !== "_self") {
+      return;
+    }
+    const rel = String(anchor.getAttribute("rel") || "").toLowerCase();
+    if (rel.includes("external")) {
+      return;
+    }
+    const href = String(anchor.getAttribute("href") || "").trim();
+    if (!href || href.startsWith("#") || href.startsWith("mailto:") || href.startsWith("tel:")) {
+      return;
+    }
+    let url;
+    try {
+      url = new URL(href, window.location.origin);
+    } catch (_err) {
+      return;
+    }
+    if (!canUseContentPartialNavigation(url)) {
+      return;
+    }
+
+    const current = new URL(window.location.href);
+    if (normalizePath(current.pathname) === normalizePath(url.pathname) && current.search === url.search) {
+      return;
+    }
+
+    event.preventDefault();
+    navigateWithPartialContent(url, { pushHistory: true });
+  });
+
+  window.addEventListener("popstate", () => {
+    const target = new URL(window.location.href);
+    if (!canUseContentPartialNavigation(target)) {
+      return;
+    }
+    navigateWithPartialContent(target, { pushHistory: false });
+  });
+}
+
 function arrangeSidebarNav() {
   if (!nav) {
     return;
@@ -149,7 +342,7 @@ function arrangeSidebarNav() {
   const bottomSection = document.createElement("div");
   bottomSection.className = "nav-section nav-section--bottom";
 
-  const homePaths = new Set(["/", "/index.html"]);
+  const homePaths = homeNavPaths;
   const notificationPaths = new Set(["/notifications.html"]);
   const handoutPaths = new Set(["/handouts.html"]);
   const paymentPaths = new Set(["/payments.html"]);
@@ -310,6 +503,7 @@ async function toggleTeacherRoleLinks() {
 
 toggleTeacherRoleLinks();
 enhanceFileInputs(document);
+bindPartialContentNavigation();
 
 if (document.body && typeof MutationObserver === "function") {
   const fileInputObserver = new MutationObserver(() => {
@@ -369,6 +563,7 @@ if (document.body && typeof MutationObserver === "function") {
 
   applyTheme(document.documentElement.getAttribute("data-theme") || initialTheme);
   arrangeSidebarNav();
+  updateActiveNavLinks(window.location.pathname);
 
   const themeInput = document.getElementById("themeToggleButton");
   if (!themeInput) {

@@ -90,6 +90,39 @@ async function requestJson(url) {
   return payload;
 }
 
+function parseContentDispositionFilename(headerValue) {
+  const raw = String(headerValue || "");
+  if (!raw) {
+    return "";
+  }
+  const utfMatch = raw.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utfMatch && utfMatch[1]) {
+    try {
+      return decodeURIComponent(utfMatch[1].trim());
+    } catch (_err) {
+      return utfMatch[1].trim();
+    }
+  }
+  const standardMatch = raw.match(/filename="?([^"]+)"?/i);
+  if (!standardMatch || !standardMatch[1]) {
+    return "";
+  }
+  return standardMatch[1].trim();
+}
+
+function triggerDownloadBlob(blob, filename) {
+  const safeBlob = blob instanceof Blob ? blob : new Blob([String(blob || "")], { type: "text/csv;charset=utf-8" });
+  const downloadName = String(filename || "").trim() || "analytics-export.csv";
+  const objectUrl = URL.createObjectURL(safeBlob);
+  const link = document.createElement("a");
+  link.href = objectUrl;
+  link.download = downloadName;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(objectUrl);
+}
+
 function getDefaultDateRange(days = 30) {
   const safeDays = Number.isFinite(days) && days > 0 ? Math.floor(days) : 30;
   const toDate = new Date();
@@ -605,7 +638,8 @@ function bindEvents() {
   }
 
   if (exportButton) {
-    exportButton.addEventListener("click", () => {
+    exportButton.addEventListener("click", async () => {
+      setButtonBusy(exportButton, true, "Exporting...");
       try {
         const filters = getFiltersFromForm();
         const query = buildQuery({
@@ -616,9 +650,34 @@ function bindEvents() {
           limit: 10,
           sort: "collected_desc",
         });
-        window.location.assign(`/api/analytics/export.csv?${query}`);
+        const response = await fetch(`/api/analytics/export.csv?${query}`, {
+          credentials: "same-origin",
+        });
+        if (!response.ok) {
+          let payload = null;
+          try {
+            payload = await response.json();
+          } catch (_err) {
+            payload = null;
+          }
+          throw new Error((payload && payload.error) || "Could not export analytics CSV.");
+        }
+        const blob = await response.blob();
+        const fileName =
+          parseContentDispositionFilename(response.headers.get("Content-Disposition")) ||
+          `analytics-${filters.from}-to-${filters.to}.csv`;
+        triggerDownloadBlob(blob, fileName);
+        setStatus(`Exported ${fileName}.`);
+        if (window.showToast) {
+          window.showToast("Analytics CSV downloaded.", { type: "success" });
+        }
       } catch (err) {
         setStatus(err.message || "Could not export analytics CSV.", true);
+        if (window.showToast) {
+          window.showToast(err.message || "Could not export analytics CSV.", { type: "error" });
+        }
+      } finally {
+        setButtonBusy(exportButton, false, "");
       }
     });
   }

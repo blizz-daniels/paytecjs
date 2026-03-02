@@ -26,6 +26,7 @@ function showContentError(message) {
 
 const contentState = {
   user: null,
+  loadToken: 0,
   data: {
     notifications: [],
     handouts: [],
@@ -57,6 +58,14 @@ const notificationReactionOptions = [
   { key: "wow", emoji: "&#128558;", label: "Wow" },
   { key: "sad", emoji: "&#128546;", label: "Sad" },
 ];
+
+function resetContentFilters() {
+  contentState.filters.query = "";
+  contentState.filters.category = "";
+  contentState.filters.lecturer = "";
+  contentState.filters.urgency = "all";
+  contentState.filters.dateFrom = "";
+}
 
 function canMarkRead(item) {
   return !!(contentState.user && contentState.user.role === "student" && !item.is_read);
@@ -864,6 +873,9 @@ async function loadContent() {
   if (!page) {
     return;
   }
+  const requestToken = contentState.loadToken + 1;
+  contentState.loadToken = requestToken;
+  const isCurrentRequest = () => contentState.loadToken === requestToken;
 
   try {
     if (page === "notifications") {
@@ -875,9 +887,15 @@ async function loadContent() {
       if (!meRes.ok || !notificationsRes.ok || !sharedFilesRes.ok) {
         throw new Error("notifications");
       }
+      if (!isCurrentRequest()) {
+        return;
+      }
       contentState.user = await meRes.json();
       contentState.data.notifications = await notificationsRes.json();
       contentState.data.sharedFiles = await sharedFilesRes.json();
+      if (!isCurrentRequest()) {
+        return;
+      }
       refreshFilterChoices();
       renderPageFromState();
       return;
@@ -891,8 +909,14 @@ async function loadContent() {
       if (!meRes.ok || !handoutsRes.ok) {
         throw new Error("handouts");
       }
+      if (!isCurrentRequest()) {
+        return;
+      }
       contentState.user = await meRes.json();
       contentState.data.handouts = await handoutsRes.json();
+      if (!isCurrentRequest()) {
+        return;
+      }
       refreshFilterChoices();
       renderPageFromState();
       return;
@@ -909,11 +933,17 @@ async function loadContent() {
       if (!meRes.ok || !notificationsRes.ok || !sharedFilesRes.ok || !handoutsRes.ok) {
         throw new Error("home");
       }
+      if (!isCurrentRequest()) {
+        return;
+      }
 
       contentState.user = await meRes.json();
       contentState.data.notifications = await notificationsRes.json();
       contentState.data.sharedFiles = await sharedFilesRes.json();
       contentState.data.handouts = await handoutsRes.json();
+      if (!isCurrentRequest()) {
+        return;
+      }
       refreshFilterChoices();
       renderPageFromState();
     }
@@ -925,7 +955,21 @@ async function loadContent() {
   }
 }
 
-bindFilterBar();
-bindNotificationReadActions();
-startRealtimeContentSync();
-loadContent();
+function initContentPage({ preserveFilters = true } = {}) {
+  const page = String(document.body?.dataset?.page || "")
+    .trim()
+    .toLowerCase();
+  if (!realtimePages.has(page)) {
+    return;
+  }
+  if (!preserveFilters) {
+    resetContentFilters();
+  }
+  bindFilterBar();
+  bindNotificationReadActions();
+  startRealtimeContentSync();
+  loadContent();
+}
+
+window.initContentPage = initContentPage;
+initContentPage();
