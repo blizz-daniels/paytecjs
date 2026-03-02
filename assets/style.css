@@ -1429,6 +1429,7 @@ body.has-profile-panel {
   color: var(--muted);
   font-size: 0.9rem;
   display: -webkit-box;
+  line-clamp: 2;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
