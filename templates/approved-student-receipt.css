@@ -61,38 +61,17 @@ body {
   column-gap: 6mm;
 }
 
-.paytec-mark__title {
-  color: var(--blue);
-  font-size: 14mm;
-  line-height: 0.98;
-  font-weight: 900;
-  font-style: italic;
-  letter-spacing: 0.04em;
+.paytec-mark {
+  min-height: 26mm;
+  display: flex;
+  align-items: center;
 }
 
-.paytec-mark__swoosh {
-  margin-top: 0.9mm;
-  position: relative;
-  height: 4.6mm;
-}
-
-.paytec-mark__swoosh-main,
-.paytec-mark__swoosh-sub {
-  position: absolute;
-  left: 0;
-  border-radius: 999px;
-}
-
-.paytec-mark__swoosh-main {
-  width: 58mm;
-  top: 0;
-  border-top: 0.75mm solid var(--orange);
-}
-
-.paytec-mark__swoosh-sub {
-  width: 47mm;
-  top: 1.7mm;
-  border-top: 0.65mm solid #7a889b;
+.paytec-mark img {
+  width: 100%;
+  max-height: 22mm;
+  object-fit: contain;
+  object-position: left center;
 }
 
 .receipt-title {
@@ -106,37 +85,22 @@ body {
 }
 
 .brand-banner {
-  display: grid;
-  grid-template-columns: 18mm 1fr;
+  display: flex;
   align-items: center;
+  justify-content: center;
   background: var(--black);
-  color: #f8cb5b;
   border: 0.45mm solid #2a2f38;
   min-height: 26mm;
-  padding: 1.1mm 2.1mm;
-}
-
-.brand-banner__logo-wrap {
-  width: 16mm;
-  height: 16mm;
-  border-radius: 0.8mm;
+  padding: 1.2mm 2.2mm;
   overflow: hidden;
-  background: #10141b;
 }
 
-.brand-banner__logo-wrap img {
+.brand-banner img {
   width: 100%;
   height: 100%;
-  object-fit: cover;
-}
-
-.brand-banner__text {
-  margin: 0 0 0 1.7mm;
-  color: #f8cb5b;
-  font-size: 8.4mm;
-  line-height: 1;
-  font-weight: 800;
-  letter-spacing: 0.03em;
+  max-height: 22mm;
+  object-fit: contain;
+  object-position: center;
 }
 
 .accent-strip {
@@ -247,9 +211,20 @@ body {
 }
 
 .passport-frame img {
+  display: block;
   width: 100%;
   height: 100%;
   object-fit: cover;
+  object-position: center;
+  image-orientation: from-image;
+}
+
+.passport-photo {
+  transform-origin: center center;
+}
+
+.passport-photo--rotated {
+  transform: rotate(90deg);
 }
 
 .acknowledgement {
@@ -304,17 +279,21 @@ body {
 .receipt-footer__signature-mark {
   margin: 0;
   height: 14.4mm;
-  display: grid;
-  justify-content: start;
-  align-content: center;
+  position: relative;
+  overflow: visible;
 }
 
 .receipt-footer__signature-mark img {
-  height: 13.5mm;
+  position: absolute;
+  left: 0.8mm;
+  top: -5.3mm;
+  height: 25mm;
   width: auto;
-  max-width: 98mm;
-  object-fit: contain;
+  max-width: none;
+  object-fit: cover;
   mix-blend-mode: multiply;
+  transform: rotate(-7deg);
+  opacity: 0.95;
 }
 
 .receipt-footer__signature-line--bottom {

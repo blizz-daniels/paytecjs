@@ -69,6 +69,14 @@ const DEFAULT_BRAND_LOGO_SVG = `
 </svg>
 `.trim();
 
+const DEFAULT_PAYTEC_LOGO_SVG = `
+<svg xmlns="http://www.w3.org/2000/svg" width="420" height="140" viewBox="0 0 420 140">
+  <text x="0" y="86" fill="#1c4d93" font-family="Arial, sans-serif" font-size="88" font-weight="800">PAY-TEC</text>
+  <path d="M8 100h240" stroke="#f28c1b" stroke-width="8" stroke-linecap="round"/>
+  <path d="M8 112h206" stroke="#7a889b" stroke-width="6" stroke-linecap="round"/>
+</svg>
+`.trim();
+
 const DEFAULT_FALLBACK_TEMPLATE_HTML = `
 <!doctype html>
 <html lang="en">
@@ -84,13 +92,11 @@ const DEFAULT_FALLBACK_TEMPLATE_HTML = `
         <div class="top-rule"></div>
         <div class="brand-row">
           <div class="paytec-mark">
-            <div class="paytec">PAY-TEC</div>
-            <div class="paytec-swoosh"></div>
+            <img src="{{paytec_logo}}" alt="Paytec logo" />
           </div>
           <h1>RECEIPT</h1>
           <div class="brand-banner">
             <img src="{{brand_logo}}" alt="Da4lions logo" />
-            <span>DA4LIONS</span>
           </div>
         </div>
         <div class="accent-strip">
@@ -111,7 +117,7 @@ const DEFAULT_FALLBACK_TEMPLATE_HTML = `
         </div>
         <aside class="receipt-right">
           <figure class="photo-frame">
-            <img src="{{passport_photo}}" alt="Passport photo" />
+            <img class="{{passport_photo_class}}" src="{{passport_photo}}" alt="Passport photo" />
           </figure>
           <p class="ack">Received with thanks the sum of {{amount_paid_words}} for {{purpose_of_payment}}.</p>
         </aside>
@@ -146,12 +152,11 @@ html, body { margin: 0; padding: 0; font-family: "Segoe UI", Arial, sans-serif; 
 .receipt-shell { background: #fff; border: 1px solid #c9d1dc; box-shadow: 0 4px 14px rgba(15, 28, 45, 0.12); padding: 24px 30px; min-height: 738px; box-sizing: border-box; display: flex; flex-direction: column; }
 .top-rule { height: 2px; background: #1c4d93; margin-bottom: 10px; }
 .brand-row { display: grid; grid-template-columns: 270px 1fr 250px; align-items: center; column-gap: 16px; }
-.paytec { color: #1c4d93; font-size: 56px; line-height: 0.95; font-style: italic; font-weight: 900; letter-spacing: 0.03em; }
-.paytec-swoosh { margin-top: 6px; height: 3px; width: 190px; border-top: 3px solid #f28c1b; box-shadow: 0 4px 0 #7a889b; border-radius: 999px; }
+.paytec-mark { height: 56px; display: flex; align-items: center; }
+.paytec-mark img { width: 100%; height: 100%; object-fit: contain; object-position: left center; }
 h1 { margin: 0; text-align: center; color: #1c4d93; font-size: 74px; letter-spacing: 0.08em; line-height: 1; }
-.brand-banner { background: #11141b; color: #f3b33f; padding: 8px 10px; display: grid; grid-template-columns: 56px 1fr; align-items: center; border: 1px solid #2a2f38; }
-.brand-banner img { width: 52px; height: 52px; object-fit: cover; }
-.brand-banner span { font-size: 34px; font-weight: 800; }
+.brand-banner { background: #11141b; padding: 8px 10px; display: flex; align-items: center; justify-content: center; border: 1px solid #2a2f38; }
+.brand-banner img { width: 100%; height: 52px; object-fit: contain; object-position: center; }
 .accent-strip { margin-top: 12px; height: 7px; position: relative; }
 .accent-strip::before { content: ""; position: absolute; left: 0; right: 0; top: 3px; border-top: 1px solid #7893b5; }
 .accent-strip-orange { position: absolute; left: 380px; top: 0; width: 300px; height: 4px; background: #f28c1b; clip-path: polygon(0 100%, 6% 0, 100% 0, 94% 100%); }
@@ -162,13 +167,14 @@ h1 { margin: 0; text-align: center; color: #1c4d93; font-size: 74px; letter-spac
 .receipt-left p:nth-child(4) { margin-top: 8px; }
 .receipt-right { display: grid; grid-template-rows: auto 1fr; row-gap: 20px; }
 .photo-frame { margin: 0; border: 1px solid #7f95b4; height: 260px; background: #f2f5fa; overflow: hidden; }
-.photo-frame img { width: 100%; height: 100%; object-fit: cover; }
+.photo-frame img { width: 100%; height: 100%; object-fit: cover; object-position: center; image-orientation: from-image; transform-origin: center center; }
+.passport-photo--rotated { transform: rotate(90deg); }
 .ack { margin: 0; border-top: 1px solid #c4cfde; border-bottom: 1px solid #7691b7; padding: 16px 8px; font-size: 30px; line-height: 1.35; font-style: italic; font-weight: 600; color: #17263e; align-self: end; }
 .receipt-footer { margin-top: 28px; border-top: 1px solid #8fa8c8; padding-top: 18px; display: grid; grid-template-columns: 1fr 240px; column-gap: 22px; }
 .label { margin: 0 0 10px; color: #1f4478; font-size: 31px; line-height: 1; font-style: italic; font-weight: 800; }
 .line { border-bottom: 1px solid #8fa8c8; height: 36px; }
-.signature-mark { margin: 0; height: 56px; display: grid; justify-content: start; align-content: center; }
-.signature-mark img { height: 52px; width: auto; max-width: 280px; object-fit: contain; mix-blend-mode: multiply; }
+.signature-mark { margin: 0; height: 56px; position: relative; overflow: visible; }
+.signature-mark img { position: absolute; left: 6px; top: -24px; height: 92px; width: auto; max-width: none; object-fit: cover; mix-blend-mode: multiply; transform: rotate(-7deg); opacity: 0.95; }
 .line-bottom { height: 12px; }
 .bottom-strip { margin-top: auto; height: 10px; position: relative; }
 .bottom-strip::before { content: ""; position: absolute; left: 0; right: 0; top: 3px; border-top: 1px solid #7893b5; }
@@ -461,8 +467,10 @@ function buildPlaceholderMap(row, overrides = {}) {
     approval_date: formatHumanDate(approvalDateValue),
     date_display: formatDateDdMmYyyy(approvalDateValue),
     passport_photo: row.passport_photo || createDefaultPassportDataUri(),
+    passport_photo_class: row.passport_photo_class || "passport-photo",
     sign_stamp: row.sign_stamp || createDefaultStampDataUri(),
     brand_logo: row.brand_logo || createDefaultBrandLogoDataUri(),
+    paytec_logo: row.paytec_logo || createDefaultPaytecLogoDataUri(),
     ...overrides,
   };
 }
@@ -483,6 +491,10 @@ function createDefaultBrandLogoDataUri() {
   return encodeSvgToDataUri(DEFAULT_BRAND_LOGO_SVG);
 }
 
+function createDefaultPaytecLogoDataUri() {
+  return encodeSvgToDataUri(DEFAULT_PAYTEC_LOGO_SVG);
+}
+
 function guessImageMime(filePath) {
   const ext = path.extname(String(filePath || "")).toLowerCase();
   if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
@@ -496,6 +508,87 @@ async function fileToDataUri(filePath) {
   const bytes = await fs.promises.readFile(filePath);
   const mime = guessImageMime(filePath);
   return `data:${mime};base64,${bytes.toString("base64")}`;
+}
+
+function parsePngDimensions(bytes) {
+  if (!Buffer.isBuffer(bytes) || bytes.length < 24) {
+    return null;
+  }
+  const signature = bytes.subarray(0, 8);
+  const expectedSignature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  if (!signature.equals(expectedSignature)) {
+    return null;
+  }
+  return {
+    width: bytes.readUInt32BE(16),
+    height: bytes.readUInt32BE(20),
+  };
+}
+
+function parseJpegDimensions(bytes) {
+  if (!Buffer.isBuffer(bytes) || bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) {
+    return null;
+  }
+  const startMarkers = new Set([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf]);
+  let offset = 2;
+  while (offset + 3 < bytes.length) {
+    if (bytes[offset] !== 0xff) {
+      offset += 1;
+      continue;
+    }
+    const marker = bytes[offset + 1];
+    if (marker === 0xd8 || marker === 0xd9) {
+      offset += 2;
+      continue;
+    }
+    if (offset + 4 >= bytes.length) {
+      return null;
+    }
+    const segmentLength = bytes.readUInt16BE(offset + 2);
+    if (segmentLength < 2) {
+      return null;
+    }
+    if (startMarkers.has(marker)) {
+      if (offset + 8 >= bytes.length) {
+        return null;
+      }
+      return {
+        width: bytes.readUInt16BE(offset + 7),
+        height: bytes.readUInt16BE(offset + 5),
+      };
+    }
+    offset += 2 + segmentLength;
+  }
+  return null;
+}
+
+function getImageDimensionsFromBytes(bytes, mime) {
+  const normalizedMime = String(mime || "").toLowerCase();
+  if (normalizedMime === "image/png") {
+    return parsePngDimensions(bytes);
+  }
+  if (normalizedMime === "image/jpeg" || normalizedMime === "image/jpg") {
+    return parseJpegDimensions(bytes);
+  }
+  return null;
+}
+
+async function resolvePassportPhotoClass(row, options) {
+  const dataDir = path.resolve(options.dataDir || path.join(__dirname, "..", "data"));
+  const imagePathOrUrl = resolveProfileImageFile(row.profile_image_url, dataDir);
+  if (!imagePathOrUrl || /^https?:\/\//i.test(imagePathOrUrl) || /^data:/i.test(imagePathOrUrl)) {
+    return "passport-photo";
+  }
+  try {
+    const bytes = await fs.promises.readFile(imagePathOrUrl);
+    const dimensions = getImageDimensionsFromBytes(bytes, guessImageMime(imagePathOrUrl));
+    if (!dimensions || !Number.isFinite(dimensions.width) || !Number.isFinite(dimensions.height)) {
+      return "passport-photo";
+    }
+    return dimensions.width > dimensions.height ? "passport-photo passport-photo--rotated" : "passport-photo";
+  } catch (_err) {
+    return "passport-photo";
+  }
 }
 
 function resolveProfileImageFile(profileImageUrl, dataDir) {
@@ -598,6 +691,54 @@ async function resolveSignStampValue(options = {}) {
   }
 }
 
+async function resolvePaytecLogoPath(options = {}) {
+  const projectRoot = path.resolve(options.projectRoot || path.join(__dirname, ".."));
+  const explicitInput = String(options.paytecLogoPath || process.env.RECEIPT_TEMPLATE_PAYTEC_LOGO_PATH || "").trim();
+  if (explicitInput) {
+    return path.isAbsolute(explicitInput) ? explicitInput : path.resolve(projectRoot, explicitInput);
+  }
+
+  const candidates = [
+    path.resolve(projectRoot, "assets", "paytec.png"),
+    path.resolve(projectRoot, "assets", "paytec-logo.png"),
+    path.resolve(projectRoot, "assets", "paytec-logo.jpeg"),
+    path.resolve(projectRoot, "assets", "paytec-logo.jpg"),
+  ];
+  for (const candidate of candidates) {
+    try {
+      await fs.promises.access(candidate, fs.constants.R_OK);
+      return candidate;
+    } catch (_err) {
+      // Continue scanning candidates.
+    }
+  }
+  return null;
+}
+
+async function resolvePaytecLogoValue(options = {}) {
+  const logger = ensureLogger(options.logger);
+  const logoPath = await resolvePaytecLogoPath(options);
+  if (!logoPath) {
+    emitLog(logger, "warn", "paytec_logo_fallback", {
+      reason: "paytec logo file not found",
+    });
+    return createDefaultPaytecLogoDataUri();
+  }
+  if (/^https?:\/\//i.test(logoPath) || /^data:/i.test(logoPath)) {
+    return logoPath;
+  }
+  try {
+    await fs.promises.access(logoPath, fs.constants.R_OK);
+    return await fileToDataUri(logoPath);
+  } catch (_err) {
+    emitLog(logger, "warn", "paytec_logo_fallback", {
+      reason: "paytec logo file unreadable",
+      logo_path: logoPath,
+    });
+    return createDefaultPaytecLogoDataUri();
+  }
+}
+
 async function resolveBrandLogoPath(options = {}) {
   const projectRoot = path.resolve(options.projectRoot || path.join(__dirname, ".."));
   const explicitInput = String(options.brandLogoPath || process.env.RECEIPT_TEMPLATE_BRAND_LOGO_PATH || "").trim();
@@ -606,6 +747,7 @@ async function resolveBrandLogoPath(options = {}) {
   }
 
   const candidates = [
+    path.resolve(projectRoot, "assets", "da4lions.png"),
     path.resolve(projectRoot, "assets", "da4lions-logo.jpeg"),
     path.resolve(projectRoot, "assets", "lion-logo.png"),
     path.resolve(projectRoot, "assets", "lion-logo-512.png"),
@@ -1118,25 +1260,32 @@ async function buildStyledFallbackReceiptPdfBuffer(row, placeholders) {
   });
 
   const headerY = shellTop - 70;
-  page.drawText("PAY-TEC", {
-    x: contentX,
-    y: headerY,
-    size: 38,
-    font: fontBold,
-    color: colorBlue,
-  });
-  page.drawLine({
-    start: { x: contentX + 8, y: headerY - 6 },
-    end: { x: contentX + 148, y: headerY + 4 },
-    thickness: 2,
-    color: colorOrange,
-  });
-  page.drawLine({
-    start: { x: contentX + 6, y: headerY - 12 },
-    end: { x: contentX + 140, y: headerY - 8 },
-    thickness: 1.5,
-    color: rgbFromHex("7a889b", rgb),
-  });
+  const parsedPaytecLogo = parseDataUriImage(placeholders?.paytec_logo);
+  if (parsedPaytecLogo) {
+    try {
+      const embedded =
+        parsedPaytecLogo.mime === "image/png"
+          ? await doc.embedPng(parsedPaytecLogo.bytes)
+          : await doc.embedJpg(parsedPaytecLogo.bytes);
+      drawContainedImage(embedded, contentX, headerY - 8, 222, 60);
+    } catch (_err) {
+      page.drawText("PAY-TEC", {
+        x: contentX,
+        y: headerY,
+        size: 38,
+        font: fontBold,
+        color: colorBlue,
+      });
+    }
+  } else {
+    page.drawText("PAY-TEC", {
+      x: contentX,
+      y: headerY,
+      size: 38,
+      font: fontBold,
+      color: colorBlue,
+    });
+  }
 
   const receiptTitle = "RECEIPT";
   const receiptTitleSize = 56;
@@ -1170,30 +1319,25 @@ async function buildStyledFallbackReceiptPdfBuffer(row, placeholders) {
         parsedBrandLogo.mime === "image/png"
           ? await doc.embedPng(parsedBrandLogo.bytes)
           : await doc.embedJpg(parsedBrandLogo.bytes);
-      drawContainedImage(embedded, bannerX + 6, bannerY + 6, 42, 42);
+      drawContainedImage(embedded, bannerX + 8, bannerY + 7, bannerW - 16, bannerH - 14);
     } catch (_err) {
-      page.drawCircle({
-        x: bannerX + 27,
-        y: bannerY + 27,
-        size: 15,
+      page.drawText("DA4LIONS", {
+        x: bannerX + 50,
+        y: bannerY + 17,
+        size: 24,
+        font: fontBold,
         color: colorYellow,
       });
     }
   } else {
-    page.drawCircle({
-      x: bannerX + 27,
-      y: bannerY + 27,
-      size: 15,
+    page.drawText("DA4LIONS", {
+      x: bannerX + 50,
+      y: bannerY + 17,
+      size: 24,
+      font: fontBold,
       color: colorYellow,
     });
   }
-  page.drawText("DA4LIONS", {
-    x: bannerX + 54,
-    y: bannerY + 17,
-    size: 24,
-    font: fontBold,
-    color: colorYellow,
-  });
 
   const stripY = shellTop - 98;
   page.drawLine({
@@ -1218,7 +1362,7 @@ async function buildStyledFallbackReceiptPdfBuffer(row, placeholders) {
   });
 
   const photoW = 200;
-  const photoH = 180;
+  const photoH = 200;
   const photoX = rightColX + 6;
   const photoY = shellTop - 286;
   page.drawRectangle({
@@ -1374,7 +1518,7 @@ async function buildStyledFallbackReceiptPdfBuffer(row, placeholders) {
         parsedStamp.mime === "image/png"
           ? await doc.embedPng(parsedStamp.bytes)
           : await doc.embedJpg(parsedStamp.bytes);
-      drawContainedImage(embedded, signatureLineStart + 18, footerLineY - 92, 210, 36);
+      drawContainedImage(embedded, signatureLineStart - 2, footerLineY - 112, 260, 78);
     } catch (_err) {
       page.drawText("Signature", {
         x: signatureLineStart + 58,
@@ -1573,6 +1717,11 @@ async function generateApprovedStudentReceipts(options = {}) {
     templateStampPath: options.templateStampPath,
     projectRoot: path.resolve(__dirname, ".."),
   });
+  const paytecLogoDataUri = await resolvePaytecLogoValue({
+    logger,
+    paytecLogoPath: options.paytecLogoPath,
+    projectRoot: path.resolve(__dirname, ".."),
+  });
   const brandLogoDataUri = await resolveBrandLogoValue({
     logger,
     brandLogoPath: options.brandLogoPath,
@@ -1640,8 +1789,13 @@ async function generateApprovedStudentReceipts(options = {}) {
         dataDir: options.dataDir,
         logger,
       });
+      const passportPhotoClass = await resolvePassportPhotoClass(row, {
+        dataDir: options.dataDir,
+      });
       placeholders = buildPlaceholderMap(row, {
         passport_photo: passportPhoto,
+        passport_photo_class: passportPhotoClass,
+        paytec_logo: paytecLogoDataUri,
         brand_logo: brandLogoDataUri,
       });
       placeholders.sign_stamp = signStampDataUri;

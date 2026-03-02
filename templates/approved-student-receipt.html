@@ -13,18 +13,11 @@
         <div class="top-rule" aria-hidden="true"></div>
         <div class="brand-row">
           <div class="paytec-mark">
-            <div class="paytec-mark__title">PAY-TEC</div>
-            <div class="paytec-mark__swoosh" aria-hidden="true">
-              <span class="paytec-mark__swoosh-main"></span>
-              <span class="paytec-mark__swoosh-sub"></span>
-            </div>
+            <img src="{{paytec_logo}}" alt="Paytec logo" />
           </div>
           <h1 class="receipt-title">RECEIPT</h1>
           <div class="brand-banner">
-            <div class="brand-banner__logo-wrap">
-              <img src="{{brand_logo}}" alt="Da4lions logo" />
-            </div>
-            <div class="brand-banner__text">DA4LIONS</div>
+            <img src="{{brand_logo}}" alt="Da4lions logo" />
           </div>
         </div>
         <div class="accent-strip" aria-hidden="true">
@@ -71,7 +64,7 @@
 
         <aside class="receipt-main__right">
           <figure class="passport-frame">
-            <img src="{{passport_photo}}" alt="Passport photo" />
+            <img class="{{passport_photo_class}}" src="{{passport_photo}}" alt="Passport photo" />
           </figure>
           <div class="acknowledgement">
             <p>Received with thanks the sum of</p>
