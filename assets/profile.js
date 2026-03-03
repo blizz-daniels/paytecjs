@@ -47,7 +47,7 @@ window.addEventListener("DOMContentLoaded", () => {
         </form>
       </div>
       <form id="profileEmailForm" class="profile-panel__form">
-        <label for="profileEmailAddress">Email address (used for Paystack/password reset)</label>
+        <label for="profileEmailAddress">Email address (used for Paystack)</label>
         <input
           id="profileEmailAddress"
           name="email"
