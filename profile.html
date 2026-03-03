@@ -66,7 +66,29 @@
             <dt>Email</dt>
             <dd id="profilePageEmail">-</dd>
           </div>
+          <div>
+            <dt>Email status</dt>
+            <dd id="profilePageEmailStatus">-</dd>
+          </div>
         </dl>
+      </section>
+
+      <section class="card">
+        <h2>Security</h2>
+        <p class="auth-subtitle">Set a stronger custom password. After saving it, this becomes your login password.</p>
+        <p id="passwordStatus" class="auth-subtitle"></p>
+        <form id="profilePasswordForm" class="auth-form">
+          <label for="profileCurrentPassword">Current password</label>
+          <input id="profileCurrentPassword" name="currentPassword" type="password" minlength="2" maxlength="72" required />
+
+          <label for="profileNewPassword">New password</label>
+          <input id="profileNewPassword" name="newPassword" type="password" minlength="10" maxlength="72" required />
+
+          <label for="profileConfirmPassword">Confirm new password</label>
+          <input id="profileConfirmPassword" name="confirmPassword" type="password" minlength="10" maxlength="72" required />
+
+          <button type="submit" class="btn">Update password</button>
+        </form>
       </section>
 
       <section class="card profile-checklist-card">

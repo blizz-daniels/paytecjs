@@ -47,7 +47,7 @@ window.addEventListener("DOMContentLoaded", () => {
         </form>
       </div>
       <form id="profileEmailForm" class="profile-panel__form">
-        <label for="profileEmailAddress">Email address (used for Paystack)</label>
+        <label for="profileEmailAddress">Email address (used for Paystack/password reset)</label>
         <input
           id="profileEmailAddress"
           name="email"
@@ -59,6 +59,24 @@ window.addEventListener("DOMContentLoaded", () => {
         />
         <button type="submit" class="btn">Save email</button>
       </form>
+      <div id="profileEmailVerificationBlock" hidden>
+        <p id="profileEmailVerificationHint" class="auth-subtitle"></p>
+        <form id="profileEmailVerifyForm" class="profile-panel__form">
+          <label for="profileEmailCode">Email verification code</label>
+          <input
+            id="profileEmailCode"
+            name="code"
+            type="text"
+            inputmode="numeric"
+            pattern="\\d{6}"
+            minlength="6"
+            maxlength="6"
+            placeholder="6-digit code"
+            required
+          />
+          <button type="submit" class="btn btn-secondary">Verify email</button>
+        </form>
+      </div>
       <form id="profileAvatarForm" class="profile-panel__form">
         <label for="profileAvatarInput">Profile picture (PNG, JPG, WEBP)</label>
         <input id="profileAvatarInput" name="avatar" type="file" accept="image/png,image/jpeg,image/webp" />
@@ -74,12 +92,16 @@ window.addEventListener("DOMContentLoaded", () => {
   const profileInitialEl = panel.querySelector("[data-profile-initial]");
   const emailInput = panel.querySelector("#profileEmailAddress");
   const emailForm = panel.querySelector("#profileEmailForm");
+  const emailVerifyBlock = panel.querySelector("#profileEmailVerificationBlock");
+  const emailVerifyHint = panel.querySelector("#profileEmailVerificationHint");
+  const emailVerifyForm = panel.querySelector("#profileEmailVerifyForm");
+  const emailCodeInput = panel.querySelector("#profileEmailCode");
   const avatarForm = panel.querySelector("#profileAvatarForm");
   const avatarInput = panel.querySelector("#profileAvatarInput");
   const statusNode = panel.querySelector("[data-profile-status]");
   const homeGreetingName = document.getElementById("homeGreetingName");
   const homeGreeting = document.querySelector(".home-greeting");
-  const backdrop = panel.querySelector("[data-action=\"close\"]");
+  const backdrop = panel.querySelector('[data-action="close"]');
 
   let profileData = null;
 
@@ -106,7 +128,10 @@ window.addEventListener("DOMContentLoaded", () => {
     if (!imageEl || !initialEl) {
       return;
     }
-    const firstLetter = String(fallback || "").trim().charAt(0).toUpperCase();
+    const firstLetter = String(fallback || "")
+      .trim()
+      .charAt(0)
+      .toUpperCase();
     if (imageUrl) {
       imageEl.src = imageUrl;
       imageEl.hidden = false;
@@ -116,6 +141,41 @@ window.addEventListener("DOMContentLoaded", () => {
     imageEl.hidden = true;
     initialEl.hidden = false;
     initialEl.textContent = firstLetter || "?";
+  }
+
+  function formatExpiry(expiresAt) {
+    if (!expiresAt) {
+      return "";
+    }
+    try {
+      const localTime = new Date(expiresAt);
+      if (Number.isNaN(localTime.getTime())) {
+        return "";
+      }
+      return localTime.toLocaleString();
+    } catch (_err) {
+      return "";
+    }
+  }
+
+  function updateEmailVerificationUi(profile) {
+    if (!emailVerifyBlock || !emailVerifyHint) {
+      return;
+    }
+    const pending = profile && profile.pendingEmailVerification ? profile.pendingEmailVerification : null;
+    if (!pending || !pending.email) {
+      emailVerifyBlock.hidden = true;
+      emailVerifyHint.textContent = "";
+      if (emailCodeInput) {
+        emailCodeInput.value = "";
+      }
+      return;
+    }
+    const expiresAtText = formatExpiry(pending.expiresAt);
+    emailVerifyHint.textContent = expiresAtText
+      ? `A verification code was sent to ${pending.email}. It expires at ${expiresAtText}.`
+      : `A verification code was sent to ${pending.email}.`;
+    emailVerifyBlock.hidden = false;
   }
 
   function applyProfile(profile) {
@@ -128,7 +188,9 @@ window.addEventListener("DOMContentLoaded", () => {
       profileNameEl.textContent = displayName;
     }
     if (profileRoleEl) {
-      const normalizedRole = String(profile.role || "").trim().toLowerCase();
+      const normalizedRole = String(profile.role || "")
+        .trim()
+        .toLowerCase();
       const roleText =
         normalizedRole === "teacher"
           ? "Lecturer"
@@ -138,7 +200,7 @@ window.addEventListener("DOMContentLoaded", () => {
       profileRoleEl.textContent = roleText;
     }
     if (emailInput) {
-      emailInput.value = profile.email || "";
+      emailInput.value = profile.email || profile.pendingEmailVerification?.email || "";
     }
     if (homeGreetingName) {
       homeGreetingName.textContent = displayName;
@@ -147,6 +209,7 @@ window.addEventListener("DOMContentLoaded", () => {
       homeGreeting.hidden = false;
     }
     updateAvatar(profileImageEl, profileInitialEl, profile.profileImageUrl || null, displayName);
+    updateEmailVerificationUi(profile);
   }
 
   function openPanel() {
@@ -162,7 +225,7 @@ window.addEventListener("DOMContentLoaded", () => {
     setStatus("", false);
   }
 
-  async function loadProfile({ showStatus = false } = {}) {
+  async function loadProfile() {
     try {
       const response = await fetch("/api/me", { credentials: "same-origin" });
       if (!response.ok) {
@@ -170,15 +233,10 @@ window.addEventListener("DOMContentLoaded", () => {
       }
       const data = await response.json();
       applyProfile(data);
-      setStatus(showStatus ? "Profile saved." : "", false);
-      if (showStatus && window.showToast) {
-        window.showToast("Profile updated.", { type: "success" });
-      }
-    } catch (err) {
+      return data;
+    } catch (_err) {
       setStatus("Unable to load profile right now.", true);
-      if (showStatus && window.showToast) {
-        window.showToast("Unable to load profile right now.", { type: "error" });
-      }
+      return null;
     }
   }
 
@@ -225,7 +283,8 @@ window.addEventListener("DOMContentLoaded", () => {
           throw new Error(payload.error || "Upload failed.");
         }
         avatarInput.value = "";
-        await loadProfile({ showStatus: true });
+        await loadProfile();
+        setStatus("Profile picture updated.", false);
       } catch (err) {
         setStatus(err?.message || "Upload failed.", true);
         if (window.showToast) {
@@ -268,11 +327,69 @@ window.addEventListener("DOMContentLoaded", () => {
         if (!response.ok) {
           throw new Error(payload.error || "Could not save your email address.");
         }
-        await loadProfile({ showStatus: true });
+        await loadProfile();
+        if (payload.verified) {
+          setStatus("Email already verified.", false);
+          if (window.showToast) {
+            window.showToast("Email is already verified.", { type: "success" });
+          }
+        } else {
+          setStatus("Verification code sent. Enter the 6-digit code below.", false);
+          if (window.showToast) {
+            window.showToast("Verification code sent to your email.", { type: "success" });
+          }
+        }
       } catch (err) {
         setStatus(err?.message || "Could not save email address.", true);
         if (window.showToast) {
           window.showToast(err?.message || "Could not save email address.", { type: "error" });
+        }
+      } finally {
+        setButtonBusy(submitButton, false, "");
+        if (loadingToast) {
+          loadingToast.close();
+        }
+      }
+    });
+  }
+
+  if (emailVerifyForm) {
+    emailVerifyForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const code = emailCodeInput?.value?.trim() || "";
+      if (!code) {
+        setStatus("Enter the verification code from your email.", true);
+        return;
+      }
+      const submitButton = emailVerifyForm.querySelector('button[type="submit"]');
+      const loadingToast = window.showToast
+        ? window.showToast("Verifying email...", { type: "loading", sticky: true })
+        : null;
+      setButtonBusy(submitButton, true, "Verifying...");
+      setStatus("Verifying email...", false);
+      try {
+        const response = await fetch("/api/profile/email/verify", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ code }),
+        });
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(payload.error || "Could not verify email.");
+        }
+        if (emailCodeInput) {
+          emailCodeInput.value = "";
+        }
+        await loadProfile();
+        setStatus("Email verified successfully.", false);
+        if (window.showToast) {
+          window.showToast("Email verified.", { type: "success" });
+        }
+      } catch (err) {
+        setStatus(err?.message || "Could not verify email.", true);
+        if (window.showToast) {
+          window.showToast(err?.message || "Could not verify email.", { type: "error" });
         }
       } finally {
         setButtonBusy(submitButton, false, "");

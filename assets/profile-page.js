@@ -43,6 +43,15 @@ function setChecklistStatus(message, isError = false) {
   node.style.color = isError ? "var(--danger)" : "var(--muted)";
 }
 
+function setPasswordStatus(message, isError = false) {
+  const node = document.getElementById("passwordStatus");
+  if (!node) {
+    return;
+  }
+  node.textContent = String(message || "");
+  node.style.color = isError ? "var(--danger)" : "var(--muted)";
+}
+
 function updateProfileAvatar(imageUrl, fallbackName) {
   const imageEl = document.querySelector("[data-profile-image]");
   const initialEl = document.querySelector("[data-profile-initial]");
@@ -127,6 +136,7 @@ async function loadProfilePage() {
     const profileRole = document.getElementById("profilePageRole");
     const profileDepartment = document.getElementById("profilePageDepartment");
     const profileEmail = document.getElementById("profilePageEmail");
+    const profileEmailStatus = document.getElementById("profilePageEmailStatus");
 
     if (profileName) {
       profileName.textContent = me.displayName || me.username || "-";
@@ -141,7 +151,16 @@ async function loadProfilePage() {
       profileDepartment.textContent = me.departmentLabel || me.department || "-";
     }
     if (profileEmail) {
-      profileEmail.textContent = me.email || "-";
+      profileEmail.textContent = me.email || me.pendingEmailVerification?.email || "-";
+    }
+    if (profileEmailStatus) {
+      if (me.email) {
+        profileEmailStatus.textContent = "Verified";
+      } else if (me.pendingEmailVerification?.email) {
+        profileEmailStatus.textContent = "Pending verification";
+      } else {
+        profileEmailStatus.textContent = "Not set";
+      }
     }
     updateProfileAvatar(me.profileImageUrl || "", me.displayName || me.username || "");
 
@@ -183,6 +202,55 @@ async function loadProfilePage() {
             window.showToast(err.message || "Could not update checklist.", { type: "error" });
           }
           target.disabled = false;
+        }
+      });
+    }
+
+    const passwordForm = document.getElementById("profilePasswordForm");
+    if (passwordForm && passwordForm.dataset.bound !== "1") {
+      passwordForm.dataset.bound = "1";
+      passwordForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const currentPassword = String(
+          document.getElementById("profileCurrentPassword")?.value || ""
+        );
+        const newPassword = String(document.getElementById("profileNewPassword")?.value || "");
+        const confirmPassword = String(document.getElementById("profileConfirmPassword")?.value || "");
+        if (!currentPassword || !newPassword || !confirmPassword) {
+          setPasswordStatus("All password fields are required.", true);
+          return;
+        }
+        const submitButton = passwordForm.querySelector('button[type="submit"]');
+        if (submitButton instanceof HTMLButtonElement) {
+          submitButton.disabled = true;
+          submitButton.textContent = "Updating...";
+        }
+        setPasswordStatus("Updating password...", false);
+        try {
+          await requestJson("/api/profile/password", {
+            method: "POST",
+            payload: {
+              currentPassword,
+              newPassword,
+              confirmPassword,
+            },
+          });
+          passwordForm.reset();
+          setPasswordStatus("Password updated successfully.", false);
+          if (window.showToast) {
+            window.showToast("Password updated.", { type: "success" });
+          }
+          await loadProfilePage();
+        } catch (err) {
+          setPasswordStatus(err.message || "Could not update password.", true);
+          if (window.showToast) {
+            window.showToast(err.message || "Could not update password.", { type: "error" });
+          }
+        } finally {
+          if (submitButton instanceof HTMLButtonElement) {
+            submitButton.disabled = false;
+            submitButton.textContent = "Update password";
+          }
         }
       });
     }
