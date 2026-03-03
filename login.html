@@ -19,58 +19,18 @@
           <span class="brand-copy">Da4lions Pay-tec</span>
         </div>
         <h1>Portal Login</h1>
-        <p class="auth-subtitle">Students use matric number, lecturers use lecturer code. Password is surname in lowercase.</p>
+        <p class="auth-subtitle">Students use matric number, lecturers use lecturer code. Use surname in lowercase unless you already set a custom password.</p>
         <p id="authError" class="auth-error" hidden></p>
         <form method="post" action="/login" class="auth-form">
           <label for="username">Username</label>
           <input id="username" name="username" type="text" minlength="3" maxlength="40" pattern="[A-Za-z0-9/_-]+" required />
 
           <label for="password">Password</label>
-          <input id="password" name="password" type="password" minlength="2" maxlength="72" required />
+          <input id="password" name="password" type="password" minlength="2" maxlength="40" required />
           <input type="hidden" name="_csrf" value="" />
 
           <button type="submit" class="btn">Log in</button>
         </form>
-        <section>
-          <h2>Forgot password?</h2>
-          <p class="auth-subtitle">Use your verified profile email to reset your password.</p>
-          <p id="forgotPasswordStatus" class="auth-subtitle"></p>
-          <form id="forgotPasswordForm" class="auth-form">
-            <label for="forgotPasswordUsername">Username</label>
-            <input
-              id="forgotPasswordUsername"
-              name="username"
-              type="text"
-              minlength="3"
-              maxlength="40"
-              pattern="[A-Za-z0-9/_-]+"
-              required
-            />
-            <button type="submit" class="btn btn-secondary">Send reset code</button>
-          </form>
-          <form id="resetPasswordForm" class="auth-form" hidden>
-            <label for="resetPasswordCode">Reset code</label>
-            <input
-              id="resetPasswordCode"
-              name="code"
-              type="text"
-              inputmode="numeric"
-              pattern="\\d{6}"
-              minlength="6"
-              maxlength="6"
-              placeholder="6-digit code"
-              required
-            />
-
-            <label for="resetPasswordNew">New password</label>
-            <input id="resetPasswordNew" name="newPassword" type="password" minlength="10" maxlength="72" required />
-
-            <label for="resetPasswordConfirm">Confirm new password</label>
-            <input id="resetPasswordConfirm" name="confirmPassword" type="password" minlength="10" maxlength="72" required />
-
-            <button type="submit" class="btn">Reset password</button>
-          </form>
-        </section>
         <p class="auth-help">Accounts are provisioned by admin roster upload.</p>
       </section>
     </main>

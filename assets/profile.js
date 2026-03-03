@@ -163,12 +163,7 @@ window.addEventListener("DOMContentLoaded", () => {
       homeGreeting.hidden = false;
     }
     updateAvatar(profileImageEl, profileInitialEl, profile.profileImageUrl || null, displayName);
-
-    if (profile.pendingEmailVerification?.email) {
-      setStatus("Email verification is pending. Complete it on the profile page.", false);
-    } else {
-      setStatus("", false);
-    }
+    setStatus("", false);
   }
 
   function openPanel() {

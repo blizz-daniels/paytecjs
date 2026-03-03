@@ -4,7 +4,6 @@ const crypto = require("crypto");
 const { execFile } = require("child_process");
 const { promisify } = require("util");
 const bcrypt = require("bcryptjs");
-const nodemailer = require("nodemailer");
 const express = require("express");
 const multer = require("multer");
 const session = require("express-session");
@@ -79,25 +78,11 @@ const CSRF_SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 const LOGIN_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_RATE_LIMIT_MAX_ATTEMPTS = 8;
 const LOGIN_RATE_LIMIT_BLOCK_MS = 15 * 60 * 1000;
-const AUTH_TOKEN_PURPOSE_EMAIL_VERIFICATION = "email_verification";
-const AUTH_TOKEN_PURPOSE_PASSWORD_RESET = "password_reset";
-const AUTH_CODE_LENGTH = 6;
-const EMAIL_VERIFICATION_CODE_TTL_MINUTES = (() => {
-  const value = Number.parseInt(String(process.env.EMAIL_VERIFICATION_CODE_TTL_MINUTES || "15"), 10);
-  return Number.isFinite(value) && value > 0 ? value : 15;
-})();
-const PASSWORD_RESET_CODE_TTL_MINUTES = (() => {
-  const value = Number.parseInt(String(process.env.PASSWORD_RESET_CODE_TTL_MINUTES || "15"), 10);
-  return Number.isFinite(value) && value > 0 ? value : 15;
-})();
 const CUSTOM_PASSWORD_MIN_LENGTH = (() => {
   const value = Number.parseInt(String(process.env.CUSTOM_PASSWORD_MIN_LENGTH || "10"), 10);
   return Number.isFinite(value) && value >= 8 ? value : 10;
 })();
 const CUSTOM_PASSWORD_MAX_LENGTH = 72;
-const exposeSecurityCodes =
-  process.env.NODE_ENV === "test" || parseBooleanEnv(process.env.AUTH_EXPOSE_DEBUG_CODES, false);
-const authCodeFallbackEnabled = parseBooleanEnv(process.env.AUTH_ALLOW_INSECURE_CODE_FALLBACK, !isProduction);
 const loginAttempts = new Map();
 let departmentGroupsCache = {
   mtimeMs: -1,
@@ -107,7 +92,6 @@ let contentStreamClientSequence = 0;
 const contentStreamClients = new Map();
 const CONTENT_STREAM_KEEPALIVE_MS = 25 * 1000;
 const execFileAsync = promisify(execFile);
-let authMailerTransport = null;
 const OCR_PROVIDER = String(process.env.OCR_PROVIDER || "none").trim().toLowerCase();
 const OCR_SPACE_API_KEY = String(process.env.OCR_SPACE_API_KEY || "").trim();
 const OCR_SPACE_ENDPOINT = String(process.env.OCR_SPACE_ENDPOINT || "https://api.ocr.space/parse/image").trim();
@@ -120,22 +104,6 @@ const PAYSTACK_SECRET_KEY = String(process.env.PAYSTACK_SECRET_KEY || "").trim()
 const PAYSTACK_PUBLIC_KEY = String(process.env.PAYSTACK_PUBLIC_KEY || "").trim();
 const PAYSTACK_WEBHOOK_SECRET = String(process.env.PAYSTACK_WEBHOOK_SECRET || PAYSTACK_SECRET_KEY).trim();
 const PAYSTACK_CALLBACK_URL = String(process.env.PAYSTACK_CALLBACK_URL || "").trim();
-const SMTP_URL = String(process.env.SMTP_URL || "").trim();
-const SMTP_HOST = String(process.env.SMTP_HOST || "").trim();
-const SMTP_PORT = Number.parseInt(String(process.env.SMTP_PORT || "587"), 10) || 587;
-const SMTP_USER = String(process.env.SMTP_USER || "").trim();
-const SMTP_PASS_RAW = String(process.env.SMTP_PASS || "").trim();
-const SMTP_PASS = /gmail\.com|googlemail\.com/i.test(SMTP_HOST)
-  ? SMTP_PASS_RAW.replace(/\s+/g, "")
-  : SMTP_PASS_RAW;
-const SMTP_SECURE = parseBooleanEnv(process.env.SMTP_SECURE, SMTP_PORT === 465);
-const AUTH_EMAIL_FROM = String(
-  process.env.AUTH_EMAIL_FROM || process.env.SMTP_FROM || process.env.RECEIPT_EMAIL_FROM || ""
-).trim();
-const AUTH_EMAIL_SEND_TIMEOUT_MS = (() => {
-  const value = Number.parseInt(String(process.env.AUTH_EMAIL_SEND_TIMEOUT_MS || "12000"), 10);
-  return Number.isFinite(value) && value >= 3000 ? value : 12000;
-})();
 const PAYMENT_REFERENCE_PREFIX = String(process.env.PAYMENT_REFERENCE_PREFIX || "PAYTEC").trim().toUpperCase();
 const PAYMENT_REFERENCE_TENANT_ID = String(
   process.env.PAYMENT_REFERENCE_TENANT_ID || process.env.SCHOOL_ID || process.env.TENANT_ID || "default-school"
@@ -600,118 +568,6 @@ function resolvePaystackCheckoutEmail(username, profileEmail) {
   return "";
 }
 
-function normalizeVerificationCode(value) {
-  return String(value || "")
-    .trim()
-    .replace(/\s+/g, "");
-}
-
-function isValidVerificationCode(value) {
-  return new RegExp(`^\\d{${AUTH_CODE_LENGTH}}$`).test(normalizeVerificationCode(value));
-}
-
-function hashVerificationCode(value) {
-  return crypto.createHash("sha256").update(normalizeVerificationCode(value)).digest("hex");
-}
-
-function generateVerificationCode(length = AUTH_CODE_LENGTH) {
-  let code = "";
-  for (let i = 0; i < length; i += 1) {
-    code += String(crypto.randomInt(0, 10));
-  }
-  return code;
-}
-
-function computeFutureIso(minutesFromNow) {
-  const now = Date.now();
-  const offset = Number(minutesFromNow) * 60 * 1000;
-  return new Date(now + offset).toISOString();
-}
-
-function getRequestBaseUrl(req) {
-  const configured = String(process.env.AUTH_BASE_URL || "").trim();
-  if (configured) {
-    return configured.replace(/\/+$/, "");
-  }
-  const host = String(req?.get?.("host") || "").trim();
-  if (!host) {
-    return "";
-  }
-  const protocol = String(req?.protocol || (isProduction ? "https" : "http")).trim() || "http";
-  return `${protocol}://${host}`;
-}
-
-function isAuthEmailDeliveryConfigured() {
-  if (!AUTH_EMAIL_FROM) {
-    return false;
-  }
-  if (SMTP_URL) {
-    return true;
-  }
-  return !!(SMTP_HOST && SMTP_PORT && SMTP_USER && SMTP_PASS);
-}
-
-function getAuthEmailTransport() {
-  if (authMailerTransport) {
-    return authMailerTransport;
-  }
-  if (!isAuthEmailDeliveryConfigured()) {
-    return null;
-  }
-  if (SMTP_URL) {
-    authMailerTransport = nodemailer.createTransport(SMTP_URL);
-    return authMailerTransport;
-  }
-  authMailerTransport = nodemailer.createTransport({
-    host: SMTP_HOST,
-    port: SMTP_PORT,
-    secure: SMTP_SECURE,
-    auth: {
-      user: SMTP_USER,
-      pass: SMTP_PASS,
-    },
-  });
-  return authMailerTransport;
-}
-
-async function sendAuthEmail(payload) {
-  if (!payload || !payload.to || !payload.subject) {
-    throw new Error("Auth email payload is incomplete.");
-  }
-  if (process.env.NODE_ENV === "test" && !isAuthEmailDeliveryConfigured()) {
-    return { skipped: true };
-  }
-  const transport = getAuthEmailTransport();
-  if (!transport) {
-    throw new Error("Email delivery is not configured.");
-  }
-  await transport.sendMail({
-    from: AUTH_EMAIL_FROM,
-    to: payload.to,
-    subject: payload.subject,
-    text: String(payload.text || ""),
-  });
-  return { skipped: false };
-}
-
-async function sendAuthEmailWithTimeout(payload, timeoutMs = AUTH_EMAIL_SEND_TIMEOUT_MS) {
-  let timer = null;
-  try {
-    return await Promise.race([
-      sendAuthEmail(payload),
-      new Promise((_, reject) => {
-        timer = setTimeout(() => {
-          reject(new Error("Auth email send timed out."));
-        }, timeoutMs);
-      }),
-    ]);
-  } finally {
-    if (timer) {
-      clearTimeout(timer);
-    }
-  }
-}
-
 function validateCustomPasswordStrength(password, username) {
   const raw = String(password || "");
   const normalizedUsername = normalizeIdentifier(username || "");
@@ -743,44 +599,6 @@ function validateCustomPasswordStrength(password, username) {
     }
   }
   return "";
-}
-
-function buildEmailVerificationMail(req, email, code) {
-  const baseUrl = getRequestBaseUrl(req);
-  const loginUrl = baseUrl ? `${baseUrl}/login` : "/login";
-  return {
-    subject: "Verify your Pay-tec profile email",
-    text: [
-      "A verification code was requested for your Pay-tec profile.",
-      "",
-      `Verification code: ${code}`,
-      `This code expires in ${EMAIL_VERIFICATION_CODE_TTL_MINUTES} minutes.`,
-      "",
-      "If you did not request this, ignore this email.",
-      "",
-      `Portal: ${loginUrl}`,
-      `Email: ${email}`,
-    ].join("\n"),
-  };
-}
-
-function buildPasswordResetMail(req, username, code) {
-  const baseUrl = getRequestBaseUrl(req);
-  const loginUrl = baseUrl ? `${baseUrl}/login` : "/login";
-  return {
-    subject: "Reset your Pay-tec password",
-    text: [
-      "A password reset code was requested for your Pay-tec account.",
-      "",
-      `Username: ${username}`,
-      `Reset code: ${code}`,
-      `This code expires in ${PASSWORD_RESET_CODE_TTL_MINUTES} minutes.`,
-      "",
-      "If you did not request this, ignore this email.",
-      "",
-      `Portal: ${loginUrl}`,
-    ].join("\n"),
-  };
 }
 
 function getClientIp(req) {
@@ -1428,73 +1246,6 @@ async function upsertPasswordOverride(username, passwordHash) {
   );
 }
 
-async function clearAuthTokens(username, purpose) {
-  await run("DELETE FROM auth_tokens WHERE username = ? AND purpose = ?", [
-    normalizeIdentifier(username || ""),
-    String(purpose || ""),
-  ]);
-}
-
-async function getActiveAuthToken(username, purpose) {
-  const nowIso = new Date().toISOString();
-  return get(
-    `
-      SELECT id, username, email, purpose, token_hash, expires_at, consumed_at, created_at
-      FROM auth_tokens
-      WHERE username = ?
-        AND purpose = ?
-        AND consumed_at IS NULL
-        AND expires_at > ?
-      ORDER BY id DESC
-      LIMIT 1
-    `,
-    [normalizeIdentifier(username || ""), String(purpose || ""), nowIso]
-  );
-}
-
-async function getPendingEmailVerification(username) {
-  const row = await getActiveAuthToken(username, AUTH_TOKEN_PURPOSE_EMAIL_VERIFICATION);
-  if (!row) {
-    return null;
-  }
-  return {
-    email: normalizeProfileEmail(row.email || ""),
-    expiresAt: row.expires_at || null,
-  };
-}
-
-async function issueAuthToken({ username, email, purpose, ttlMinutes }) {
-  const normalizedUsername = normalizeIdentifier(username || "");
-  const normalizedEmail = normalizeProfileEmail(email || "");
-  const normalizedPurpose = String(purpose || "").trim().toLowerCase();
-  if (!normalizedUsername || !normalizedEmail || !normalizedPurpose) {
-    throw new Error("Cannot issue token without username, email and purpose.");
-  }
-  const code = generateVerificationCode(AUTH_CODE_LENGTH);
-  const expiresAt = computeFutureIso(ttlMinutes);
-  await clearAuthTokens(normalizedUsername, normalizedPurpose);
-  await run(
-    `
-      INSERT INTO auth_tokens (username, email, purpose, token_hash, expires_at, created_at)
-      VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-    `,
-    [normalizedUsername, normalizedEmail, normalizedPurpose, hashVerificationCode(code), expiresAt]
-  );
-  return { code, expiresAt };
-}
-
-async function consumeAuthToken(id) {
-  await run(
-    `
-      UPDATE auth_tokens
-      SET consumed_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-        AND consumed_at IS NULL
-    `,
-    [id]
-  );
-}
-
 async function getRosterUserDepartment(username, role) {
   const normalizedUsername = normalizeIdentifier(username);
   const normalizedRole = String(role || "")
@@ -1607,19 +1358,6 @@ async function initDatabase() {
       username TEXT PRIMARY KEY,
       password_hash TEXT NOT NULL,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
-
-  await run(`
-    CREATE TABLE IF NOT EXISTS auth_tokens (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      username TEXT NOT NULL,
-      email TEXT NOT NULL,
-      purpose TEXT NOT NULL,
-      token_hash TEXT NOT NULL,
-      expires_at TEXT NOT NULL,
-      consumed_at TEXT,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   `);
 
@@ -2015,8 +1753,6 @@ async function initDatabase() {
   await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_messages_thread_created ON messages(thread_id, created_at)");
   await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_message_threads_updated_at ON message_threads(updated_at)");
   await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_auth_roster_role_department ON auth_roster(role, department)");
-  await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_auth_tokens_user_purpose ON auth_tokens(username, purpose)");
-  await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_auth_tokens_expires_at ON auth_tokens(expires_at)");
 
   await run(`
     CREATE TABLE IF NOT EXISTS user_profiles (
@@ -2084,8 +1820,6 @@ async function initDatabase() {
   if (!profileColumns.some((column) => column.name === "email")) {
     await run("ALTER TABLE user_profiles ADD COLUMN email TEXT");
   }
-
-  await run("DELETE FROM auth_tokens WHERE consumed_at IS NOT NULL OR expires_at <= ?", [new Date().toISOString()]);
 
   const notificationColumns = await all("PRAGMA table_info(notifications)");
   if (!notificationColumns.some((column) => column.name === "is_pinned")) {
@@ -6054,123 +5788,6 @@ app.get("/lecturer.html", (_req, res) => res.redirect("/lecturer"));
 app.get("/analytics.html", (_req, res) => res.redirect("/analytics"));
 app.get("/messages.html", (_req, res) => res.redirect("/messages"));
 
-app.post("/api/auth/forgot-password", async (req, res) => {
-  const identifier = normalizeIdentifier(req.body?.username || "");
-  const genericPayload = {
-    ok: true,
-    message: "If the account exists and has a verified email, a reset code has been sent.",
-  };
-  const emailDeliveryConfigured = isAuthEmailDeliveryConfigured();
-
-  if (!emailDeliveryConfigured && !authCodeFallbackEnabled) {
-    return res.status(503).json({ error: "Email delivery is not configured. Add SMTP settings first." });
-  }
-  if (!isValidIdentifier(identifier)) {
-    return res.json(genericPayload);
-  }
-
-  try {
-    const rosterUser = await get("SELECT auth_id FROM auth_roster WHERE auth_id = ? LIMIT 1", [identifier]);
-    if (!rosterUser) {
-      return res.json(genericPayload);
-    }
-    const profile = await getUserProfile(identifier);
-    const email = profile && isValidProfileEmail(profile.email) ? normalizeProfileEmail(profile.email) : "";
-    if (!email) {
-      return res.json(genericPayload);
-    }
-    const issued = await issueAuthToken({
-      username: identifier,
-      email,
-      purpose: AUTH_TOKEN_PURPOSE_PASSWORD_RESET,
-      ttlMinutes: PASSWORD_RESET_CODE_TTL_MINUTES,
-    });
-    let deliveryWarning = "";
-    if (emailDeliveryConfigured) {
-      const mail = buildPasswordResetMail(req, identifier, issued.code);
-      try {
-        await sendAuthEmailWithTimeout({
-          to: email,
-          subject: mail.subject,
-          text: mail.text,
-        });
-      } catch (err) {
-        if (!authCodeFallbackEnabled) {
-          await clearAuthTokens(identifier, AUTH_TOKEN_PURPOSE_PASSWORD_RESET);
-          return res.status(500).json({ error: "Could not send reset code right now. Please try again later." });
-        }
-        deliveryWarning = "Email delivery is delayed or unavailable. Use the reset code shown here.";
-        console.warn("[auth] forgot-password email delivery fallback enabled:", err?.message || err);
-      }
-    }
-    const payload = {
-      ...genericPayload,
-      expiresAt: issued.expiresAt,
-    };
-    if (exposeSecurityCodes || !emailDeliveryConfigured || deliveryWarning) {
-      payload.debugCode = issued.code;
-    }
-    if (!emailDeliveryConfigured) {
-      payload.message = "Email delivery is not configured on this server. Use the reset code shown here.";
-    } else if (deliveryWarning) {
-      payload.message = deliveryWarning;
-    }
-    return res.json(payload);
-  } catch (_err) {
-    return res.status(500).json({ error: "Could not start password reset." });
-  }
-});
-
-app.post("/api/auth/reset-password", async (req, res) => {
-  const identifier = normalizeIdentifier(req.body?.username || "");
-  const code = normalizeVerificationCode(req.body?.code || "");
-  const newPassword = String(req.body?.newPassword || "");
-  const confirmPassword = String(req.body?.confirmPassword || "");
-
-  if (!isValidIdentifier(identifier)) {
-    return res.status(400).json({ error: "Username is invalid." });
-  }
-  if (!isValidVerificationCode(code)) {
-    return res.status(400).json({ error: "Enter a valid reset code." });
-  }
-  if (!newPassword) {
-    return res.status(400).json({ error: "New password is required." });
-  }
-  if (newPassword !== confirmPassword) {
-    return res.status(400).json({ error: "New password and confirmation do not match." });
-  }
-  const passwordStrengthError = validateCustomPasswordStrength(newPassword, identifier);
-  if (passwordStrengthError) {
-    return res.status(400).json({ error: passwordStrengthError });
-  }
-
-  try {
-    const tokenRow = await getActiveAuthToken(identifier, AUTH_TOKEN_PURPOSE_PASSWORD_RESET);
-    if (!tokenRow) {
-      return res.status(400).json({ error: "Reset code is invalid or has expired." });
-    }
-    if (!isSameToken(tokenRow.token_hash, hashVerificationCode(code))) {
-      return res.status(400).json({ error: "Reset code is invalid or has expired." });
-    }
-    const profile = await getUserProfile(identifier);
-    const email = profile && isValidProfileEmail(profile.email) ? normalizeProfileEmail(profile.email) : "";
-    const tokenEmail = normalizeProfileEmail(tokenRow.email || "");
-    if (!email || email !== tokenEmail) {
-      return res.status(400).json({ error: "Reset code is invalid or has expired." });
-    }
-
-    const passwordHash = await bcrypt.hash(newPassword, 12);
-    await withSqlTransaction(async () => {
-      await upsertPasswordOverride(identifier, passwordHash);
-      await consumeAuthToken(tokenRow.id);
-      await clearAuthTokens(identifier, AUTH_TOKEN_PURPOSE_PASSWORD_RESET);
-    });
-    return res.json({ ok: true });
-  } catch (_err) {
-    return res.status(500).json({ error: "Could not reset password." });
-  }
-});
-
 app.post("/login", async (req, res) => {
   const rawIdentifier = String(req.body.username || "");
   const rawPassword = String(req.body.password || "");
@@ -6278,10 +5895,9 @@ app.get("/health", (_req, res) => {
 
 app.get("/api/me", requireAuth, async (req, res) => {
   try {
-    const [profile, department, pendingEmailVerification, passwordOverride] = await Promise.all([
+    const [profile, department, passwordOverride] = await Promise.all([
       getUserProfile(req.session.user.username),
       getSessionUserDepartment(req),
-      getPendingEmailVerification(req.session.user.username),
       getPasswordOverride(req.session.user.username),
     ]);
     const departmentScope = expandDepartmentScope(department);
@@ -6297,7 +5913,6 @@ app.get("/api/me", requireAuth, async (req, res) => {
       profileImageUrl: profile ? profile.profile_image_url : null,
       email,
       emailVerified: !!email,
-      pendingEmailVerification,
       customPasswordEnabled: !!(passwordOverride && passwordOverride.password_hash),
       department,
       departmentLabel: formatDepartmentLabel(department),
@@ -6377,7 +5992,6 @@ app.post("/api/profile", requireAuth, async (req, res) => {
 
 app.post("/api/profile/email", requireAuth, async (req, res) => {
   const email = normalizeProfileEmail(req.body?.email || "");
-  const emailDeliveryConfigured = isAuthEmailDeliveryConfigured();
   if (!email) {
     return res.status(400).json({ error: "Email address cannot be empty." });
   }
@@ -6390,87 +6004,10 @@ app.post("/api/profile/email", requireAuth, async (req, res) => {
     if (existingOwner && normalizeIdentifier(existingOwner.username) !== normalizeIdentifier(req.session.user.username)) {
       return res.status(409).json({ error: "This email address is already in use by another account." });
     }
-
-    const profile = await getUserProfile(req.session.user.username);
-    const currentEmail = profile && isValidProfileEmail(profile.email) ? normalizeProfileEmail(profile.email) : "";
-    if (currentEmail && currentEmail === email) {
-      await clearAuthTokens(req.session.user.username, AUTH_TOKEN_PURPOSE_EMAIL_VERIFICATION);
-      return res.json({ ok: true, email, verified: true, requiresVerification: false });
-    }
-
-    const issued = await issueAuthToken({
-      username: req.session.user.username,
-      email,
-      purpose: AUTH_TOKEN_PURPOSE_EMAIL_VERIFICATION,
-      ttlMinutes: EMAIL_VERIFICATION_CODE_TTL_MINUTES,
-    });
-    let deliveryWarning = "";
-    if (emailDeliveryConfigured) {
-      const mail = buildEmailVerificationMail(req, email, issued.code);
-      try {
-        await sendAuthEmailWithTimeout({
-          to: email,
-          subject: mail.subject,
-          text: mail.text,
-        });
-      } catch (err) {
-        deliveryWarning = "Email delivery is delayed or unavailable. Use the code shown in your profile page.";
-        console.warn("[auth] profile email verification fallback enabled:", err?.message || err);
-      }
-    }
-
-    const payload = {
-      ok: true,
-      pendingEmail: email,
-      expiresAt: issued.expiresAt,
-      requiresVerification: true,
-    };
-    if (exposeSecurityCodes || !emailDeliveryConfigured || deliveryWarning) {
-      payload.debugCode = issued.code;
-    }
-    if (!emailDeliveryConfigured) {
-      payload.message = "Email delivery is not configured on this server. Use the code shown on your profile page.";
-    } else if (deliveryWarning) {
-      payload.message = deliveryWarning;
-    }
-    return res.json(payload);
+    await upsertProfileEmail(req.session.user.username, email);
+    return res.json({ ok: true, email, verified: true, requiresVerification: false });
   } catch (_err) {
     return res.status(500).json({ error: "Could not update email address." });
-  }
-});
-
-app.post("/api/profile/email/verify", requireAuth, async (req, res) => {
-  const code = normalizeVerificationCode(req.body?.code || "");
-  if (!isValidVerificationCode(code)) {
-    return res.status(400).json({ error: "Enter a valid verification code." });
-  }
-
-  try {
-    const tokenRow = await getActiveAuthToken(req.session.user.username, AUTH_TOKEN_PURPOSE_EMAIL_VERIFICATION);
-    if (!tokenRow) {
-      return res.status(400).json({ error: "Verification code is invalid or has expired." });
-    }
-    if (!isSameToken(tokenRow.token_hash, hashVerificationCode(code))) {
-      return res.status(400).json({ error: "Verification code is invalid or has expired." });
-    }
-
-    const email = normalizeProfileEmail(tokenRow.email || "");
-    if (!isValidProfileEmail(email)) {
-      return res.status(400).json({ error: "Verification code is invalid or has expired." });
-    }
-    const existingOwner = await findProfileEmailOwner(email, req.session.user.username);
-    if (existingOwner && normalizeIdentifier(existingOwner.username) !== normalizeIdentifier(req.session.user.username)) {
-      return res.status(409).json({ error: "This email address is already in use by another account." });
-    }
-
-    await withSqlTransaction(async () => {
-      await upsertProfileEmail(req.session.user.username, email);
-      await consumeAuthToken(tokenRow.id);
-      await clearAuthTokens(req.session.user.username, AUTH_TOKEN_PURPOSE_EMAIL_VERIFICATION);
-    });
-    return res.json({ ok: true, email, verified: true });
-  } catch (_err) {
-    return res.status(500).json({ error: "Could not verify email address." });
   }
 });
 
@@ -6539,7 +6076,6 @@ app.post("/api/profile/password", requireAuth, async (req, res) => {
 
     const passwordHash = await bcrypt.hash(newPassword, 12);
     await upsertPasswordOverride(req.session.user.username, passwordHash);
-    await clearAuthTokens(req.session.user.username, AUTH_TOKEN_PURPOSE_PASSWORD_RESET);
     return res.json({ ok: true });
   } catch (_err) {
     return res.status(500).json({ error: "Could not update password." });

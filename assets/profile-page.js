@@ -52,17 +52,6 @@ function setPasswordStatus(message, isError = false) {
   node.style.color = isError ? "var(--danger)" : "var(--muted)";
 }
 
-function setEmailStatus(message, isError = false) {
-  const node = document.getElementById("profileEmailStatusMessage");
-  if (!node) {
-    return;
-  }
-  node.textContent = String(message || "");
-  node.style.color = isError ? "var(--danger)" : "var(--muted)";
-}
-
-let cachedEmailDebugCode = "";
-
 function updateProfileAvatar(imageUrl, fallbackName) {
   const imageEl = document.querySelector("[data-profile-image]");
   const initialEl = document.querySelector("[data-profile-initial]");
@@ -145,17 +134,6 @@ function renderChecklist(items, meRole) {
     .join("");
 }
 
-function formatDateTime(value) {
-  if (!value) {
-    return "";
-  }
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return "";
-  }
-  return date.toLocaleString();
-}
-
 async function loadProfilePage() {
   try {
     setError("");
@@ -170,11 +148,6 @@ async function loadProfilePage() {
     const profileRole = document.getElementById("profilePageRole");
     const profileDepartment = document.getElementById("profilePageDepartment");
     const profileEmail = document.getElementById("profilePageEmail");
-    const profileEmailStatus = document.getElementById("profilePageEmailStatus");
-    const emailInput = document.getElementById("profilePageEmailInput");
-    const emailForm = document.getElementById("profileEmailForm");
-    const emailVerifyForm = document.getElementById("profileEmailVerifyForm");
-    const emailCodeInput = document.getElementById("profilePageEmailCode");
 
     if (profileName) {
       profileName.textContent = me.displayName || me.username || "-";
@@ -189,40 +162,7 @@ async function loadProfilePage() {
       profileDepartment.textContent = me.departmentLabel || me.department || "-";
     }
     if (profileEmail) {
-      profileEmail.textContent = me.email || me.pendingEmailVerification?.email || "-";
-    }
-    if (profileEmailStatus) {
-      if (me.email) {
-        profileEmailStatus.textContent = "Verified";
-      } else if (me.pendingEmailVerification?.email) {
-        profileEmailStatus.textContent = "Pending verification";
-      } else {
-        profileEmailStatus.textContent = "Not set";
-      }
-    }
-    if (emailInput) {
-      emailInput.value = me.email || me.pendingEmailVerification?.email || "";
-    }
-    if (emailVerifyForm) {
-      emailVerifyForm.hidden = !me.pendingEmailVerification?.email;
-    }
-    if (me.pendingEmailVerification?.email) {
-      const expiresText = formatDateTime(me.pendingEmailVerification?.expiresAt);
-      const baseMessage = expiresText
-        ? `Verification pending for ${me.pendingEmailVerification.email}. Expires: ${expiresText}.`
-        : `Verification pending for ${me.pendingEmailVerification.email}.`;
-      setEmailStatus(
-        cachedEmailDebugCode ? `${baseMessage} Verification code: ${cachedEmailDebugCode}` : baseMessage,
-        false
-      );
-    } else if (me.email) {
-      setEmailStatus("Email is verified.", false);
-      cachedEmailDebugCode = "";
-      if (emailCodeInput) {
-        emailCodeInput.value = "";
-      }
-    } else {
-      setEmailStatus("Add your email address and verify it.", false);
+      profileEmail.textContent = me.email || "-";
     }
     updateProfileAvatar(me.profileImageUrl || "", me.displayName || me.username || "");
 
@@ -268,114 +208,12 @@ async function loadProfilePage() {
       });
     }
 
-    if (emailForm && emailForm.dataset.bound !== "1") {
-      emailForm.dataset.bound = "1";
-      emailForm.addEventListener("submit", async (event) => {
-        event.preventDefault();
-        const value = String(emailInput?.value || "").trim();
-        if (!value) {
-          setEmailStatus("Email address cannot be empty.", true);
-          return;
-        }
-        const submitButton = emailForm.querySelector('button[type="submit"]');
-        if (submitButton instanceof HTMLButtonElement) {
-          submitButton.disabled = true;
-          submitButton.textContent = "Saving...";
-        }
-        setEmailStatus("Saving email address...", false);
-        try {
-          const payload = await requestJson("/api/profile/email", {
-            method: "POST",
-            payload: { email: value },
-            timeoutMs: 20000,
-          });
-          cachedEmailDebugCode = payload?.debugCode ? String(payload.debugCode) : "";
-          if (payload.verified) {
-            setEmailStatus("Email already verified.", false);
-            if (window.showToast) {
-              window.showToast("Email is already verified.", { type: "success" });
-            }
-          } else if (cachedEmailDebugCode) {
-            setEmailStatus(`Verification code: ${cachedEmailDebugCode}`, false);
-            if (window.showToast) {
-              window.showToast("Verification code generated. Enter it below.", { type: "success" });
-            }
-          } else {
-            setEmailStatus(
-              payload.message || "Verification code sent. Enter the 6-digit code below.",
-              false
-            );
-            if (window.showToast) {
-              window.showToast("Verification code sent to your email.", { type: "success" });
-            }
-          }
-          await loadProfilePage();
-        } catch (err) {
-          setEmailStatus(err.message || "Could not save email address.", true);
-          if (window.showToast) {
-            window.showToast(err.message || "Could not save email address.", { type: "error" });
-          }
-        } finally {
-          if (submitButton instanceof HTMLButtonElement) {
-            submitButton.disabled = false;
-            submitButton.textContent = "Save email";
-          }
-        }
-      });
-    }
-
-    if (emailVerifyForm && emailVerifyForm.dataset.bound !== "1") {
-      emailVerifyForm.dataset.bound = "1";
-      emailVerifyForm.addEventListener("submit", async (event) => {
-        event.preventDefault();
-        const code = String(emailCodeInput?.value || "").trim();
-        if (!code) {
-          setEmailStatus("Enter the verification code.", true);
-          return;
-        }
-        const submitButton = emailVerifyForm.querySelector('button[type="submit"]');
-        if (submitButton instanceof HTMLButtonElement) {
-          submitButton.disabled = true;
-          submitButton.textContent = "Verifying...";
-        }
-        setEmailStatus("Verifying email...", false);
-        try {
-          await requestJson("/api/profile/email/verify", {
-            method: "POST",
-            payload: { code },
-            timeoutMs: 15000,
-          });
-          cachedEmailDebugCode = "";
-          if (emailCodeInput) {
-            emailCodeInput.value = "";
-          }
-          setEmailStatus("Email verified successfully.", false);
-          if (window.showToast) {
-            window.showToast("Email verified.", { type: "success" });
-          }
-          await loadProfilePage();
-        } catch (err) {
-          setEmailStatus(err.message || "Could not verify email.", true);
-          if (window.showToast) {
-            window.showToast(err.message || "Could not verify email.", { type: "error" });
-          }
-        } finally {
-          if (submitButton instanceof HTMLButtonElement) {
-            submitButton.disabled = false;
-            submitButton.textContent = "Verify email";
-          }
-        }
-      });
-    }
-
     const passwordForm = document.getElementById("profilePasswordForm");
     if (passwordForm && passwordForm.dataset.bound !== "1") {
       passwordForm.dataset.bound = "1";
       passwordForm.addEventListener("submit", async (event) => {
         event.preventDefault();
-        const currentPassword = String(
-          document.getElementById("profileCurrentPassword")?.value || ""
-        );
+        const currentPassword = String(document.getElementById("profileCurrentPassword")?.value || "");
         const newPassword = String(document.getElementById("profileNewPassword")?.value || "");
         const confirmPassword = String(document.getElementById("profileConfirmPassword")?.value || "");
         if (!currentPassword || !newPassword || !confirmPassword) {
