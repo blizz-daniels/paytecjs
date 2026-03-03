@@ -46,37 +46,6 @@ window.addEventListener("DOMContentLoaded", () => {
           <button type="submit" class="logout-btn">Log out</button>
         </form>
       </div>
-      <form id="profileEmailForm" class="profile-panel__form">
-        <label for="profileEmailAddress">Email address (used for Paystack/password reset)</label>
-        <input
-          id="profileEmailAddress"
-          name="email"
-          type="email"
-          maxlength="254"
-          placeholder="name@example.com"
-          autocomplete="email"
-          required
-        />
-        <button type="submit" class="btn">Save email</button>
-      </form>
-      <div id="profileEmailVerificationBlock" hidden>
-        <p id="profileEmailVerificationHint" class="auth-subtitle"></p>
-        <form id="profileEmailVerifyForm" class="profile-panel__form">
-          <label for="profileEmailCode">Email verification code</label>
-          <input
-            id="profileEmailCode"
-            name="code"
-            type="text"
-            inputmode="numeric"
-            pattern="\\d{6}"
-            minlength="6"
-            maxlength="6"
-            placeholder="6-digit code"
-            required
-          />
-          <button type="submit" class="btn btn-secondary">Verify email</button>
-        </form>
-      </div>
       <form id="profileAvatarForm" class="profile-panel__form">
         <label for="profileAvatarInput">Profile picture (PNG, JPG, WEBP)</label>
         <input id="profileAvatarInput" name="avatar" type="file" accept="image/png,image/jpeg,image/webp" />
@@ -90,20 +59,12 @@ window.addEventListener("DOMContentLoaded", () => {
   const profileRoleEl = panel.querySelector("[data-profile-role]");
   const profileImageEl = panel.querySelector("[data-profile-image]");
   const profileInitialEl = panel.querySelector("[data-profile-initial]");
-  const emailInput = panel.querySelector("#profileEmailAddress");
-  const emailForm = panel.querySelector("#profileEmailForm");
-  const emailVerifyBlock = panel.querySelector("#profileEmailVerificationBlock");
-  const emailVerifyHint = panel.querySelector("#profileEmailVerificationHint");
-  const emailVerifyForm = panel.querySelector("#profileEmailVerifyForm");
-  const emailCodeInput = panel.querySelector("#profileEmailCode");
   const avatarForm = panel.querySelector("#profileAvatarForm");
   const avatarInput = panel.querySelector("#profileAvatarInput");
   const statusNode = panel.querySelector("[data-profile-status]");
   const homeGreetingName = document.getElementById("homeGreetingName");
   const homeGreeting = document.querySelector(".home-greeting");
   const backdrop = panel.querySelector('[data-action="close"]');
-
-  let profileData = null;
 
   function setButtonBusy(button, isBusy, busyLabel) {
     if (!button) {
@@ -143,46 +104,42 @@ window.addEventListener("DOMContentLoaded", () => {
     initialEl.textContent = firstLetter || "?";
   }
 
-  function formatExpiry(expiresAt) {
-    if (!expiresAt) {
-      return "";
-    }
+  async function requestJson(url, options = {}) {
+    const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 15000;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const localTime = new Date(expiresAt);
-      if (Number.isNaN(localTime.getTime())) {
-        return "";
+      const response = await fetch(url, {
+        method: options.method || "GET",
+        credentials: "same-origin",
+        headers: options.payload ? { "Content-Type": "application/json" } : undefined,
+        body: options.payload ? JSON.stringify(options.payload) : undefined,
+        signal: controller.signal,
+      });
+      let payload = null;
+      try {
+        payload = await response.json();
+      } catch (_err) {
+        payload = null;
       }
-      return localTime.toLocaleString();
-    } catch (_err) {
-      return "";
-    }
-  }
-
-  function updateEmailVerificationUi(profile) {
-    if (!emailVerifyBlock || !emailVerifyHint) {
-      return;
-    }
-    const pending = profile && profile.pendingEmailVerification ? profile.pendingEmailVerification : null;
-    if (!pending || !pending.email) {
-      emailVerifyBlock.hidden = true;
-      emailVerifyHint.textContent = "";
-      if (emailCodeInput) {
-        emailCodeInput.value = "";
+      if (!response.ok) {
+        throw new Error((payload && payload.error) || "Request failed.");
       }
-      return;
+      return payload || {};
+    } catch (err) {
+      if (err && err.name === "AbortError") {
+        throw new Error("Request timed out. Please try again.");
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
     }
-    const expiresAtText = formatExpiry(pending.expiresAt);
-    emailVerifyHint.textContent = expiresAtText
-      ? `A verification code was sent to ${pending.email}. It expires at ${expiresAtText}.`
-      : `A verification code was sent to ${pending.email}.`;
-    emailVerifyBlock.hidden = false;
   }
 
   function applyProfile(profile) {
     if (!profile) {
       return;
     }
-    profileData = profile;
     const displayName = profile.displayName || profile.username || "Guest";
     if (profileNameEl) {
       profileNameEl.textContent = displayName;
@@ -199,9 +156,6 @@ window.addEventListener("DOMContentLoaded", () => {
           : "Member";
       profileRoleEl.textContent = roleText;
     }
-    if (emailInput) {
-      emailInput.value = profile.email || profile.pendingEmailVerification?.email || "";
-    }
     if (homeGreetingName) {
       homeGreetingName.textContent = displayName;
     }
@@ -209,7 +163,12 @@ window.addEventListener("DOMContentLoaded", () => {
       homeGreeting.hidden = false;
     }
     updateAvatar(profileImageEl, profileInitialEl, profile.profileImageUrl || null, displayName);
-    updateEmailVerificationUi(profile);
+
+    if (profile.pendingEmailVerification?.email) {
+      setStatus("Email verification is pending. Complete it on the profile page.", false);
+    } else {
+      setStatus("", false);
+    }
   }
 
   function openPanel() {
@@ -222,21 +181,14 @@ window.addEventListener("DOMContentLoaded", () => {
     panel.classList.remove("profile-panel--open");
     panel.style.display = "none";
     document.body.classList.remove("has-profile-panel");
-    setStatus("", false);
   }
 
   async function loadProfile() {
     try {
-      const response = await fetch("/api/me", { credentials: "same-origin" });
-      if (!response.ok) {
-        throw new Error("Could not load profile.");
-      }
-      const data = await response.json();
+      const data = await requestJson("/api/me", { method: "GET", timeoutMs: 12000 });
       applyProfile(data);
-      return data;
     } catch (_err) {
       setStatus("Unable to load profile right now.", true);
-      return null;
     }
   }
 
@@ -273,11 +225,19 @@ window.addEventListener("DOMContentLoaded", () => {
       const formData = new FormData();
       formData.append("avatar", file);
       try {
-        const response = await fetch("/api/profile/avatar", {
-          method: "POST",
-          credentials: "same-origin",
-          body: formData,
-        });
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 20000);
+        let response = null;
+        try {
+          response = await fetch("/api/profile/avatar", {
+            method: "POST",
+            credentials: "same-origin",
+            body: formData,
+            signal: controller.signal,
+          });
+        } finally {
+          clearTimeout(timer);
+        }
         const payload = await response.json();
         if (!response.ok) {
           throw new Error(payload.error || "Upload failed.");
@@ -286,115 +246,10 @@ window.addEventListener("DOMContentLoaded", () => {
         await loadProfile();
         setStatus("Profile picture updated.", false);
       } catch (err) {
-        setStatus(err?.message || "Upload failed.", true);
+        const message = err?.name === "AbortError" ? "Upload timed out. Please try again." : err?.message || "Upload failed.";
+        setStatus(message, true);
         if (window.showToast) {
-          window.showToast(err?.message || "Upload failed.", { type: "error" });
-        }
-      } finally {
-        setButtonBusy(submitButton, false, "");
-        if (loadingToast) {
-          loadingToast.close();
-        }
-      }
-    });
-  }
-
-  if (emailForm) {
-    emailForm.addEventListener("submit", async (event) => {
-      event.preventDefault();
-      const value = emailInput?.value?.trim() || "";
-      if (!value) {
-        setStatus("Email address cannot be empty.", true);
-        if (window.showToast) {
-          window.showToast("Email address cannot be empty.", { type: "error" });
-        }
-        return;
-      }
-      const submitButton = emailForm.querySelector('button[type="submit"]');
-      const loadingToast = window.showToast
-        ? window.showToast("Saving email address...", { type: "loading", sticky: true })
-        : null;
-      setButtonBusy(submitButton, true, "Saving...");
-      setStatus("Saving email address...", false);
-      try {
-        const response = await fetch("/api/profile/email", {
-          method: "POST",
-          credentials: "same-origin",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ email: value }),
-        });
-        const payload = await response.json();
-        if (!response.ok) {
-          throw new Error(payload.error || "Could not save your email address.");
-        }
-        await loadProfile();
-        if (payload.verified) {
-          setStatus("Email already verified.", false);
-          if (window.showToast) {
-            window.showToast("Email is already verified.", { type: "success" });
-          }
-        } else if (payload.debugCode) {
-          setStatus(`Use this verification code: ${payload.debugCode}`, false);
-          if (window.showToast) {
-            window.showToast("Verification code generated. Use the code shown in the panel.", { type: "success" });
-          }
-        } else {
-          setStatus("Verification code sent. Enter the 6-digit code below.", false);
-          if (window.showToast) {
-            window.showToast("Verification code sent to your email.", { type: "success" });
-          }
-        }
-      } catch (err) {
-        setStatus(err?.message || "Could not save email address.", true);
-        if (window.showToast) {
-          window.showToast(err?.message || "Could not save email address.", { type: "error" });
-        }
-      } finally {
-        setButtonBusy(submitButton, false, "");
-        if (loadingToast) {
-          loadingToast.close();
-        }
-      }
-    });
-  }
-
-  if (emailVerifyForm) {
-    emailVerifyForm.addEventListener("submit", async (event) => {
-      event.preventDefault();
-      const code = emailCodeInput?.value?.trim() || "";
-      if (!code) {
-        setStatus("Enter the verification code from your email.", true);
-        return;
-      }
-      const submitButton = emailVerifyForm.querySelector('button[type="submit"]');
-      const loadingToast = window.showToast
-        ? window.showToast("Verifying email...", { type: "loading", sticky: true })
-        : null;
-      setButtonBusy(submitButton, true, "Verifying...");
-      setStatus("Verifying email...", false);
-      try {
-        const response = await fetch("/api/profile/email/verify", {
-          method: "POST",
-          credentials: "same-origin",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ code }),
-        });
-        const payload = await response.json();
-        if (!response.ok) {
-          throw new Error(payload.error || "Could not verify email.");
-        }
-        if (emailCodeInput) {
-          emailCodeInput.value = "";
-        }
-        await loadProfile();
-        setStatus("Email verified successfully.", false);
-        if (window.showToast) {
-          window.showToast("Email verified.", { type: "success" });
-        }
-      } catch (err) {
-        setStatus(err?.message || "Could not verify email.", true);
-        if (window.showToast) {
-          window.showToast(err?.message || "Could not verify email.", { type: "error" });
+          window.showToast(message, { type: "error" });
         }
       } finally {
         setButtonBusy(submitButton, false, "");

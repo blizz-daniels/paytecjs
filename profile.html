@@ -74,6 +74,40 @@
       </section>
 
       <section class="card">
+        <h2>Email Verification</h2>
+        <p class="auth-subtitle">Add or update your login/recovery email, then verify it with the code.</p>
+        <p id="profileEmailStatusMessage" class="auth-subtitle"></p>
+        <form id="profileEmailForm" class="auth-form">
+          <label for="profilePageEmailInput">Email address</label>
+          <input
+            id="profilePageEmailInput"
+            name="email"
+            type="email"
+            maxlength="254"
+            placeholder="name@example.com"
+            autocomplete="email"
+            required
+          />
+          <button type="submit" class="btn">Save email</button>
+        </form>
+        <form id="profileEmailVerifyForm" class="auth-form" hidden>
+          <label for="profilePageEmailCode">Verification code</label>
+          <input
+            id="profilePageEmailCode"
+            name="code"
+            type="text"
+            inputmode="numeric"
+            pattern="\\d{6}"
+            minlength="6"
+            maxlength="6"
+            placeholder="6-digit code"
+            required
+          />
+          <button type="submit" class="btn btn-secondary">Verify email</button>
+        </form>
+      </section>
+
+      <section class="card">
         <h2>Security</h2>
         <p class="auth-subtitle">Set a stronger custom password. After saving it, this becomes your login password.</p>
         <p id="passwordStatus" class="auth-subtitle"></p>

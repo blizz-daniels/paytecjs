@@ -124,11 +124,18 @@ const SMTP_URL = String(process.env.SMTP_URL || "").trim();
 const SMTP_HOST = String(process.env.SMTP_HOST || "").trim();
 const SMTP_PORT = Number.parseInt(String(process.env.SMTP_PORT || "587"), 10) || 587;
 const SMTP_USER = String(process.env.SMTP_USER || "").trim();
-const SMTP_PASS = String(process.env.SMTP_PASS || "").trim();
+const SMTP_PASS_RAW = String(process.env.SMTP_PASS || "").trim();
+const SMTP_PASS = /gmail\.com|googlemail\.com/i.test(SMTP_HOST)
+  ? SMTP_PASS_RAW.replace(/\s+/g, "")
+  : SMTP_PASS_RAW;
 const SMTP_SECURE = parseBooleanEnv(process.env.SMTP_SECURE, SMTP_PORT === 465);
 const AUTH_EMAIL_FROM = String(
   process.env.AUTH_EMAIL_FROM || process.env.SMTP_FROM || process.env.RECEIPT_EMAIL_FROM || ""
 ).trim();
+const AUTH_EMAIL_SEND_TIMEOUT_MS = (() => {
+  const value = Number.parseInt(String(process.env.AUTH_EMAIL_SEND_TIMEOUT_MS || "12000"), 10);
+  return Number.isFinite(value) && value >= 3000 ? value : 12000;
+})();
 const PAYMENT_REFERENCE_PREFIX = String(process.env.PAYMENT_REFERENCE_PREFIX || "PAYTEC").trim().toUpperCase();
 const PAYMENT_REFERENCE_TENANT_ID = String(
   process.env.PAYMENT_REFERENCE_TENANT_ID || process.env.SCHOOL_ID || process.env.TENANT_ID || "default-school"
@@ -685,6 +692,24 @@ async function sendAuthEmail(payload) {
     text: String(payload.text || ""),
   });
   return { skipped: false };
+}
+
+async function sendAuthEmailWithTimeout(payload, timeoutMs = AUTH_EMAIL_SEND_TIMEOUT_MS) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      sendAuthEmail(payload),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error("Auth email send timed out."));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
 }
 
 function validateCustomPasswordStrength(password, username) {
@@ -6060,28 +6085,35 @@ app.post("/api/auth/forgot-password", async (req, res) => {
       purpose: AUTH_TOKEN_PURPOSE_PASSWORD_RESET,
       ttlMinutes: PASSWORD_RESET_CODE_TTL_MINUTES,
     });
+    let deliveryWarning = "";
     if (emailDeliveryConfigured) {
       const mail = buildPasswordResetMail(req, identifier, issued.code);
       try {
-        await sendAuthEmail({
+        await sendAuthEmailWithTimeout({
           to: email,
           subject: mail.subject,
           text: mail.text,
         });
-      } catch (_err) {
-        await clearAuthTokens(identifier, AUTH_TOKEN_PURPOSE_PASSWORD_RESET);
-        return res.status(500).json({ error: "Could not send reset code right now. Please try again later." });
+      } catch (err) {
+        if (!authCodeFallbackEnabled) {
+          await clearAuthTokens(identifier, AUTH_TOKEN_PURPOSE_PASSWORD_RESET);
+          return res.status(500).json({ error: "Could not send reset code right now. Please try again later." });
+        }
+        deliveryWarning = "Email delivery is delayed or unavailable. Use the reset code shown here.";
+        console.warn("[auth] forgot-password email delivery fallback enabled:", err?.message || err);
       }
     }
     const payload = {
       ...genericPayload,
       expiresAt: issued.expiresAt,
     };
-    if (exposeSecurityCodes || !emailDeliveryConfigured) {
+    if (exposeSecurityCodes || !emailDeliveryConfigured || deliveryWarning) {
       payload.debugCode = issued.code;
     }
     if (!emailDeliveryConfigured) {
       payload.message = "Email delivery is not configured on this server. Use the reset code shown here.";
+    } else if (deliveryWarning) {
+      payload.message = deliveryWarning;
     }
     return res.json(payload);
   } catch (_err) {
@@ -6354,9 +6386,6 @@ app.post("/api/profile/email", requireAuth, async (req, res) => {
   }
 
   try {
-    if (!emailDeliveryConfigured && !authCodeFallbackEnabled) {
-      return res.status(503).json({ error: "Email delivery is not configured. Add SMTP settings first." });
-    }
     const existingOwner = await findProfileEmailOwner(email, req.session.user.username);
     if (existingOwner && normalizeIdentifier(existingOwner.username) !== normalizeIdentifier(req.session.user.username)) {
       return res.status(409).json({ error: "This email address is already in use by another account." });
@@ -6375,17 +6404,18 @@ app.post("/api/profile/email", requireAuth, async (req, res) => {
       purpose: AUTH_TOKEN_PURPOSE_EMAIL_VERIFICATION,
       ttlMinutes: EMAIL_VERIFICATION_CODE_TTL_MINUTES,
     });
+    let deliveryWarning = "";
     if (emailDeliveryConfigured) {
       const mail = buildEmailVerificationMail(req, email, issued.code);
       try {
-        await sendAuthEmail({
+        await sendAuthEmailWithTimeout({
           to: email,
           subject: mail.subject,
           text: mail.text,
         });
-      } catch (_err) {
-        await clearAuthTokens(req.session.user.username, AUTH_TOKEN_PURPOSE_EMAIL_VERIFICATION);
-        return res.status(500).json({ error: "Could not send verification code right now. Please try again later." });
+      } catch (err) {
+        deliveryWarning = "Email delivery is delayed or unavailable. Use the code shown in your profile page.";
+        console.warn("[auth] profile email verification fallback enabled:", err?.message || err);
       }
     }
 
@@ -6395,11 +6425,13 @@ app.post("/api/profile/email", requireAuth, async (req, res) => {
       expiresAt: issued.expiresAt,
       requiresVerification: true,
     };
-    if (exposeSecurityCodes || !emailDeliveryConfigured) {
+    if (exposeSecurityCodes || !emailDeliveryConfigured || deliveryWarning) {
       payload.debugCode = issued.code;
     }
     if (!emailDeliveryConfigured) {
-      payload.message = "Email delivery is not configured on this server. Use the code shown in this panel.";
+      payload.message = "Email delivery is not configured on this server. Use the code shown on your profile page.";
+    } else if (deliveryWarning) {
+      payload.message = deliveryWarning;
     }
     return res.json(payload);
   } catch (_err) {
