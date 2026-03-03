@@ -333,6 +333,11 @@ window.addEventListener("DOMContentLoaded", () => {
           if (window.showToast) {
             window.showToast("Email is already verified.", { type: "success" });
           }
+        } else if (payload.debugCode) {
+          setStatus(`Use this verification code: ${payload.debugCode}`, false);
+          if (window.showToast) {
+            window.showToast("Verification code generated. Use the code shown in the panel.", { type: "success" });
+          }
         } else {
           setStatus("Verification code sent. Enter the 6-digit code below.", false);
           if (window.showToast) {

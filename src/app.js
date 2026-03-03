@@ -97,6 +97,7 @@ const CUSTOM_PASSWORD_MIN_LENGTH = (() => {
 const CUSTOM_PASSWORD_MAX_LENGTH = 72;
 const exposeSecurityCodes =
   process.env.NODE_ENV === "test" || parseBooleanEnv(process.env.AUTH_EXPOSE_DEBUG_CODES, false);
+const authCodeFallbackEnabled = parseBooleanEnv(process.env.AUTH_ALLOW_INSECURE_CODE_FALLBACK, !isProduction);
 const loginAttempts = new Map();
 let departmentGroupsCache = {
   mtimeMs: -1,
@@ -6034,8 +6035,9 @@ app.post("/api/auth/forgot-password", async (req, res) => {
     ok: true,
     message: "If the account exists and has a verified email, a reset code has been sent.",
   };
+  const emailDeliveryConfigured = isAuthEmailDeliveryConfigured();
 
-  if (!isAuthEmailDeliveryConfigured() && process.env.NODE_ENV !== "test") {
+  if (!emailDeliveryConfigured && !authCodeFallbackEnabled) {
     return res.status(503).json({ error: "Email delivery is not configured. Add SMTP settings first." });
   }
   if (!isValidIdentifier(identifier)) {
@@ -6058,23 +6060,28 @@ app.post("/api/auth/forgot-password", async (req, res) => {
       purpose: AUTH_TOKEN_PURPOSE_PASSWORD_RESET,
       ttlMinutes: PASSWORD_RESET_CODE_TTL_MINUTES,
     });
-    const mail = buildPasswordResetMail(req, identifier, issued.code);
-    try {
-      await sendAuthEmail({
-        to: email,
-        subject: mail.subject,
-        text: mail.text,
-      });
-    } catch (_err) {
-      await clearAuthTokens(identifier, AUTH_TOKEN_PURPOSE_PASSWORD_RESET);
-      return res.status(500).json({ error: "Could not send reset code right now. Please try again later." });
+    if (emailDeliveryConfigured) {
+      const mail = buildPasswordResetMail(req, identifier, issued.code);
+      try {
+        await sendAuthEmail({
+          to: email,
+          subject: mail.subject,
+          text: mail.text,
+        });
+      } catch (_err) {
+        await clearAuthTokens(identifier, AUTH_TOKEN_PURPOSE_PASSWORD_RESET);
+        return res.status(500).json({ error: "Could not send reset code right now. Please try again later." });
+      }
     }
     const payload = {
       ...genericPayload,
       expiresAt: issued.expiresAt,
     };
-    if (exposeSecurityCodes) {
+    if (exposeSecurityCodes || !emailDeliveryConfigured) {
       payload.debugCode = issued.code;
+    }
+    if (!emailDeliveryConfigured) {
+      payload.message = "Email delivery is not configured on this server. Use the reset code shown here.";
     }
     return res.json(payload);
   } catch (_err) {
@@ -6338,6 +6345,7 @@ app.post("/api/profile", requireAuth, async (req, res) => {
 
 app.post("/api/profile/email", requireAuth, async (req, res) => {
   const email = normalizeProfileEmail(req.body?.email || "");
+  const emailDeliveryConfigured = isAuthEmailDeliveryConfigured();
   if (!email) {
     return res.status(400).json({ error: "Email address cannot be empty." });
   }
@@ -6346,7 +6354,7 @@ app.post("/api/profile/email", requireAuth, async (req, res) => {
   }
 
   try {
-    if (!isAuthEmailDeliveryConfigured() && process.env.NODE_ENV !== "test") {
+    if (!emailDeliveryConfigured && !authCodeFallbackEnabled) {
       return res.status(503).json({ error: "Email delivery is not configured. Add SMTP settings first." });
     }
     const existingOwner = await findProfileEmailOwner(email, req.session.user.username);
@@ -6367,16 +6375,18 @@ app.post("/api/profile/email", requireAuth, async (req, res) => {
       purpose: AUTH_TOKEN_PURPOSE_EMAIL_VERIFICATION,
       ttlMinutes: EMAIL_VERIFICATION_CODE_TTL_MINUTES,
     });
-    const mail = buildEmailVerificationMail(req, email, issued.code);
-    try {
-      await sendAuthEmail({
-        to: email,
-        subject: mail.subject,
-        text: mail.text,
-      });
-    } catch (_err) {
-      await clearAuthTokens(req.session.user.username, AUTH_TOKEN_PURPOSE_EMAIL_VERIFICATION);
-      return res.status(500).json({ error: "Could not send verification code right now. Please try again later." });
+    if (emailDeliveryConfigured) {
+      const mail = buildEmailVerificationMail(req, email, issued.code);
+      try {
+        await sendAuthEmail({
+          to: email,
+          subject: mail.subject,
+          text: mail.text,
+        });
+      } catch (_err) {
+        await clearAuthTokens(req.session.user.username, AUTH_TOKEN_PURPOSE_EMAIL_VERIFICATION);
+        return res.status(500).json({ error: "Could not send verification code right now. Please try again later." });
+      }
     }
 
     const payload = {
@@ -6385,8 +6395,11 @@ app.post("/api/profile/email", requireAuth, async (req, res) => {
       expiresAt: issued.expiresAt,
       requiresVerification: true,
     };
-    if (exposeSecurityCodes) {
+    if (exposeSecurityCodes || !emailDeliveryConfigured) {
       payload.debugCode = issued.code;
+    }
+    if (!emailDeliveryConfigured) {
+      payload.message = "Email delivery is not configured on this server. Use the code shown in this panel.";
     }
     return res.json(payload);
   } catch (_err) {
