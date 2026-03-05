@@ -33,8 +33,11 @@ The payment system runs in strict Paystack mode:
 - Students can create a stronger custom password once from their profile page.
 - After that one-time setup, further student password changes are blocked in profile.
 - Forgotten stronger passwords are reset from `/forgot-password` using email OTP verification.
-- OTP delivery requires a valid student profile email and SMTP configuration.
+- OTP delivery requires a valid student profile email and email delivery configuration (SMTP or API).
 - OTP is always sent to the email saved in `user_profiles.email` for that username.
+- Email delivery provider is configurable with `EMAIL_PROVIDER`:
+  - `smtp` (default) using `SMTP_*`
+  - `resend` (HTTPS API) using `RESEND_API_KEY` + `PASSWORD_RESET_EMAIL_FROM`
 
 ## Core APIs
 
@@ -242,7 +245,7 @@ See `.env.example`, including:
 - `PAYSTACK_WEBHOOK_SECRET`
 - `PAYSTACK_INTERNAL_VERIFY_SECRET`
 - `RECEIPT_*` values for approved receipt generation/download
-- `SMTP_*` values only if you run the standalone email sender workflow
+- `EMAIL_PROVIDER`, `PASSWORD_RESET_EMAIL_FROM`, and either `SMTP_*` (SMTP mode) or `RESEND_API_KEY` (Resend API mode)
 
 ## Running Tests
 

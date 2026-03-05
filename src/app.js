@@ -108,9 +108,20 @@ const SMTP_USER = String(process.env.SMTP_USER || "").trim();
 const SMTP_PASS = String(process.env.SMTP_PASS || "").trim();
 const SMTP_FROM = String(process.env.SMTP_FROM || "").trim();
 const PASSWORD_RESET_EMAIL_FROM = String(process.env.PASSWORD_RESET_EMAIL_FROM || SMTP_FROM || "").trim();
+const EMAIL_PROVIDER = String(process.env.EMAIL_PROVIDER || "smtp")
+  .trim()
+  .toLowerCase();
+const RESEND_API_KEY = String(process.env.RESEND_API_KEY || "").trim();
+const RESEND_API_BASE_URL = String(process.env.RESEND_API_BASE_URL || "https://api.resend.com")
+  .trim()
+  .replace(/\/$/, "");
 const PASSWORD_RESET_SMTP_TIMEOUT_MS = (() => {
   const value = Number.parseInt(String(process.env.PASSWORD_RESET_SMTP_TIMEOUT_MS || "10000"), 10);
   return Number.isFinite(value) && value >= 3000 && value <= 60000 ? value : 10000;
+})();
+const PASSWORD_RESET_EMAIL_API_TIMEOUT_MS = (() => {
+  const value = Number.parseInt(String(process.env.PASSWORD_RESET_EMAIL_API_TIMEOUT_MS || "12000"), 10);
+  return Number.isFinite(value) && value >= 3000 && value <= 60000 ? value : 12000;
 })();
 const isTestEnvironment = process.env.NODE_ENV === "test";
 const loginAttempts = new Map();
@@ -744,13 +755,7 @@ async function sendPasswordResetOtpEmail({ username, toEmail, otpCode, expiresIn
   if (!toEmail || !isValidProfileEmail(toEmail)) {
     throw new Error("Cannot deliver OTP because the account email is invalid.");
   }
-  const transport = getSmtpTransport();
-  if (!transport) {
-    if (isTestEnvironment) {
-      return;
-    }
-    throw new Error("Email delivery is not configured. Set SMTP_URL or SMTP_HOST.");
-  }
+  const provider = EMAIL_PROVIDER || "smtp";
   const mailFrom = PASSWORD_RESET_EMAIL_FROM || SMTP_FROM;
   if (!mailFrom) {
     throw new Error("Email delivery is not configured. Set PASSWORD_RESET_EMAIL_FROM or SMTP_FROM.");
@@ -764,6 +769,66 @@ async function sendPasswordResetOtpEmail({ username, toEmail, otpCode, expiresIn
     "",
     "If you did not request this reset, ignore this message.",
   ].join("\n");
+
+  if (provider === "resend") {
+    if (!RESEND_API_KEY) {
+      if (isTestEnvironment) {
+        return;
+      }
+      throw new Error("Email API is not configured. Set RESEND_API_KEY.");
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), PASSWORD_RESET_EMAIL_API_TIMEOUT_MS);
+    try {
+      const response = await fetch(`${RESEND_API_BASE_URL}/emails`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${RESEND_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          from: mailFrom,
+          to: [toEmail],
+          subject,
+          text,
+        }),
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        let payload = null;
+        try {
+          payload = await response.json();
+        } catch (_err) {
+          payload = null;
+        }
+        const apiMessage = String(payload?.message || payload?.error || "").trim();
+        if (apiMessage) {
+          throw new Error(`Email API error: ${apiMessage}`);
+        }
+        throw new Error(`Email API error: HTTP ${response.status}`);
+      }
+      return;
+    } catch (err) {
+      if (err?.name === "AbortError") {
+        throw new Error("OTP email API request timed out. Check EMAIL_PROVIDER settings and try again.");
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  if (provider !== "smtp") {
+    throw new Error("Unsupported EMAIL_PROVIDER. Use 'smtp' or 'resend'.");
+  }
+
+  const transport = getSmtpTransport();
+  if (!transport) {
+    if (isTestEnvironment) {
+      return;
+    }
+    throw new Error("Email delivery is not configured. Set SMTP_URL or SMTP_HOST.");
+  }
   await withPromiseTimeout(
     transport.sendMail({
       from: mailFrom,
