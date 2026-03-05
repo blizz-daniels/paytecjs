@@ -108,6 +108,10 @@ const SMTP_USER = String(process.env.SMTP_USER || "").trim();
 const SMTP_PASS = String(process.env.SMTP_PASS || "").trim();
 const SMTP_FROM = String(process.env.SMTP_FROM || "").trim();
 const PASSWORD_RESET_EMAIL_FROM = String(process.env.PASSWORD_RESET_EMAIL_FROM || SMTP_FROM || "").trim();
+const PASSWORD_RESET_SMTP_TIMEOUT_MS = (() => {
+  const value = Number.parseInt(String(process.env.PASSWORD_RESET_SMTP_TIMEOUT_MS || "10000"), 10);
+  return Number.isFinite(value) && value >= 3000 && value <= 60000 ? value : 10000;
+})();
 const isTestEnvironment = process.env.NODE_ENV === "test";
 const loginAttempts = new Map();
 let departmentGroupsCache = {
@@ -672,6 +676,39 @@ function hasPasswordResetOtpResendCooldown(row, nowMs = Date.now()) {
   return nowMs - createdAtMs < PASSWORD_RESET_OTP_RESEND_COOLDOWN_SECONDS * 1000;
 }
 
+function maskEmailAddress(value) {
+  const normalized = normalizeProfileEmail(value);
+  if (!isValidProfileEmail(normalized)) {
+    return "";
+  }
+  const [localPart, domainPart] = normalized.split("@");
+  if (!localPart || !domainPart) {
+    return "";
+  }
+  if (localPart.length <= 2) {
+    return `${localPart.charAt(0)}***@${domainPart}`;
+  }
+  return `${localPart.slice(0, 2)}***@${domainPart}`;
+}
+
+function withPromiseTimeout(promise, timeoutMs, timeoutMessage) {
+  const safeTimeoutMs = Number.isFinite(timeoutMs) ? Math.max(1000, timeoutMs) : 10000;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(timeoutMessage || "Request timed out."));
+    }, safeTimeoutMs);
+    Promise.resolve(promise)
+      .then((value) => {
+        clearTimeout(timer);
+        resolve(value);
+      })
+      .catch((err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+  });
+}
+
 function getSmtpTransport() {
   if (smtpTransportInitialized) {
     return smtpTransport;
@@ -679,7 +716,12 @@ function getSmtpTransport() {
   smtpTransportInitialized = true;
 
   if (SMTP_URL) {
-    smtpTransport = nodemailer.createTransport(SMTP_URL);
+    smtpTransport = nodemailer.createTransport({
+      url: SMTP_URL,
+      connectionTimeout: PASSWORD_RESET_SMTP_TIMEOUT_MS,
+      greetingTimeout: PASSWORD_RESET_SMTP_TIMEOUT_MS,
+      socketTimeout: PASSWORD_RESET_SMTP_TIMEOUT_MS + 5000,
+    });
     return smtpTransport;
   }
   if (!SMTP_HOST) {
@@ -691,6 +733,9 @@ function getSmtpTransport() {
     port: Number.isFinite(SMTP_PORT) && SMTP_PORT > 0 ? SMTP_PORT : 587,
     secure: SMTP_SECURE,
     auth: SMTP_USER ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
+    connectionTimeout: PASSWORD_RESET_SMTP_TIMEOUT_MS,
+    greetingTimeout: PASSWORD_RESET_SMTP_TIMEOUT_MS,
+    socketTimeout: PASSWORD_RESET_SMTP_TIMEOUT_MS + 5000,
   });
   return smtpTransport;
 }
@@ -719,12 +764,16 @@ async function sendPasswordResetOtpEmail({ username, toEmail, otpCode, expiresIn
     "",
     "If you did not request this reset, ignore this message.",
   ].join("\n");
-  await transport.sendMail({
-    from: mailFrom,
-    to: toEmail,
-    subject,
-    text,
-  });
+  await withPromiseTimeout(
+    transport.sendMail({
+      from: mailFrom,
+      to: toEmail,
+      subject,
+      text,
+    }),
+    PASSWORD_RESET_SMTP_TIMEOUT_MS + 2000,
+    "OTP email delivery timed out. Check SMTP settings and try again."
+  );
 }
 
 function getClientIp(req) {
@@ -6175,7 +6224,7 @@ app.post("/api/auth/password-recovery/send-otp", async (req, res) => {
     const payload = {
       ok: true,
       expiresInMinutes: PASSWORD_RESET_OTP_TTL_MINUTES,
-      sentToMaskedEmail: email.replace(/^(.).+(@.+)$/, "$1***$2"),
+      sentToMaskedEmail: maskEmailAddress(email),
     };
     if (isTestEnvironment) {
       payload.otpCode = otpCode;

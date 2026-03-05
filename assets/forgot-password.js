@@ -59,11 +59,12 @@ window.addEventListener("DOMContentLoaded", () => {
     }
     sendOtpButton.disabled = true;
     sendOtpButton.textContent = "Sending...";
-    setStatus("Sending OTP to your email...", false);
+    setStatus("Sending OTP to your profile email...", false);
     try {
       const payload = await requestJson("/api/auth/password-recovery/send-otp", {
         method: "POST",
         payload: { username },
+        timeoutMs: 30000,
       });
       const masked = String(payload.sentToMaskedEmail || "").trim();
       if (masked) {

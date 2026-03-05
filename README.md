@@ -34,6 +34,7 @@ The payment system runs in strict Paystack mode:
 - After that one-time setup, further student password changes are blocked in profile.
 - Forgotten stronger passwords are reset from `/forgot-password` using email OTP verification.
 - OTP delivery requires a valid student profile email and SMTP configuration.
+- OTP is always sent to the email saved in `user_profiles.email` for that username.
 
 ## Core APIs
 
