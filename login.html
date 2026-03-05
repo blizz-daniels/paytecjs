@@ -26,11 +26,12 @@
           <input id="username" name="username" type="text" minlength="3" maxlength="40" pattern="[A-Za-z0-9/_-]+" required />
 
           <label for="password">Password</label>
-          <input id="password" name="password" type="password" minlength="2" maxlength="40" required />
+          <input id="password" name="password" type="password" minlength="2" maxlength="72" required />
           <input type="hidden" name="_csrf" value="" />
 
           <button type="submit" class="btn">Log in</button>
         </form>
+        <p class="auth-help"><a href="/forgot-password">Forgot Password?</a></p>
         <p class="auth-help">Accounts are provisioned by admin roster upload.</p>
       </section>
     </main>

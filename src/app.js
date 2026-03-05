@@ -83,6 +83,31 @@ const CUSTOM_PASSWORD_MIN_LENGTH = (() => {
   return Number.isFinite(value) && value >= 8 ? value : 10;
 })();
 const CUSTOM_PASSWORD_MAX_LENGTH = 72;
+const SECURITY_ANSWER_MIN_LENGTH = 8;
+const SECURITY_ANSWER_MAX_LENGTH = 160;
+const REQUIRED_SECURITY_QUESTIONS = Object.freeze([
+  {
+    key: "home_nickname",
+    prompt: "What nickname was used for you only at home?",
+  },
+  {
+    key: "private_childhood_friend",
+    prompt: "What is the full name of a close childhood friend that you never post online?",
+  },
+  {
+    key: "first_phone_details",
+    prompt: "What was your first phone model and its color?",
+  },
+  {
+    key: "hidden_family_place",
+    prompt: "What place did your family visit often but never shared publicly?",
+  },
+  {
+    key: "personal_life_motto",
+    prompt: "What private life motto do you keep for yourself?",
+  },
+]);
+const REQUIRED_SECURITY_QUESTION_KEYS = new Set(REQUIRED_SECURITY_QUESTIONS.map((item) => item.key));
 const loginAttempts = new Map();
 let departmentGroupsCache = {
   mtimeMs: -1,
@@ -599,6 +624,51 @@ function validateCustomPasswordStrength(password, username) {
     }
   }
   return "";
+}
+
+function normalizeSecurityAnswer(value) {
+  return String(value || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+}
+
+function getSecurityQuestionPayload() {
+  return REQUIRED_SECURITY_QUESTIONS.map((item) => ({
+    key: item.key,
+    prompt: item.prompt,
+    minAnswerLength: SECURITY_ANSWER_MIN_LENGTH,
+  }));
+}
+
+function parseRequiredSecurityAnswers(rawAnswers) {
+  if (!rawAnswers || typeof rawAnswers !== "object" || Array.isArray(rawAnswers)) {
+    return { error: "All security question answers are required." };
+  }
+  const normalizedAnswers = [];
+  for (const question of REQUIRED_SECURITY_QUESTIONS) {
+    const normalizedAnswer = normalizeSecurityAnswer(rawAnswers[question.key]);
+    if (!normalizedAnswer) {
+      return { error: `Answer required: ${question.prompt}` };
+    }
+    if (normalizedAnswer.length < SECURITY_ANSWER_MIN_LENGTH) {
+      return {
+        error: `Answer for "${question.prompt}" must be at least ${SECURITY_ANSWER_MIN_LENGTH} characters.`,
+      };
+    }
+    if (normalizedAnswer.length > SECURITY_ANSWER_MAX_LENGTH) {
+      return {
+        error: `Answer for "${question.prompt}" must be at most ${SECURITY_ANSWER_MAX_LENGTH} characters.`,
+      };
+    }
+    normalizedAnswers.push({
+      questionKey: question.key,
+      normalizedAnswer,
+    });
+  }
+  return {
+    answers: normalizedAnswers,
+  };
 }
 
 function getClientIp(req) {
@@ -1246,6 +1316,41 @@ async function upsertPasswordOverride(username, passwordHash) {
   );
 }
 
+async function listUserSecurityAnswers(username) {
+  return all(
+    `
+      SELECT question_key, answer_hash, updated_at
+      FROM user_security_answers
+      WHERE username = ?
+      ORDER BY question_key ASC
+    `,
+    [normalizeIdentifier(username || "")]
+  );
+}
+
+function hasAllRequiredSecurityAnswers(rows) {
+  const questions = new Set(
+    (Array.isArray(rows) ? rows : [])
+      .map((row) => String(row?.question_key || "").trim())
+      .filter((questionKey) => REQUIRED_SECURITY_QUESTION_KEYS.has(questionKey))
+  );
+  return questions.size === REQUIRED_SECURITY_QUESTION_KEYS.size;
+}
+
+async function upsertUserSecurityAnswers(username, hashedAnswers) {
+  const normalizedUsername = normalizeIdentifier(username || "");
+  await run("DELETE FROM user_security_answers WHERE username = ?", [normalizedUsername]);
+  for (const answer of hashedAnswers) {
+    await run(
+      `
+        INSERT INTO user_security_answers (username, question_key, answer_hash, updated_at)
+        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+      `,
+      [normalizedUsername, answer.questionKey, answer.answerHash]
+    );
+  }
+}
+
 async function getRosterUserDepartment(username, role) {
   const normalizedUsername = normalizeIdentifier(username);
   const normalizedRole = String(role || "")
@@ -1358,6 +1463,16 @@ async function initDatabase() {
       username TEXT PRIMARY KEY,
       password_hash TEXT NOT NULL,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  await run(`
+    CREATE TABLE IF NOT EXISTS user_security_answers (
+      username TEXT NOT NULL,
+      question_key TEXT NOT NULL,
+      answer_hash TEXT NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (username, question_key)
     )
   `);
 
@@ -5780,13 +5895,28 @@ app.get("/login", (req, res) => {
   return res.sendFile(path.join(PROJECT_ROOT, "login.html"));
 });
 
+app.get("/forgot-password", (req, res) => {
+  if (isAuthenticated(req)) {
+    return res.redirect("/");
+  }
+  return res.sendFile(path.join(PROJECT_ROOT, "forgot-password.html"));
+});
+
 app.get("/login.html", (_req, res) => res.redirect("/login"));
+app.get("/forgot-password.html", (_req, res) => res.redirect("/forgot-password"));
 app.get("/admin.html", (_req, res) => res.redirect("/admin"));
 app.get("/admin-import.html", (_req, res) => res.redirect("/admin/import"));
 app.get("/teacher.html", (_req, res) => res.redirect("/lecturer"));
 app.get("/lecturer.html", (_req, res) => res.redirect("/lecturer"));
 app.get("/analytics.html", (_req, res) => res.redirect("/analytics"));
 app.get("/messages.html", (_req, res) => res.redirect("/messages"));
+app.get("/api/auth/password-recovery/questions", (_req, res) => {
+  return res.json({
+    questions: getSecurityQuestionPayload(),
+    securityAnswerMinLength: SECURITY_ANSWER_MIN_LENGTH,
+    requiredCount: REQUIRED_SECURITY_QUESTIONS.length,
+  });
+});
 
 app.post("/login", async (req, res) => {
   const rawIdentifier = String(req.body.username || "");
@@ -5876,6 +6006,70 @@ app.post("/login", async (req, res) => {
   }
 });
 
+app.post("/api/auth/password-recovery/reset", async (req, res) => {
+  const identifier = normalizeIdentifier(req.body?.username || "");
+  const newPassword = String(req.body?.newPassword || "");
+  const confirmPassword = String(req.body?.confirmPassword || "");
+  if (!isValidIdentifier(identifier)) {
+    return res.status(400).json({ error: "Enter a valid username." });
+  }
+  if (!newPassword) {
+    return res.status(400).json({ error: "New password is required." });
+  }
+  if (newPassword !== confirmPassword) {
+    return res.status(400).json({ error: "New password and confirmation do not match." });
+  }
+  const passwordStrengthError = validateCustomPasswordStrength(newPassword, identifier);
+  if (passwordStrengthError) {
+    return res.status(400).json({ error: passwordStrengthError });
+  }
+  const parsedSecurityAnswers = parseRequiredSecurityAnswers(req.body?.securityAnswers);
+  if (parsedSecurityAnswers.error) {
+    return res.status(400).json({ error: parsedSecurityAnswers.error });
+  }
+
+  try {
+    const rosterUser = await get("SELECT auth_id, role FROM auth_roster WHERE auth_id = ? LIMIT 1", [identifier]);
+    if (!rosterUser || String(rosterUser.role || "").trim().toLowerCase() !== "student") {
+      return res.status(400).json({ error: "Password reset is not available for this account." });
+    }
+
+    const passwordOverride = await getPasswordOverride(identifier);
+    if (!passwordOverride || !passwordOverride.password_hash) {
+      return res.status(400).json({ error: "Password reset is not available for this account." });
+    }
+
+    const storedAnswers = await listUserSecurityAnswers(identifier);
+    if (!hasAllRequiredSecurityAnswers(storedAnswers)) {
+      return res.status(400).json({ error: "Security questions are not configured for this account." });
+    }
+    const answersByQuestion = new Map(
+      storedAnswers.map((row) => [String(row?.question_key || "").trim(), String(row?.answer_hash || "")])
+    );
+    for (const answer of parsedSecurityAnswers.answers) {
+      const storedHash = answersByQuestion.get(answer.questionKey);
+      if (!storedHash) {
+        return res.status(403).json({ error: "Security answer verification failed." });
+      }
+      const isMatch = await bcrypt.compare(answer.normalizedAnswer, storedHash);
+      if (!isMatch) {
+        return res.status(403).json({ error: "Security answer verification failed." });
+      }
+    }
+
+    const isSameAsCurrent = await bcrypt.compare(newPassword, passwordOverride.password_hash);
+    if (isSameAsCurrent) {
+      return res.status(400).json({ error: "New password must be different from your current password." });
+    }
+
+    const passwordHash = await bcrypt.hash(newPassword, 12);
+    await upsertPasswordOverride(identifier, passwordHash);
+    return res.json({ ok: true });
+  } catch (_err) {
+    return res.status(500).json({ error: "Could not reset password." });
+  }
+});
+
 function handleLogout(req, res) {
   if (!req.session) {
     return res.redirect("/login");
@@ -5914,6 +6108,12 @@ app.get("/api/me", requireAuth, async (req, res) => {
       email,
       emailVerified: !!email,
       customPasswordEnabled: !!(passwordOverride && passwordOverride.password_hash),
+      canSetOneTimeStrongPassword: req.session.user.role === "student" && !(passwordOverride && passwordOverride.password_hash),
+      securityQuestions:
+        req.session.user.role === "student" && !(passwordOverride && passwordOverride.password_hash)
+          ? getSecurityQuestionPayload()
+          : [],
+      securityAnswerMinLength: SECURITY_ANSWER_MIN_LENGTH,
       department,
       departmentLabel: formatDepartmentLabel(department),
       departmentsCovered:
@@ -6012,7 +6212,10 @@ app.post("/api/profile/email", requireAuth, async (req, res) => {
 });
 
 app.post("/api/profile/password", requireAuth, async (req, res) => {
-  if (req.session.user.role !== "student" && req.session.user.role !== "teacher") {
+  const actorRole = String(req.session?.user?.role || "")
+    .trim()
+    .toLowerCase();
+  if (actorRole !== "student" && actorRole !== "teacher") {
     return res.status(403).json({ error: "Only students and lecturers can change passwords here." });
   }
 
@@ -6044,6 +6247,17 @@ app.post("/api/profile/password", requireAuth, async (req, res) => {
     }
 
     const passwordOverride = await getPasswordOverride(req.session.user.username);
+    const isStudentOneTimeSetup = actorRole === "student";
+    if (isStudentOneTimeSetup && passwordOverride && passwordOverride.password_hash) {
+      return res.status(403).json({
+        error: "You can only create a stronger password once. Use Forgot Password on the login page to reset it.",
+      });
+    }
+    const parsedSecurityAnswers = isStudentOneTimeSetup ? parseRequiredSecurityAnswers(req.body?.securityAnswers) : { answers: [] };
+    if (isStudentOneTimeSetup && parsedSecurityAnswers.error) {
+      return res.status(400).json({ error: parsedSecurityAnswers.error });
+    }
+
     let isCurrentPasswordValid = false;
     if (passwordOverride && passwordOverride.password_hash) {
       isCurrentPasswordValid = await bcrypt.compare(currentPassword, passwordOverride.password_hash);
@@ -6075,7 +6289,20 @@ app.post("/api/profile/password", requireAuth, async (req, res) => {
     }
 
     const passwordHash = await bcrypt.hash(newPassword, 12);
-    await upsertPasswordOverride(req.session.user.username, passwordHash);
+    if (isStudentOneTimeSetup) {
+      const hashedAnswers = await Promise.all(
+        parsedSecurityAnswers.answers.map(async (answer) => ({
+          questionKey: answer.questionKey,
+          answerHash: await bcrypt.hash(answer.normalizedAnswer, 12),
+        }))
+      );
+      await withSqlTransaction(async () => {
+        await upsertPasswordOverride(req.session.user.username, passwordHash);
+        await upsertUserSecurityAnswers(req.session.user.username, hashedAnswers);
+      });
+    } else {
+      await upsertPasswordOverride(req.session.user.username, passwordHash);
+    }
     return res.json({ ok: true });
   } catch (_err) {
     return res.status(500).json({ error: "Could not update password." });
