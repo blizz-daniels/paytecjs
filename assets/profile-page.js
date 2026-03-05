@@ -134,39 +134,6 @@ function renderChecklist(items, meRole) {
     .join("");
 }
 
-function renderSecurityQuestions(questions, minLength) {
-  const root = document.getElementById("securityQuestionsList");
-  if (!root) {
-    return;
-  }
-  const rows = Array.isArray(questions) ? questions : [];
-  if (!rows.length) {
-    root.innerHTML = "";
-    return;
-  }
-  root.innerHTML = rows
-    .map((question, index) => {
-      const key = String(question?.key || "")
-        .trim()
-        .toLowerCase();
-      const prompt = String(question?.prompt || "").trim();
-      const inputId = `profileSecurityAnswer_${escapeHtml(key)}`;
-      return `
-        <label for="${inputId}">${index + 1}. ${escapeHtml(prompt)}</label>
-        <input
-          id="${inputId}"
-          type="password"
-          minlength="${Number(minLength || 8)}"
-          maxlength="160"
-          autocomplete="off"
-          data-security-question-key="${escapeHtml(key)}"
-          data-security-question-prompt="${escapeHtml(prompt)}"
-        />
-      `;
-    })
-    .join("");
-}
-
 function configurePasswordForm(me) {
   const passwordForm = document.getElementById("profilePasswordForm");
   if (!passwordForm) {
@@ -177,66 +144,28 @@ function configurePasswordForm(me) {
     .toLowerCase();
   const isStudent = role === "student";
   const canSetOneTimeStrongPassword = !!me?.canSetOneTimeStrongPassword;
-  const requiresSecurityAnswers = isStudent && canSetOneTimeStrongPassword;
-  const securityAnswerMinLength = Number.parseInt(String(me?.securityAnswerMinLength || "8"), 10) || 8;
-  const securityQuestions = requiresSecurityAnswers ? me?.securityQuestions || [] : [];
-  const securityFieldset = document.getElementById("securityQuestionsFieldset");
   const submitButton = passwordForm.querySelector('button[type="submit"]');
   const currentPasswordLabel = passwordForm.querySelector('label[for="profileCurrentPassword"]');
-
-  passwordForm.dataset.requireSecurityAnswers = requiresSecurityAnswers ? "1" : "0";
-  passwordForm.dataset.securityAnswerMinLength = String(securityAnswerMinLength);
 
   if (isStudent && !canSetOneTimeStrongPassword) {
     passwordForm.hidden = true;
     setPasswordStatus(
-      "You already used your one-time stronger password setup. Use Forgot Password on the login page to reset it.",
+      "You already used your one-time stronger password setup. Use Forgot Password for email OTP reset.",
       false
     );
     return;
   }
 
   passwordForm.hidden = false;
-  if (requiresSecurityAnswers) {
-    if (currentPasswordLabel) {
-      currentPasswordLabel.textContent = "Current password (surname)";
-    }
-    renderSecurityQuestions(securityQuestions, securityAnswerMinLength);
-    if (securityFieldset) {
-      securityFieldset.hidden = false;
-    }
-    const answerInputs = passwordForm.querySelectorAll("input[data-security-question-key]");
-    answerInputs.forEach((input) => {
-      input.required = true;
-    });
-    if (submitButton instanceof HTMLButtonElement) {
-      submitButton.textContent = "Create stronger password";
-      submitButton.dataset.defaultLabel = "Create stronger password";
-    }
-    setPasswordStatus("Create your one-time stronger password and set all five security answers.", false);
-    return;
-  }
-
   if (currentPasswordLabel) {
-    currentPasswordLabel.textContent = "Current password";
-  }
-  if (securityFieldset) {
-    securityFieldset.hidden = true;
-  }
-  const answerInputs = passwordForm.querySelectorAll("input[data-security-question-key]");
-  answerInputs.forEach((input) => {
-    input.required = false;
-    input.value = "";
-  });
-  const securityRoot = document.getElementById("securityQuestionsList");
-  if (securityRoot) {
-    securityRoot.innerHTML = "";
+    currentPasswordLabel.textContent = isStudent ? "Current password (surname)" : "Current password";
   }
   if (submitButton instanceof HTMLButtonElement) {
-    submitButton.textContent = "Update password";
-    submitButton.dataset.defaultLabel = "Update password";
+    const label = isStudent ? "Create stronger password" : "Update password";
+    submitButton.textContent = label;
+    submitButton.dataset.defaultLabel = label;
   }
-  setPasswordStatus("Update your password.", false);
+  setPasswordStatus(isStudent ? "Create your stronger password once." : "Update your password.", false);
 }
 
 async function loadProfilePage() {
@@ -329,49 +258,26 @@ async function loadProfilePage() {
           setPasswordStatus("All password fields are required.", true);
           return;
         }
-        const requiresSecurityAnswers = passwordForm.dataset.requireSecurityAnswers === "1";
-        const minAnswerLength = Number.parseInt(String(passwordForm.dataset.securityAnswerMinLength || "8"), 10) || 8;
         const payload = {
           currentPassword,
           newPassword,
           confirmPassword,
         };
-        if (requiresSecurityAnswers) {
-          const securityAnswers = {};
-          const answerInputs = passwordForm.querySelectorAll("input[data-security-question-key]");
-          for (const input of answerInputs) {
-            const answer = String(input.value || "").trim();
-            const questionKey = String(input.dataset.securityQuestionKey || "").trim();
-            const prompt = String(input.dataset.securityQuestionPrompt || "Security question").trim();
-            if (!questionKey) {
-              continue;
-            }
-            if (answer.length < minAnswerLength) {
-              setPasswordStatus(`Answer for "${prompt}" must be at least ${minAnswerLength} characters.`, true);
-              return;
-            }
-            securityAnswers[questionKey] = answer;
-          }
-          payload.securityAnswers = securityAnswers;
-        }
         const submitButton = passwordForm.querySelector('button[type="submit"]');
         if (submitButton instanceof HTMLButtonElement) {
           submitButton.disabled = true;
           submitButton.textContent = "Saving...";
         }
-        setPasswordStatus(requiresSecurityAnswers ? "Saving stronger password..." : "Updating password...", false);
+        setPasswordStatus("Saving password...", false);
         try {
           await requestJson("/api/profile/password", {
             method: "POST",
             payload,
           });
           passwordForm.reset();
-          setPasswordStatus(
-            requiresSecurityAnswers ? "Stronger password and security answers saved." : "Password updated successfully.",
-            false
-          );
+          setPasswordStatus("Password saved successfully.", false);
           if (window.showToast) {
-            window.showToast(requiresSecurityAnswers ? "Stronger password created." : "Password updated.", { type: "success" });
+            window.showToast("Password saved.", { type: "success" });
           }
           await loadProfilePage();
         } catch (err) {

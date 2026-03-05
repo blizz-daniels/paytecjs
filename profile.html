@@ -72,7 +72,7 @@
       <section class="card">
         <h2>Security</h2>
         <p class="auth-subtitle">
-          Students can create one stronger password once. After that, use Forgot Password on the login page for resets.
+          Students can create one stronger password once. After that, reset it from login using email OTP verification.
         </p>
         <p id="passwordStatus" class="auth-subtitle"></p>
         <form id="profilePasswordForm" class="auth-form">
@@ -84,12 +84,6 @@
 
           <label for="profileConfirmPassword">Confirm new password</label>
           <input id="profileConfirmPassword" name="confirmPassword" type="password" minlength="10" maxlength="72" required />
-
-          <fieldset id="securityQuestionsFieldset" hidden>
-            <legend>Security questions (required for students)</legend>
-            <p class="auth-subtitle">Provide private answers with at least 8 characters each.</p>
-            <div id="securityQuestionsList" class="stack"></div>
-          </fieldset>
 
           <button type="submit" class="btn">Update password</button>
         </form>

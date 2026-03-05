@@ -17,23 +17,12 @@ process.env.PAYSTACK_SECRET_KEY = "sk_test_paystack_secret";
 process.env.PAYSTACK_PUBLIC_KEY = "pk_test_paystack_public";
 process.env.PAYSTACK_WEBHOOK_SECRET = "sk_test_paystack_secret";
 process.env.PAYSTACK_CALLBACK_URL = "http://localhost:3000/api/payments/paystack/callback";
+process.env.PASSWORD_RESET_OTP_TTL_MINUTES = "10";
+process.env.PASSWORD_RESET_OTP_LENGTH = "6";
+process.env.PASSWORD_RESET_OTP_MAX_ATTEMPTS = "5";
+process.env.PASSWORD_RESET_OTP_RESEND_COOLDOWN_SECONDS = "0";
 
-const { app, initDatabase, run, get, all, db } = require("../server");
-
-const baseSecurityAnswers = {
-  home_nickname: "quiet lion 77",
-  private_childhood_friend: "Bamidele Akinwale",
-  first_phone_details: "Nokia 3310 blue",
-  hidden_family_place: "Old market riverside",
-  personal_life_motto: "Build before bragging",
-};
-
-function normalizeSecurityAnswer(value) {
-  return String(value || "")
-    .trim()
-    .replace(/\s+/g, " ")
-    .toLowerCase();
-}
+const { app, initDatabase, run, db } = require("../server");
 
 async function getCsrfToken(agent) {
   const response = await agent.get("/api/csrf-token");
@@ -56,7 +45,7 @@ async function login(agent, username, password) {
     .send({ username, password });
 }
 
-async function seedRoster() {
+async function seedRosterAndProfile() {
   const studentHash = await bcrypt.hash("doe", 12);
   const teacherHash = await bcrypt.hash("teach", 12);
   await run(
@@ -68,6 +57,16 @@ async function seedRoster() {
     `,
     [studentHash, teacherHash]
   );
+  await run(
+    `
+      INSERT INTO user_profiles (username, display_name, email, updated_at)
+      VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(username) DO UPDATE SET
+        email = excluded.email,
+        updated_at = CURRENT_TIMESTAMP
+    `,
+    ["std_001", "Student One", "std_001@example.com"]
+  );
 }
 
 beforeAll(async () => {
@@ -77,11 +76,12 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
-  await run("DELETE FROM user_security_answers");
+  await run("DELETE FROM password_reset_otps");
   await run("DELETE FROM user_password_overrides");
+  await run("DELETE FROM user_profiles");
   await run("DELETE FROM auth_roster");
   await run("DELETE FROM users WHERE role != 'admin'");
-  await seedRoster();
+  await seedRosterAndProfile();
 });
 
 afterAll(async () => {
@@ -89,7 +89,7 @@ afterAll(async () => {
   fs.rmSync(testDataDir, { recursive: true, force: true });
 });
 
-test("student stronger password setup stores hashed security answers and blocks second setup", async () => {
+test("student can create stronger password once and second profile change is blocked", async () => {
   const student = request.agent(app);
   const loginResponse = await login(student, "std_001", "doe");
   expect(loginResponse.status).toBe(302);
@@ -99,30 +99,9 @@ test("student stronger password setup stores hashed security answers and blocks 
     currentPassword: "doe",
     newPassword: "MyStr0ng!Pass2026",
     confirmPassword: "MyStr0ng!Pass2026",
-    securityAnswers: baseSecurityAnswers,
   });
   expect(firstSetup.status).toBe(200);
   expect(firstSetup.body.ok).toBe(true);
-
-  const override = await get("SELECT password_hash FROM user_password_overrides WHERE username = ?", ["std_001"]);
-  expect(override).toBeTruthy();
-  expect(typeof override.password_hash).toBe("string");
-  expect(override.password_hash).not.toContain("MyStr0ng!Pass2026");
-
-  const storedAnswers = await all(
-    "SELECT question_key, answer_hash FROM user_security_answers WHERE username = ? ORDER BY question_key ASC",
-    ["std_001"]
-  );
-  expect(storedAnswers.length).toBe(5);
-  for (const row of storedAnswers) {
-    expect(String(row.answer_hash || "")).not.toBe("");
-    expect(String(row.answer_hash || "")).not.toContain(" ");
-    expect(String(row.answer_hash || "")).not.toContain("quiet lion 77");
-  }
-  const nicknameRow = storedAnswers.find((row) => row.question_key === "home_nickname");
-  expect(nicknameRow).toBeTruthy();
-  const nicknameMatch = await bcrypt.compare(normalizeSecurityAnswer(baseSecurityAnswers.home_nickname), nicknameRow.answer_hash);
-  expect(nicknameMatch).toBe(true);
 
   const meResponse = await student.get("/api/me");
   expect(meResponse.status).toBe(200);
@@ -133,13 +112,12 @@ test("student stronger password setup stores hashed security answers and blocks 
     currentPassword: "MyStr0ng!Pass2026",
     newPassword: "An0ther!Pass2026",
     confirmPassword: "An0ther!Pass2026",
-    securityAnswers: baseSecurityAnswers,
   });
   expect(secondSetup.status).toBe(403);
   expect(String(secondSetup.body.error || "")).toMatch(/once/i);
 });
 
-test("forgot-password reset requires correct security answers and updates custom password", async () => {
+test("forgot-password reset uses email OTP verification", async () => {
   const student = request.agent(app);
   const loginResponse = await login(student, "std_001", "doe");
   expect(loginResponse.status).toBe(302);
@@ -148,30 +126,34 @@ test("forgot-password reset requires correct security answers and updates custom
     currentPassword: "doe",
     newPassword: "MyStr0ng!Pass2026",
     confirmPassword: "MyStr0ng!Pass2026",
-    securityAnswers: baseSecurityAnswers,
   });
   expect(setup.status).toBe(200);
 
   const guest = request.agent(app);
-  const wrongReset = await postJson(guest, "/api/auth/password-recovery/reset", {
+  const sendOtp = await postJson(guest, "/api/auth/password-recovery/send-otp", {
     username: "std_001",
-    newPassword: "Reset!Pass2026A",
-    confirmPassword: "Reset!Pass2026A",
-    securityAnswers: {
-      ...baseSecurityAnswers,
-      personal_life_motto: "wrong answer value",
-    },
   });
-  expect(wrongReset.status).toBe(403);
+  expect(sendOtp.status).toBe(200);
+  expect(sendOtp.body.ok).toBe(true);
+  expect(String(sendOtp.body.otpCode || "").length).toBe(6);
+  const wrongOtp = sendOtp.body.otpCode === "000000" ? "111111" : "000000";
 
-  const validReset = await postJson(guest, "/api/auth/password-recovery/reset", {
+  const wrongOtpReset = await postJson(guest, "/api/auth/password-recovery/reset", {
     username: "std_001",
+    otpCode: wrongOtp,
     newPassword: "Reset!Pass2026A",
     confirmPassword: "Reset!Pass2026A",
-    securityAnswers: baseSecurityAnswers,
   });
-  expect(validReset.status).toBe(200);
-  expect(validReset.body.ok).toBe(true);
+  expect(wrongOtpReset.status).toBe(403);
+
+  const validOtpReset = await postJson(guest, "/api/auth/password-recovery/reset", {
+    username: "std_001",
+    otpCode: sendOtp.body.otpCode,
+    newPassword: "Reset!Pass2026A",
+    confirmPassword: "Reset!Pass2026A",
+  });
+  expect(validOtpReset.status).toBe(200);
+  expect(validOtpReset.body.ok).toBe(true);
 
   const oldLogin = await login(request.agent(app), "std_001", "MyStr0ng!Pass2026");
   expect(oldLogin.status).toBe(302);

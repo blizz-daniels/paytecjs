@@ -4,6 +4,7 @@ const crypto = require("crypto");
 const { execFile } = require("child_process");
 const { promisify } = require("util");
 const bcrypt = require("bcryptjs");
+const nodemailer = require("nodemailer");
 const express = require("express");
 const multer = require("multer");
 const session = require("express-session");
@@ -83,36 +84,38 @@ const CUSTOM_PASSWORD_MIN_LENGTH = (() => {
   return Number.isFinite(value) && value >= 8 ? value : 10;
 })();
 const CUSTOM_PASSWORD_MAX_LENGTH = 72;
-const SECURITY_ANSWER_MIN_LENGTH = 8;
-const SECURITY_ANSWER_MAX_LENGTH = 160;
-const REQUIRED_SECURITY_QUESTIONS = Object.freeze([
-  {
-    key: "home_nickname",
-    prompt: "What nickname was used for you only at home?",
-  },
-  {
-    key: "private_childhood_friend",
-    prompt: "What is the full name of a close childhood friend that you never post online?",
-  },
-  {
-    key: "first_phone_details",
-    prompt: "What was your first phone model and its color?",
-  },
-  {
-    key: "hidden_family_place",
-    prompt: "What place did your family visit often but never shared publicly?",
-  },
-  {
-    key: "personal_life_motto",
-    prompt: "What private life motto do you keep for yourself?",
-  },
-]);
-const REQUIRED_SECURITY_QUESTION_KEYS = new Set(REQUIRED_SECURITY_QUESTIONS.map((item) => item.key));
+const PASSWORD_RESET_OTP_LENGTH = (() => {
+  const value = Number.parseInt(String(process.env.PASSWORD_RESET_OTP_LENGTH || "6"), 10);
+  return Number.isFinite(value) && value >= 4 && value <= 8 ? value : 6;
+})();
+const PASSWORD_RESET_OTP_TTL_MINUTES = (() => {
+  const value = Number.parseInt(String(process.env.PASSWORD_RESET_OTP_TTL_MINUTES || "10"), 10);
+  return Number.isFinite(value) && value >= 2 && value <= 60 ? value : 10;
+})();
+const PASSWORD_RESET_OTP_MAX_ATTEMPTS = (() => {
+  const value = Number.parseInt(String(process.env.PASSWORD_RESET_OTP_MAX_ATTEMPTS || "5"), 10);
+  return Number.isFinite(value) && value >= 1 && value <= 10 ? value : 5;
+})();
+const PASSWORD_RESET_OTP_RESEND_COOLDOWN_SECONDS = (() => {
+  const value = Number.parseInt(String(process.env.PASSWORD_RESET_OTP_RESEND_COOLDOWN_SECONDS || "60"), 10);
+  return Number.isFinite(value) && value >= 0 && value <= 600 ? value : 60;
+})();
+const SMTP_URL = String(process.env.SMTP_URL || "").trim();
+const SMTP_HOST = String(process.env.SMTP_HOST || "").trim();
+const SMTP_PORT = Number.parseInt(String(process.env.SMTP_PORT || "587"), 10);
+const SMTP_SECURE = String(process.env.SMTP_SECURE || "").trim().toLowerCase() === "true";
+const SMTP_USER = String(process.env.SMTP_USER || "").trim();
+const SMTP_PASS = String(process.env.SMTP_PASS || "").trim();
+const SMTP_FROM = String(process.env.SMTP_FROM || "").trim();
+const PASSWORD_RESET_EMAIL_FROM = String(process.env.PASSWORD_RESET_EMAIL_FROM || SMTP_FROM || "").trim();
+const isTestEnvironment = process.env.NODE_ENV === "test";
 const loginAttempts = new Map();
 let departmentGroupsCache = {
   mtimeMs: -1,
   groups: new Map(),
 };
+let smtpTransport = null;
+let smtpTransportInitialized = false;
 let contentStreamClientSequence = 0;
 const contentStreamClients = new Map();
 const CONTENT_STREAM_KEEPALIVE_MS = 25 * 1000;
@@ -626,49 +629,102 @@ function validateCustomPasswordStrength(password, username) {
   return "";
 }
 
-function normalizeSecurityAnswer(value) {
+function normalizeOtpCode(value) {
   return String(value || "")
-    .trim()
-    .replace(/\s+/g, " ")
-    .toLowerCase();
+    .replace(/\D/g, "")
+    .trim();
 }
 
-function getSecurityQuestionPayload() {
-  return REQUIRED_SECURITY_QUESTIONS.map((item) => ({
-    key: item.key,
-    prompt: item.prompt,
-    minAnswerLength: SECURITY_ANSWER_MIN_LENGTH,
-  }));
+function generateNumericOtp(length = PASSWORD_RESET_OTP_LENGTH) {
+  const size = Number.isFinite(length) ? Math.max(4, Math.min(8, length)) : PASSWORD_RESET_OTP_LENGTH;
+  let value = "";
+  while (value.length < size) {
+    value += crypto.randomInt(0, 10).toString();
+  }
+  return value;
 }
 
-function parseRequiredSecurityAnswers(rawAnswers) {
-  if (!rawAnswers || typeof rawAnswers !== "object" || Array.isArray(rawAnswers)) {
-    return { error: "All security question answers are required." };
+function parseTimestampMs(rawValue) {
+  const raw = String(rawValue || "").trim();
+  if (!raw) {
+    return 0;
   }
-  const normalizedAnswers = [];
-  for (const question of REQUIRED_SECURITY_QUESTIONS) {
-    const normalizedAnswer = normalizeSecurityAnswer(rawAnswers[question.key]);
-    if (!normalizedAnswer) {
-      return { error: `Answer required: ${question.prompt}` };
-    }
-    if (normalizedAnswer.length < SECURITY_ANSWER_MIN_LENGTH) {
-      return {
-        error: `Answer for "${question.prompt}" must be at least ${SECURITY_ANSWER_MIN_LENGTH} characters.`,
-      };
-    }
-    if (normalizedAnswer.length > SECURITY_ANSWER_MAX_LENGTH) {
-      return {
-        error: `Answer for "${question.prompt}" must be at most ${SECURITY_ANSWER_MAX_LENGTH} characters.`,
-      };
-    }
-    normalizedAnswers.push({
-      questionKey: question.key,
-      normalizedAnswer,
-    });
+  const normalized = raw.includes("T") ? raw : raw.replace(" ", "T");
+  const hasTimezone = /Z$|[+-]\d{2}:\d{2}$/.test(normalized);
+  const candidate = hasTimezone ? normalized : `${normalized}Z`;
+  const parsed = Date.parse(candidate);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function isPasswordResetOtpExpired(row, nowMs = Date.now()) {
+  const expiresAtMs = parseTimestampMs(row?.expires_at);
+  if (!expiresAtMs) {
+    return true;
   }
-  return {
-    answers: normalizedAnswers,
-  };
+  return nowMs >= expiresAtMs;
+}
+
+function hasPasswordResetOtpResendCooldown(row, nowMs = Date.now()) {
+  const createdAtMs = parseTimestampMs(row?.created_at);
+  if (!createdAtMs) {
+    return false;
+  }
+  return nowMs - createdAtMs < PASSWORD_RESET_OTP_RESEND_COOLDOWN_SECONDS * 1000;
+}
+
+function getSmtpTransport() {
+  if (smtpTransportInitialized) {
+    return smtpTransport;
+  }
+  smtpTransportInitialized = true;
+
+  if (SMTP_URL) {
+    smtpTransport = nodemailer.createTransport(SMTP_URL);
+    return smtpTransport;
+  }
+  if (!SMTP_HOST) {
+    smtpTransport = null;
+    return smtpTransport;
+  }
+  smtpTransport = nodemailer.createTransport({
+    host: SMTP_HOST,
+    port: Number.isFinite(SMTP_PORT) && SMTP_PORT > 0 ? SMTP_PORT : 587,
+    secure: SMTP_SECURE,
+    auth: SMTP_USER ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
+  });
+  return smtpTransport;
+}
+
+async function sendPasswordResetOtpEmail({ username, toEmail, otpCode, expiresInMinutes }) {
+  if (!toEmail || !isValidProfileEmail(toEmail)) {
+    throw new Error("Cannot deliver OTP because the account email is invalid.");
+  }
+  const transport = getSmtpTransport();
+  if (!transport) {
+    if (isTestEnvironment) {
+      return;
+    }
+    throw new Error("Email delivery is not configured. Set SMTP_URL or SMTP_HOST.");
+  }
+  const mailFrom = PASSWORD_RESET_EMAIL_FROM || SMTP_FROM;
+  if (!mailFrom) {
+    throw new Error("Email delivery is not configured. Set PASSWORD_RESET_EMAIL_FROM or SMTP_FROM.");
+  }
+  const subject = "Your Password Reset OTP";
+  const text = [
+    `Hello ${username},`,
+    "",
+    `Your one-time password (OTP) is: ${otpCode}`,
+    `It expires in ${expiresInMinutes} minute(s).`,
+    "",
+    "If you did not request this reset, ignore this message.",
+  ].join("\n");
+  await transport.sendMail({
+    from: mailFrom,
+    to: toEmail,
+    subject,
+    text,
+  });
 }
 
 function getClientIp(req) {
@@ -1316,39 +1372,81 @@ async function upsertPasswordOverride(username, passwordHash) {
   );
 }
 
-async function listUserSecurityAnswers(username) {
-  return all(
+async function getLatestPasswordResetOtp(username) {
+  return get(
     `
-      SELECT question_key, answer_hash, updated_at
-      FROM user_security_answers
+      SELECT
+        id,
+        username,
+        email,
+        otp_hash,
+        expires_at,
+        attempts_used,
+        max_attempts,
+        consumed_at,
+        created_at
+      FROM password_reset_otps
       WHERE username = ?
-      ORDER BY question_key ASC
+      ORDER BY id DESC
+      LIMIT 1
     `,
     [normalizeIdentifier(username || "")]
   );
 }
 
-function hasAllRequiredSecurityAnswers(rows) {
-  const questions = new Set(
-    (Array.isArray(rows) ? rows : [])
-      .map((row) => String(row?.question_key || "").trim())
-      .filter((questionKey) => REQUIRED_SECURITY_QUESTION_KEYS.has(questionKey))
+async function invalidateActivePasswordResetOtps(username) {
+  const normalizedUsername = normalizeIdentifier(username || "");
+  await run(
+    `
+      UPDATE password_reset_otps
+      SET consumed_at = COALESCE(consumed_at, CURRENT_TIMESTAMP)
+      WHERE username = ?
+        AND consumed_at IS NULL
+    `,
+    [normalizedUsername]
   );
-  return questions.size === REQUIRED_SECURITY_QUESTION_KEYS.size;
 }
 
-async function upsertUserSecurityAnswers(username, hashedAnswers) {
-  const normalizedUsername = normalizeIdentifier(username || "");
-  await run("DELETE FROM user_security_answers WHERE username = ?", [normalizedUsername]);
-  for (const answer of hashedAnswers) {
-    await run(
-      `
-        INSERT INTO user_security_answers (username, question_key, answer_hash, updated_at)
-        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-      `,
-      [normalizedUsername, answer.questionKey, answer.answerHash]
-    );
-  }
+async function createPasswordResetOtp({ username, email, otpHash, expiresAt, maxAttempts = PASSWORD_RESET_OTP_MAX_ATTEMPTS }) {
+  const result = await run(
+    `
+      INSERT INTO password_reset_otps (
+        username,
+        email,
+        otp_hash,
+        expires_at,
+        attempts_used,
+        max_attempts,
+        consumed_at,
+        created_at
+      )
+      VALUES (?, ?, ?, ?, 0, ?, NULL, CURRENT_TIMESTAMP)
+    `,
+    [normalizeIdentifier(username || ""), normalizeProfileEmail(email || ""), String(otpHash || ""), String(expiresAt || ""), maxAttempts]
+  );
+  return Number(result?.lastID || 0);
+}
+
+async function markPasswordResetOtpConsumed(otpId) {
+  await run(
+    `
+      UPDATE password_reset_otps
+      SET consumed_at = COALESCE(consumed_at, CURRENT_TIMESTAMP)
+      WHERE id = ?
+    `,
+    [otpId]
+  );
+}
+
+async function incrementPasswordResetOtpAttempt(otpId) {
+  await run(
+    `
+      UPDATE password_reset_otps
+      SET attempts_used = attempts_used + 1
+      WHERE id = ?
+    `,
+    [otpId]
+  );
 }
 
 async function getRosterUserDepartment(username, role) {
@@ -1467,14 +1565,19 @@ async function initDatabase() {
   `);
 
   await run(`
-    CREATE TABLE IF NOT EXISTS user_security_answers (
+    CREATE TABLE IF NOT EXISTS password_reset_otps (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
       username TEXT NOT NULL,
-      question_key TEXT NOT NULL,
-      answer_hash TEXT NOT NULL,
-      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      PRIMARY KEY (username, question_key)
+      email TEXT NOT NULL,
+      otp_hash TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      attempts_used INTEGER NOT NULL DEFAULT 0,
+      max_attempts INTEGER NOT NULL DEFAULT 5,
+      consumed_at TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   `);
+  await runMigrationSql("DROP TABLE IF EXISTS user_security_answers");
 
   await run(`
     CREATE TABLE IF NOT EXISTS login_events (
@@ -1868,6 +1971,7 @@ async function initDatabase() {
   await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_messages_thread_created ON messages(thread_id, created_at)");
   await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_message_threads_updated_at ON message_threads(updated_at)");
   await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_auth_roster_role_department ON auth_roster(role, department)");
+  await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_password_reset_otps_username_created ON password_reset_otps(username, created_at)");
 
   await run(`
     CREATE TABLE IF NOT EXISTS user_profiles (
@@ -5910,13 +6014,6 @@ app.get("/teacher.html", (_req, res) => res.redirect("/lecturer"));
 app.get("/lecturer.html", (_req, res) => res.redirect("/lecturer"));
 app.get("/analytics.html", (_req, res) => res.redirect("/analytics"));
 app.get("/messages.html", (_req, res) => res.redirect("/messages"));
-app.get("/api/auth/password-recovery/questions", (_req, res) => {
-  return res.json({
-    questions: getSecurityQuestionPayload(),
-    securityAnswerMinLength: SECURITY_ANSWER_MIN_LENGTH,
-    requiredCount: REQUIRED_SECURITY_QUESTIONS.length,
-  });
-});
 
 app.post("/login", async (req, res) => {
   const rawIdentifier = String(req.body.username || "");
@@ -6006,12 +6103,99 @@ app.post("/login", async (req, res) => {
   }
 });
 
+app.post("/api/auth/password-recovery/send-otp", async (req, res) => {
+  const identifier = normalizeIdentifier(req.body?.username || "");
+  if (!isValidIdentifier(identifier)) {
+    return res.status(400).json({ error: "Enter a valid username." });
+  }
+
+  try {
+    const [rosterUser, passwordOverride, profile, latestOtp] = await Promise.all([
+      get("SELECT auth_id, role FROM auth_roster WHERE auth_id = ? LIMIT 1", [identifier]),
+      getPasswordOverride(identifier),
+      getUserProfile(identifier),
+      getLatestPasswordResetOtp(identifier),
+    ]);
+
+    if (!rosterUser || String(rosterUser.role || "").trim().toLowerCase() !== "student") {
+      return res.status(400).json({ error: "Password reset is not available for this account." });
+    }
+    if (!passwordOverride || !passwordOverride.password_hash) {
+      return res.status(400).json({ error: "Password reset is not available for this account." });
+    }
+
+    const email = profile && isValidProfileEmail(profile.email) ? normalizeProfileEmail(profile.email) : "";
+    if (!email) {
+      return res.status(400).json({ error: "No valid email is linked to this account." });
+    }
+
+    if (
+      latestOtp &&
+      !latestOtp.consumed_at &&
+      !isPasswordResetOtpExpired(latestOtp) &&
+      hasPasswordResetOtpResendCooldown(latestOtp)
+    ) {
+      return res.status(429).json({
+        error: `Please wait ${PASSWORD_RESET_OTP_RESEND_COOLDOWN_SECONDS} seconds before requesting another OTP.`,
+      });
+    }
+
+    const otpCode = generateNumericOtp(PASSWORD_RESET_OTP_LENGTH);
+    const otpHash = await bcrypt.hash(normalizeOtpCode(otpCode), 12);
+    const expiresAt = new Date(Date.now() + PASSWORD_RESET_OTP_TTL_MINUTES * 60 * 1000).toISOString();
+
+    let otpId = 0;
+    await withSqlTransaction(async () => {
+      await invalidateActivePasswordResetOtps(identifier);
+      otpId = await createPasswordResetOtp({
+        username: identifier,
+        email,
+        otpHash,
+        expiresAt,
+        maxAttempts: PASSWORD_RESET_OTP_MAX_ATTEMPTS,
+      });
+    });
+
+    try {
+      await sendPasswordResetOtpEmail({
+        username: identifier,
+        toEmail: email,
+        otpCode,
+        expiresInMinutes: PASSWORD_RESET_OTP_TTL_MINUTES,
+      });
+    } catch (sendErr) {
+      await markPasswordResetOtpConsumed(otpId);
+      const sendMessage = String(sendErr?.message || "");
+      if (sendMessage) {
+        return res.status(503).json({ error: sendMessage });
+      }
+      return res.status(503).json({ error: "Could not deliver OTP email." });
+    }
+
+    const payload = {
+      ok: true,
+      expiresInMinutes: PASSWORD_RESET_OTP_TTL_MINUTES,
+      sentToMaskedEmail: email.replace(/^(.).+(@.+)$/, "$1***$2"),
+    };
+    if (isTestEnvironment) {
+      payload.otpCode = otpCode;
+    }
+    return res.json(payload);
+  } catch (_err) {
+    return res.status(500).json({ error: "Could not send OTP." });
+  }
+});
+
 app.post("/api/auth/password-recovery/reset", async (req, res) => {
   const identifier = normalizeIdentifier(req.body?.username || "");
+  const otpCode = normalizeOtpCode(req.body?.otpCode || "");
   const newPassword = String(req.body?.newPassword || "");
   const confirmPassword = String(req.body?.confirmPassword || "");
   if (!isValidIdentifier(identifier)) {
     return res.status(400).json({ error: "Enter a valid username." });
+  }
+  if (!otpCode || otpCode.length !== PASSWORD_RESET_OTP_LENGTH) {
+    return res.status(400).json({ error: `Enter the ${PASSWORD_RESET_OTP_LENGTH}-digit OTP sent to your email.` });
   }
   if (!newPassword) {
     return res.status(400).json({ error: "New password is required." });
@@ -6023,38 +6207,43 @@ app.post("/api/auth/password-recovery/reset", async (req, res) => {
   if (passwordStrengthError) {
     return res.status(400).json({ error: passwordStrengthError });
   }
-  const parsedSecurityAnswers = parseRequiredSecurityAnswers(req.body?.securityAnswers);
-  if (parsedSecurityAnswers.error) {
-    return res.status(400).json({ error: parsedSecurityAnswers.error });
-  }
 
   try {
-    const rosterUser = await get("SELECT auth_id, role FROM auth_roster WHERE auth_id = ? LIMIT 1", [identifier]);
+    const [rosterUser, passwordOverride, latestOtp] = await Promise.all([
+      get("SELECT auth_id, role FROM auth_roster WHERE auth_id = ? LIMIT 1", [identifier]),
+      getPasswordOverride(identifier),
+      getLatestPasswordResetOtp(identifier),
+    ]);
+
     if (!rosterUser || String(rosterUser.role || "").trim().toLowerCase() !== "student") {
       return res.status(400).json({ error: "Password reset is not available for this account." });
     }
-
-    const passwordOverride = await getPasswordOverride(identifier);
     if (!passwordOverride || !passwordOverride.password_hash) {
       return res.status(400).json({ error: "Password reset is not available for this account." });
     }
-
-    const storedAnswers = await listUserSecurityAnswers(identifier);
-    if (!hasAllRequiredSecurityAnswers(storedAnswers)) {
-      return res.status(400).json({ error: "Security questions are not configured for this account." });
+    if (!latestOtp || latestOtp.consumed_at) {
+      return res.status(400).json({ error: "Request a new OTP before resetting your password." });
     }
-    const answersByQuestion = new Map(
-      storedAnswers.map((row) => [String(row?.question_key || "").trim(), String(row?.answer_hash || "")])
-    );
-    for (const answer of parsedSecurityAnswers.answers) {
-      const storedHash = answersByQuestion.get(answer.questionKey);
-      if (!storedHash) {
-        return res.status(403).json({ error: "Security answer verification failed." });
+    if (isPasswordResetOtpExpired(latestOtp)) {
+      await markPasswordResetOtpConsumed(latestOtp.id);
+      return res.status(400).json({ error: "OTP has expired. Request a new one." });
+    }
+    const attemptsUsed = Number(latestOtp.attempts_used || 0);
+    const maxAttempts = Number(latestOtp.max_attempts || PASSWORD_RESET_OTP_MAX_ATTEMPTS);
+    if (attemptsUsed >= maxAttempts) {
+      await markPasswordResetOtpConsumed(latestOtp.id);
+      return res.status(403).json({ error: "OTP verification failed. Request a new OTP." });
+    }
+
+    const isOtpMatch = await bcrypt.compare(otpCode, latestOtp.otp_hash);
+    if (!isOtpMatch) {
+      await incrementPasswordResetOtpAttempt(latestOtp.id);
+      const refreshedOtp = await getLatestPasswordResetOtp(identifier);
+      const refreshedAttempts = Number(refreshedOtp?.attempts_used || attemptsUsed + 1);
+      if (refreshedOtp && refreshedAttempts >= Number(refreshedOtp.max_attempts || maxAttempts)) {
+        await markPasswordResetOtpConsumed(refreshedOtp.id);
       }
-      const isMatch = await bcrypt.compare(answer.normalizedAnswer, storedHash);
-      if (!isMatch) {
-        return res.status(403).json({ error: "Security answer verification failed." });
-      }
+      return res.status(403).json({ error: "OTP verification failed. Check the code and try again." });
     }
 
     const isSameAsCurrent = await bcrypt.compare(newPassword, passwordOverride.password_hash);
@@ -6063,7 +6252,10 @@ app.post("/api/auth/password-recovery/reset", async (req, res) => {
     }
 
     const passwordHash = await bcrypt.hash(newPassword, 12);
-    await upsertPasswordOverride(identifier, passwordHash);
+    await withSqlTransaction(async () => {
+      await upsertPasswordOverride(identifier, passwordHash);
+      await markPasswordResetOtpConsumed(latestOtp.id);
+    });
     return res.json({ ok: true });
   } catch (_err) {
     return res.status(500).json({ error: "Could not reset password." });
@@ -6109,11 +6301,6 @@ app.get("/api/me", requireAuth, async (req, res) => {
       emailVerified: !!email,
       customPasswordEnabled: !!(passwordOverride && passwordOverride.password_hash),
       canSetOneTimeStrongPassword: req.session.user.role === "student" && !(passwordOverride && passwordOverride.password_hash),
-      securityQuestions:
-        req.session.user.role === "student" && !(passwordOverride && passwordOverride.password_hash)
-          ? getSecurityQuestionPayload()
-          : [],
-      securityAnswerMinLength: SECURITY_ANSWER_MIN_LENGTH,
       department,
       departmentLabel: formatDepartmentLabel(department),
       departmentsCovered:
@@ -6253,10 +6440,6 @@ app.post("/api/profile/password", requireAuth, async (req, res) => {
         error: "You can only create a stronger password once. Use Forgot Password on the login page to reset it.",
       });
     }
-    const parsedSecurityAnswers = isStudentOneTimeSetup ? parseRequiredSecurityAnswers(req.body?.securityAnswers) : { answers: [] };
-    if (isStudentOneTimeSetup && parsedSecurityAnswers.error) {
-      return res.status(400).json({ error: parsedSecurityAnswers.error });
-    }
 
     let isCurrentPasswordValid = false;
     if (passwordOverride && passwordOverride.password_hash) {
@@ -6289,20 +6472,7 @@ app.post("/api/profile/password", requireAuth, async (req, res) => {
     }
 
     const passwordHash = await bcrypt.hash(newPassword, 12);
-    if (isStudentOneTimeSetup) {
-      const hashedAnswers = await Promise.all(
-        parsedSecurityAnswers.answers.map(async (answer) => ({
-          questionKey: answer.questionKey,
-          answerHash: await bcrypt.hash(answer.normalizedAnswer, 12),
-        }))
-      );
-      await withSqlTransaction(async () => {
-        await upsertPasswordOverride(req.session.user.username, passwordHash);
-        await upsertUserSecurityAnswers(req.session.user.username, hashedAnswers);
-      });
-    } else {
-      await upsertPasswordOverride(req.session.user.username, passwordHash);
-    }
+    await upsertPasswordOverride(req.session.user.username, passwordHash);
     return res.json({ ok: true });
   } catch (_err) {
     return res.status(500).json({ error: "Could not update password." });

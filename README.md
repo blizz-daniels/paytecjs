@@ -28,6 +28,13 @@ The payment system runs in strict Paystack mode:
 - Student feeds and payment views are filtered by department scope.
 - Admin import also supports department checklist CSV uploads (`department,task[,order]`), consumed on the profile checklist page.
 
+## Password Security and Recovery
+
+- Students can create a stronger custom password once from their profile page.
+- After that one-time setup, further student password changes are blocked in profile.
+- Forgotten stronger passwords are reset from `/forgot-password` using email OTP verification.
+- OTP delivery requires a valid student profile email and SMTP configuration.
+
 ## Core APIs
 
 ### Payment Items + Obligations
@@ -45,6 +52,8 @@ The payment system runs in strict Paystack mode:
 - `GET /api/payments/paystack/callback`
 - `GET /api/my/payment-receipts` (approved receipts only)
 - `GET /api/payment-receipts/:id/file?variant=approved`
+- `POST /api/auth/password-recovery/send-otp`
+- `POST /api/auth/password-recovery/reset`
 
 ### Paystack Ingestion + Verification
 

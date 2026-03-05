@@ -1,12 +1,3 @@
-function escapeHtml(value) {
-  return String(value || "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
-}
-
 function setStatus(message, isError = false) {
   const node = document.getElementById("resetStatus");
   if (!node) {
@@ -53,88 +44,52 @@ async function requestJson(url, { method = "GET", payload, timeoutMs = 15000 } =
   }
 }
 
-function renderSecurityQuestions(questions, minAnswerLength) {
-  const root = document.getElementById("resetSecurityQuestionsList");
-  if (!root) {
-    return;
-  }
-  const rows = Array.isArray(questions) ? questions : [];
-  if (!rows.length) {
-    root.innerHTML = '<p class="auth-subtitle">Security questions could not be loaded.</p>';
-    return;
-  }
-  const safeMinLength = Number.parseInt(String(minAnswerLength || "8"), 10) || 8;
-  root.dataset.minAnswerLength = String(safeMinLength);
-  root.innerHTML = rows
-    .map((question, index) => {
-      const key = String(question?.key || "")
-        .trim()
-        .toLowerCase();
-      const prompt = String(question?.prompt || "").trim();
-      const inputId = `resetSecurityAnswer_${escapeHtml(key)}`;
-      return `
-        <label for="${inputId}">${index + 1}. ${escapeHtml(prompt)}</label>
-        <input
-          id="${inputId}"
-          type="password"
-          minlength="${safeMinLength}"
-          maxlength="160"
-          autocomplete="off"
-          required
-          data-security-question-key="${escapeHtml(key)}"
-          data-security-question-prompt="${escapeHtml(prompt)}"
-        />
-      `;
-    })
-    .join("");
-}
-
-async function loadSecurityQuestions() {
-  const payload = await requestJson("/api/auth/password-recovery/questions");
-  renderSecurityQuestions(payload.questions || [], payload.securityAnswerMinLength || 8);
-}
-
-window.addEventListener("DOMContentLoaded", async () => {
+window.addEventListener("DOMContentLoaded", () => {
   const form = document.getElementById("passwordResetForm");
-  if (!form) {
+  const sendOtpButton = document.getElementById("sendOtpButton");
+  if (!form || !(sendOtpButton instanceof HTMLButtonElement)) {
     return;
   }
 
-  try {
-    await loadSecurityQuestions();
-  } catch (err) {
-    setStatus(err.message || "Could not load security questions.", true);
-  }
+  sendOtpButton.addEventListener("click", async () => {
+    const username = String(document.getElementById("resetUsername")?.value || "").trim();
+    if (!username) {
+      setStatus("Enter your username first.", true);
+      return;
+    }
+    sendOtpButton.disabled = true;
+    sendOtpButton.textContent = "Sending...";
+    setStatus("Sending OTP to your email...", false);
+    try {
+      const payload = await requestJson("/api/auth/password-recovery/send-otp", {
+        method: "POST",
+        payload: { username },
+      });
+      const masked = String(payload.sentToMaskedEmail || "").trim();
+      if (masked) {
+        setStatus(`OTP sent to ${masked}.`, false);
+      } else {
+        setStatus("OTP sent to your registered email.", false);
+      }
+    } catch (err) {
+      setStatus(err.message || "Could not send OTP.", true);
+    } finally {
+      sendOtpButton.disabled = false;
+      sendOtpButton.textContent = "Send OTP";
+    }
+  });
 
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     const username = String(document.getElementById("resetUsername")?.value || "").trim();
+    const otpCode = String(document.getElementById("resetOtpCode")?.value || "")
+      .replace(/\D/g, "")
+      .trim();
     const newPassword = String(document.getElementById("resetNewPassword")?.value || "");
     const confirmPassword = String(document.getElementById("resetConfirmPassword")?.value || "");
-    if (!username || !newPassword || !confirmPassword) {
+    if (!username || !otpCode || !newPassword || !confirmPassword) {
       setStatus("All fields are required.", true);
       return;
-    }
-    const questionsRoot = document.getElementById("resetSecurityQuestionsList");
-    const minAnswerLength = Number.parseInt(String(questionsRoot?.dataset.minAnswerLength || "8"), 10) || 8;
-    const securityAnswers = {};
-    const answerInputs = form.querySelectorAll("input[data-security-question-key]");
-    if (!answerInputs.length) {
-      setStatus("Security questions are not available. Refresh the page and try again.", true);
-      return;
-    }
-    for (const input of answerInputs) {
-      const answer = String(input.value || "").trim();
-      const key = String(input.dataset.securityQuestionKey || "").trim();
-      const prompt = String(input.dataset.securityQuestionPrompt || "Security question").trim();
-      if (!key) {
-        continue;
-      }
-      if (answer.length < minAnswerLength) {
-        setStatus(`Answer for "${prompt}" must be at least ${minAnswerLength} characters.`, true);
-        return;
-      }
-      securityAnswers[key] = answer;
     }
 
     const submitButton = form.querySelector('button[type="submit"]');
@@ -148,9 +103,9 @@ window.addEventListener("DOMContentLoaded", async () => {
         method: "POST",
         payload: {
           username,
+          otpCode,
           newPassword,
           confirmPassword,
-          securityAnswers,
         },
       });
       form.reset();
