@@ -123,8 +123,27 @@ const PASSWORD_RESET_EMAIL_API_TIMEOUT_MS = (() => {
   const value = Number.parseInt(String(process.env.PASSWORD_RESET_EMAIL_API_TIMEOUT_MS || "12000"), 10);
   return Number.isFinite(value) && value >= 3000 && value <= 60000 ? value : 12000;
 })();
+const PASSWORD_RESET_RATE_LIMIT_WINDOW_SECONDS = (() => {
+  const value = Number.parseInt(String(process.env.PASSWORD_RESET_RATE_LIMIT_WINDOW_SECONDS || "3600"), 10);
+  return Number.isFinite(value) && value >= 60 && value <= 86400 ? value : 3600;
+})();
+const PASSWORD_RESET_SEND_RATE_LIMIT_MAX_ATTEMPTS = (() => {
+  const value = Number.parseInt(String(process.env.PASSWORD_RESET_SEND_RATE_LIMIT_MAX_ATTEMPTS || "5"), 10);
+  return Number.isFinite(value) && value >= 1 && value <= 100 ? value : 5;
+})();
+const PASSWORD_RESET_RESET_RATE_LIMIT_MAX_ATTEMPTS = (() => {
+  const value = Number.parseInt(String(process.env.PASSWORD_RESET_RESET_RATE_LIMIT_MAX_ATTEMPTS || "10"), 10);
+  return Number.isFinite(value) && value >= 1 && value <= 200 ? value : 10;
+})();
+const PASSWORD_RESET_RATE_LIMIT_BLOCK_SECONDS = (() => {
+  const value = Number.parseInt(String(process.env.PASSWORD_RESET_RATE_LIMIT_BLOCK_SECONDS || "1800"), 10);
+  return Number.isFinite(value) && value >= 60 && value <= 86400 ? value : 1800;
+})();
 const isTestEnvironment = process.env.NODE_ENV === "test";
 const loginAttempts = new Map();
+const otpRateLimits = new Map();
+const PASSWORD_RESET_RATE_LIMIT_WINDOW_MS = PASSWORD_RESET_RATE_LIMIT_WINDOW_SECONDS * 1000;
+const PASSWORD_RESET_RATE_LIMIT_BLOCK_MS = PASSWORD_RESET_RATE_LIMIT_BLOCK_SECONDS * 1000;
 let departmentGroupsCache = {
   mtimeMs: -1,
   groups: new Map(),
@@ -891,6 +910,68 @@ function clearFailedLogins(req, identifier) {
   const wildcardKey = getLoginRateLimitKey(req, "*");
   loginAttempts.delete(exactKey);
   loginAttempts.delete(wildcardKey);
+}
+
+function getPasswordResetRateLimitKey(req, action, identifier) {
+  const actionKey = String(action || "").trim().toLowerCase() || "unknown";
+  return `${actionKey}::${getClientIp(req)}::${normalizeIdentifier(identifier || "*") || "*"}`;
+}
+
+function getPasswordResetRateLimitRecord(key, now = Date.now()) {
+  const existing = otpRateLimits.get(key);
+  if (!existing) {
+    return {
+      attempts: 0,
+      windowStartedAt: now,
+      blockedUntil: 0,
+    };
+  }
+  if (existing.windowStartedAt + PASSWORD_RESET_RATE_LIMIT_WINDOW_MS <= now) {
+    existing.attempts = 0;
+    existing.windowStartedAt = now;
+  }
+  return existing;
+}
+
+function getPasswordResetRateLimitMaxAttempts(action) {
+  const normalizedAction = String(action || "").trim().toLowerCase();
+  if (normalizedAction === "send") {
+    return PASSWORD_RESET_SEND_RATE_LIMIT_MAX_ATTEMPTS;
+  }
+  return PASSWORD_RESET_RESET_RATE_LIMIT_MAX_ATTEMPTS;
+}
+
+function takePasswordResetRateLimitAttempt(req, action, identifier) {
+  const now = Date.now();
+  const key = getPasswordResetRateLimitKey(req, action, identifier);
+  const record = getPasswordResetRateLimitRecord(key, now);
+
+  if (record.blockedUntil > now) {
+    otpRateLimits.set(key, record);
+    return {
+      limited: true,
+      retryAfterSeconds: Math.max(1, Math.ceil((record.blockedUntil - now) / 1000)),
+    };
+  }
+
+  record.attempts += 1;
+  const maxAttempts = getPasswordResetRateLimitMaxAttempts(action);
+  if (record.attempts > maxAttempts) {
+    record.blockedUntil = now + PASSWORD_RESET_RATE_LIMIT_BLOCK_MS;
+    record.attempts = 0;
+    record.windowStartedAt = now;
+    otpRateLimits.set(key, record);
+    return {
+      limited: true,
+      retryAfterSeconds: Math.max(1, Math.ceil(PASSWORD_RESET_RATE_LIMIT_BLOCK_MS / 1000)),
+    };
+  }
+
+  otpRateLimits.set(key, record);
+  return {
+    limited: false,
+    retryAfterSeconds: 0,
+  };
 }
 
 function ensureCsrfToken(req) {
@@ -3866,6 +3947,39 @@ async function logAuditEvent(req, action, contentType, contentId, targetOwner, s
   }
 }
 
+async function logPasswordResetAuditEvent(req, action, username, outcome, details = "") {
+  const normalizedAction = String(action || "").trim().toLowerCase();
+  const targetOwner = normalizeIdentifier(username || "") || null;
+  const ip = getClientIp(req);
+  const detailText = String(details || "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const summaryParts = [`outcome=${String(outcome || "").trim().toLowerCase() || "unknown"}`, `ip=${ip}`];
+  if (detailText) {
+    summaryParts.push(detailText);
+  }
+  const summary = summaryParts.join("; ").slice(0, 500);
+  try {
+    await run(
+      `
+        INSERT INTO audit_logs (
+          actor_username,
+          actor_role,
+          action,
+          content_type,
+          content_id,
+          target_owner,
+          summary
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `,
+      ["system", "system", normalizedAction || "password_reset_otp", "auth", null, targetOwner, summary]
+    );
+  } catch (err) {
+    console.error("Password reset audit logging failed:", err);
+  }
+}
+
 async function logReceiptEvent(receiptId, req, action, fromStatus, toStatus, notes) {
   if (!req || !req.session || !req.session.user) {
     return;
@@ -6219,8 +6333,18 @@ app.post("/login", async (req, res) => {
 
 app.post("/api/auth/password-recovery/send-otp", async (req, res) => {
   const identifier = normalizeIdentifier(req.body?.username || "");
+  const auditSend = async (outcome, details = "") =>
+    logPasswordResetAuditEvent(req, "password_reset_otp_send", identifier, outcome, details);
   if (!isValidIdentifier(identifier)) {
+    await auditSend("invalid_input", "reason=invalid_username");
     return res.status(400).json({ error: "Enter a valid username." });
+  }
+
+  const sendRateLimit = takePasswordResetRateLimitAttempt(req, "send", identifier);
+  if (sendRateLimit.limited) {
+    res.set("Retry-After", String(sendRateLimit.retryAfterSeconds));
+    await auditSend("rate_limited", `retry_after_seconds=${sendRateLimit.retryAfterSeconds}`);
+    return res.status(429).json({ error: "Too many OTP requests. Please try again later." });
   }
 
   try {
@@ -6232,14 +6356,17 @@ app.post("/api/auth/password-recovery/send-otp", async (req, res) => {
     ]);
 
     if (!rosterUser || String(rosterUser.role || "").trim().toLowerCase() !== "student") {
+      await auditSend("account_unavailable", "reason=not_student_or_missing_roster");
       return res.status(400).json({ error: "Password reset is not available for this account." });
     }
     if (!passwordOverride || !passwordOverride.password_hash) {
+      await auditSend("account_unavailable", "reason=no_custom_password");
       return res.status(400).json({ error: "Password reset is not available for this account." });
     }
 
     const email = profile && isValidProfileEmail(profile.email) ? normalizeProfileEmail(profile.email) : "";
     if (!email) {
+      await auditSend("email_missing", "reason=missing_or_invalid_profile_email");
       return res.status(400).json({ error: "No valid email is linked to this account." });
     }
 
@@ -6249,6 +6376,7 @@ app.post("/api/auth/password-recovery/send-otp", async (req, res) => {
       !isPasswordResetOtpExpired(latestOtp) &&
       hasPasswordResetOtpResendCooldown(latestOtp)
     ) {
+      await auditSend("cooldown_active", `cooldown_seconds=${PASSWORD_RESET_OTP_RESEND_COOLDOWN_SECONDS}`);
       return res.status(429).json({
         error: `Please wait ${PASSWORD_RESET_OTP_RESEND_COOLDOWN_SECONDS} seconds before requesting another OTP.`,
       });
@@ -6280,6 +6408,7 @@ app.post("/api/auth/password-recovery/send-otp", async (req, res) => {
     } catch (sendErr) {
       await markPasswordResetOtpConsumed(otpId);
       const sendMessage = String(sendErr?.message || "");
+      await auditSend("delivery_failed", sendMessage ? `reason=${sendMessage}` : "reason=unknown");
       if (sendMessage) {
         return res.status(503).json({ error: sendMessage });
       }
@@ -6294,8 +6423,11 @@ app.post("/api/auth/password-recovery/send-otp", async (req, res) => {
     if (isTestEnvironment) {
       payload.otpCode = otpCode;
     }
+    await auditSend("success", `sent_to=${maskEmailAddress(email)}; expires_in_minutes=${PASSWORD_RESET_OTP_TTL_MINUTES}`);
+
     return res.json(payload);
-  } catch (_err) {
+  } catch (err) {
+    await auditSend("server_error", `reason=${String(err?.message || "unknown")}`);
     return res.status(500).json({ error: "Could not send OTP." });
   }
 });
@@ -6305,21 +6437,35 @@ app.post("/api/auth/password-recovery/reset", async (req, res) => {
   const otpCode = normalizeOtpCode(req.body?.otpCode || "");
   const newPassword = String(req.body?.newPassword || "");
   const confirmPassword = String(req.body?.confirmPassword || "");
+  const auditReset = async (outcome, details = "") =>
+    logPasswordResetAuditEvent(req, "password_reset_otp_reset", identifier, outcome, details);
   if (!isValidIdentifier(identifier)) {
+    await auditReset("invalid_input", "reason=invalid_username");
     return res.status(400).json({ error: "Enter a valid username." });
   }
   if (!otpCode || otpCode.length !== PASSWORD_RESET_OTP_LENGTH) {
+    await auditReset("invalid_input", "reason=invalid_otp_format");
     return res.status(400).json({ error: `Enter the ${PASSWORD_RESET_OTP_LENGTH}-digit OTP sent to your email.` });
   }
   if (!newPassword) {
+    await auditReset("invalid_input", "reason=missing_new_password");
     return res.status(400).json({ error: "New password is required." });
   }
   if (newPassword !== confirmPassword) {
+    await auditReset("invalid_input", "reason=password_mismatch");
     return res.status(400).json({ error: "New password and confirmation do not match." });
   }
   const passwordStrengthError = validateCustomPasswordStrength(newPassword, identifier);
   if (passwordStrengthError) {
+    await auditReset("invalid_input", "reason=password_strength");
     return res.status(400).json({ error: passwordStrengthError });
+  }
+
+  const resetRateLimit = takePasswordResetRateLimitAttempt(req, "reset", identifier);
+  if (resetRateLimit.limited) {
+    res.set("Retry-After", String(resetRateLimit.retryAfterSeconds));
+    await auditReset("rate_limited", `retry_after_seconds=${resetRateLimit.retryAfterSeconds}`);
+    return res.status(429).json({ error: "Too many failed attempts. Please try again later." });
   }
 
   try {
@@ -6330,22 +6476,27 @@ app.post("/api/auth/password-recovery/reset", async (req, res) => {
     ]);
 
     if (!rosterUser || String(rosterUser.role || "").trim().toLowerCase() !== "student") {
+      await auditReset("account_unavailable", "reason=not_student_or_missing_roster");
       return res.status(400).json({ error: "Password reset is not available for this account." });
     }
     if (!passwordOverride || !passwordOverride.password_hash) {
+      await auditReset("account_unavailable", "reason=no_custom_password");
       return res.status(400).json({ error: "Password reset is not available for this account." });
     }
     if (!latestOtp || latestOtp.consumed_at) {
+      await auditReset("otp_missing", "reason=no_active_otp");
       return res.status(400).json({ error: "Request a new OTP before resetting your password." });
     }
     if (isPasswordResetOtpExpired(latestOtp)) {
       await markPasswordResetOtpConsumed(latestOtp.id);
+      await auditReset("otp_expired", "reason=expired");
       return res.status(400).json({ error: "OTP has expired. Request a new one." });
     }
     const attemptsUsed = Number(latestOtp.attempts_used || 0);
     const maxAttempts = Number(latestOtp.max_attempts || PASSWORD_RESET_OTP_MAX_ATTEMPTS);
     if (attemptsUsed >= maxAttempts) {
       await markPasswordResetOtpConsumed(latestOtp.id);
+      await auditReset("otp_locked", `attempts_used=${attemptsUsed}; max_attempts=${maxAttempts}`);
       return res.status(403).json({ error: "OTP verification failed. Request a new OTP." });
     }
 
@@ -6357,11 +6508,13 @@ app.post("/api/auth/password-recovery/reset", async (req, res) => {
       if (refreshedOtp && refreshedAttempts >= Number(refreshedOtp.max_attempts || maxAttempts)) {
         await markPasswordResetOtpConsumed(refreshedOtp.id);
       }
+      await auditReset("otp_mismatch", `attempts_used=${refreshedAttempts}; max_attempts=${maxAttempts}`);
       return res.status(403).json({ error: "OTP verification failed. Check the code and try again." });
     }
 
     const isSameAsCurrent = await bcrypt.compare(newPassword, passwordOverride.password_hash);
     if (isSameAsCurrent) {
+      await auditReset("invalid_input", "reason=password_reuse");
       return res.status(400).json({ error: "New password must be different from your current password." });
     }
 
@@ -6370,8 +6523,11 @@ app.post("/api/auth/password-recovery/reset", async (req, res) => {
       await upsertPasswordOverride(identifier, passwordHash);
       await markPasswordResetOtpConsumed(latestOtp.id);
     });
+    await auditReset("success", "password_reset_completed");
+
     return res.json({ ok: true });
-  } catch (_err) {
+  } catch (err) {
+    await auditReset("server_error", `reason=${String(err?.message || "unknown")}`);
     return res.status(500).json({ error: "Could not reset password." });
   }
 });
