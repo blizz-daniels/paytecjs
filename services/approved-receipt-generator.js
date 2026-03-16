@@ -1587,7 +1587,13 @@ async function renderHtmlToImagePdf({ html, outputPdfPath, row, placeholders }) 
     browser = await puppeteer.launch({
       headless: true,
       executablePath: process.env.RECEIPT_BROWSER_EXECUTABLE_PATH || undefined,
-      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--no-zygote",
+      ],
     });
     const page = await browser.newPage({
       viewport: {

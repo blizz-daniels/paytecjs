@@ -15,6 +15,10 @@ services:
         value: /tmp/paytec
       - key: RECEIPT_OUTPUT_DIR
         value: /tmp/paytec/approved-receipts
+      - key: RATE_LIMIT_PRUNE_INTERVAL_MS
+        value: 300000
+      - key: MEMORY_LOG_INTERVAL_MS
+        value: 300000
       - key: PUPPETEER_CACHE_DIR
         value: /opt/render/project/src/.cache/puppeteer
       - key: ADMIN_USERNAME
@@ -25,4 +29,3 @@ services:
         value: /opt/render/project/src/data/students.csv
       - key: LECTURER_ROSTER_PATH
         value: /opt/render/project/src/data/teachers.csv
-

@@ -139,11 +139,21 @@ const PASSWORD_RESET_RATE_LIMIT_BLOCK_SECONDS = (() => {
   const value = Number.parseInt(String(process.env.PASSWORD_RESET_RATE_LIMIT_BLOCK_SECONDS || "1800"), 10);
   return Number.isFinite(value) && value >= 60 && value <= 86400 ? value : 1800;
 })();
+const RATE_LIMIT_PRUNE_INTERVAL_MS = (() => {
+  const value = Number.parseInt(String(process.env.RATE_LIMIT_PRUNE_INTERVAL_MS || "300000"), 10);
+  return Number.isFinite(value) && value >= 60000 ? value : 300000;
+})();
+const MEMORY_LOG_INTERVAL_MS = (() => {
+  const value = Number.parseInt(String(process.env.MEMORY_LOG_INTERVAL_MS || "0"), 10);
+  return Number.isFinite(value) && value >= 60000 ? value : 0;
+})();
 const isTestEnvironment = process.env.NODE_ENV === "test";
 const loginAttempts = new Map();
 const otpRateLimits = new Map();
 const PASSWORD_RESET_RATE_LIMIT_WINDOW_MS = PASSWORD_RESET_RATE_LIMIT_WINDOW_SECONDS * 1000;
 const PASSWORD_RESET_RATE_LIMIT_BLOCK_MS = PASSWORD_RESET_RATE_LIMIT_BLOCK_SECONDS * 1000;
+const LOGIN_RATE_LIMIT_RECORD_TTL_MS = LOGIN_RATE_LIMIT_WINDOW_MS + LOGIN_RATE_LIMIT_BLOCK_MS;
+const PASSWORD_RESET_RATE_LIMIT_RECORD_TTL_MS = PASSWORD_RESET_RATE_LIMIT_WINDOW_MS + PASSWORD_RESET_RATE_LIMIT_BLOCK_MS;
 let departmentGroupsCache = {
   mtimeMs: -1,
   groups: new Map(),
@@ -152,6 +162,9 @@ let smtpTransport = null;
 let smtpTransportInitialized = false;
 let contentStreamClientSequence = 0;
 const contentStreamClients = new Map();
+const approvedReceiptDispatchInflight = new Map();
+let approvedReceiptDispatchQueue = Promise.resolve();
+let nextRateLimitPruneAt = 0;
 const CONTENT_STREAM_KEEPALIVE_MS = 25 * 1000;
 const execFileAsync = promisify(execFile);
 const OCR_PROVIDER = String(process.env.OCR_PROVIDER || "none").trim().toLowerCase();
@@ -251,6 +264,112 @@ const {
   sharedFilesUploadDir,
 });
 const db = new sqlite3.Database(dbPath);
+
+function toMemoryMegabytes(value) {
+  const bytes = Number(value || 0);
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return 0;
+  }
+  return Number((bytes / (1024 * 1024)).toFixed(1));
+}
+
+function getProcessMemorySnapshot() {
+  const usage = process.memoryUsage();
+  return {
+    rss_mb: toMemoryMegabytes(usage.rss),
+    heap_total_mb: toMemoryMegabytes(usage.heapTotal),
+    heap_used_mb: toMemoryMegabytes(usage.heapUsed),
+    external_mb: toMemoryMegabytes(usage.external),
+    array_buffers_mb: toMemoryMegabytes(usage.arrayBuffers),
+  };
+}
+
+function pruneRateLimitEntries(map, ttlMs, now = Date.now()) {
+  for (const [key, record] of map.entries()) {
+    const windowStartedAt = Number(record?.windowStartedAt || 0);
+    const blockedUntil = Number(record?.blockedUntil || 0);
+    const expiresAt = Math.max(windowStartedAt + ttlMs, blockedUntil);
+    if (expiresAt <= now) {
+      map.delete(key);
+    }
+  }
+}
+
+function maybePruneInMemoryRateLimits(now = Date.now()) {
+  if (nextRateLimitPruneAt > now) {
+    return;
+  }
+  pruneRateLimitEntries(loginAttempts, LOGIN_RATE_LIMIT_RECORD_TTL_MS, now);
+  pruneRateLimitEntries(otpRateLimits, PASSWORD_RESET_RATE_LIMIT_RECORD_TTL_MS, now);
+  nextRateLimitPruneAt = now + RATE_LIMIT_PRUNE_INTERVAL_MS;
+}
+
+function logProcessMemory(event, extra = {}) {
+  console.info({
+    component: "runtime",
+    event,
+    timestamp: new Date().toISOString(),
+    ...getProcessMemorySnapshot(),
+    login_rate_limit_entries: loginAttempts.size,
+    otp_rate_limit_entries: otpRateLimits.size,
+    content_stream_clients: contentStreamClients.size,
+    approved_receipt_dispatch_inflight: approvedReceiptDispatchInflight.size,
+    ...extra,
+  });
+}
+
+function queueApprovedReceiptDispatch(receiptId, taskFactory) {
+  const dispatchKey = String(receiptId || "").trim();
+  const existing = approvedReceiptDispatchInflight.get(dispatchKey);
+  if (existing) {
+    return existing;
+  }
+
+  const scheduled = approvedReceiptDispatchQueue
+    .catch(() => undefined)
+    .then(async () => {
+      logProcessMemory("approved_receipt_dispatch_start", {
+        payment_receipt_id: receiptId,
+      });
+      try {
+        return await taskFactory();
+      } finally {
+        logProcessMemory("approved_receipt_dispatch_end", {
+          payment_receipt_id: receiptId,
+        });
+      }
+    });
+
+  approvedReceiptDispatchQueue = scheduled.catch(() => undefined);
+
+  const tracked = scheduled.finally(() => {
+    if (approvedReceiptDispatchInflight.get(dispatchKey) === tracked) {
+      approvedReceiptDispatchInflight.delete(dispatchKey);
+    }
+  });
+
+  approvedReceiptDispatchInflight.set(dispatchKey, tracked);
+  return tracked;
+}
+
+if (RATE_LIMIT_PRUNE_INTERVAL_MS > 0) {
+  const rateLimitPruneTimer = setInterval(() => {
+    maybePruneInMemoryRateLimits(Date.now());
+  }, RATE_LIMIT_PRUNE_INTERVAL_MS);
+  if (typeof rateLimitPruneTimer.unref === "function") {
+    rateLimitPruneTimer.unref();
+  }
+}
+
+if (MEMORY_LOG_INTERVAL_MS > 0) {
+  const memoryLogTimer = setInterval(() => {
+    maybePruneInMemoryRateLimits(Date.now());
+    logProcessMemory("memory_interval");
+  }, MEMORY_LOG_INTERVAL_MS);
+  if (typeof memoryLogTimer.unref === "function") {
+    memoryLogTimer.unref();
+  }
+}
 
 function resolveStoredContentPath(relativeUrl) {
   if (!relativeUrl || typeof relativeUrl !== "string") {
@@ -869,6 +988,7 @@ function getLoginRateLimitKey(req, identifier) {
 }
 
 function getLoginAttemptRecord(key, now = Date.now()) {
+  maybePruneInMemoryRateLimits(now);
   const existing = loginAttempts.get(key);
   if (!existing) {
     return {
@@ -918,6 +1038,7 @@ function getPasswordResetRateLimitKey(req, action, identifier) {
 }
 
 function getPasswordResetRateLimitRecord(key, now = Date.now()) {
+  maybePruneInMemoryRateLimits(now);
   const existing = otpRateLimits.get(key);
   if (!existing) {
     return {
@@ -2824,25 +2945,27 @@ async function triggerApprovedReceiptDispatchForReceipt(paymentReceiptId, option
   );
 
   try {
-    const summary = await generateApprovedStudentReceipts({
-      db: { run, get, all },
-      deliveryMode: "download",
-      force: !!options.forceRegenerate,
-      paymentReceiptId: receiptId,
-      limit: 1,
-      dataDir,
-      outputDir: approvedReceiptsDir,
-      templateHtmlPath,
-      templateCssPath,
-      logger: console,
+    return await queueApprovedReceiptDispatch(receiptId, async () => {
+      const summary = await generateApprovedStudentReceipts({
+        db: { run, get, all },
+        deliveryMode: "download",
+        force: !!options.forceRegenerate,
+        paymentReceiptId: receiptId,
+        limit: 1,
+        dataDir,
+        outputDir: approvedReceiptsDir,
+        templateHtmlPath,
+        templateCssPath,
+        logger: console,
+      });
+      return {
+        attempted: true,
+        mode: "download",
+        eligible: Number(summary.eligible || 0),
+        sent: Number(summary.sent || 0),
+        failed: Number(summary.failed || 0),
+      };
     });
-    return {
-      attempted: true,
-      mode: "download",
-      eligible: Number(summary.eligible || 0),
-      sent: Number(summary.sent || 0),
-      failed: Number(summary.failed || 0),
-    };
   } catch (err) {
     const reason = String(err && err.message ? err.message : err || "Unknown error");
     console.error(
@@ -5243,22 +5366,49 @@ async function verifyAndIngestPaystackReference(reference, options = {}) {
   const transaction = transactionId ? await getReconciliationTransactionById(transactionId) : ingest.transaction || null;
   const nextSessionStatus = mapPaystackSessionStatusFromTransactionStatus(transaction?.status);
   const gatewayReference = sanitizeTransactionRef(normalized.gatewayReference || safeReference);
+  const verifiedBy =
+    String(options.verifiedBy || actorReq?.session?.user?.username || "")
+      .trim()
+      .slice(0, 80) || "system-paystack";
+  const verifiedByRole =
+    String(options.verifiedByRole || actorReq?.session?.user?.role || "")
+      .trim()
+      .slice(0, 40) || "system-paystack";
   const existingSession = await get("SELECT * FROM paystack_sessions WHERE gateway_reference = ? LIMIT 1", [gatewayReference]);
   if (existingSession) {
-    const verifiedBy =
-      String(options.verifiedBy || actorReq?.session?.user?.username || "")
-        .trim()
-        .slice(0, 80) || "system-paystack";
-    const verifiedByRole =
-      String(options.verifiedByRole || actorReq?.session?.user?.role || "")
-        .trim()
-        .slice(0, 40) || "system-paystack";
     await updatePaystackSessionStatusByReference(gatewayReference, nextSessionStatus, {
       verified_at: new Date().toISOString(),
       verified_by: verifiedBy,
       verified_by_role: verifiedByRole,
       transaction_id: transaction?.id || null,
     });
+  } else {
+    const metadataObligationId = parseResourceId(
+      normalized.metadata?.obligation_id || normalized.metadata?.obligationId || transaction?.matched_obligation_id
+    );
+    const metadataStudent = normalizeIdentifier(
+      normalized.metadata?.student_username ||
+        normalized.metadata?.studentUsername ||
+        normalized.metadata?.student ||
+        transaction?.student_username ||
+        transaction?.student_hint_username
+    );
+    if (metadataObligationId && metadataStudent) {
+      await upsertPaystackSession({
+        obligationId: metadataObligationId,
+        studentId: metadataStudent,
+        gatewayReference,
+        amount: normalized.amount,
+        status: nextSessionStatus,
+        payload: {
+          verified_at: new Date().toISOString(),
+          verified_by: verifiedBy,
+          verified_by_role: verifiedByRole,
+          transaction_id: transaction?.id || null,
+          source_event_id: normalized.sourceEventId,
+        },
+      });
+    }
   }
 
   return {
@@ -5268,6 +5418,53 @@ async function verifyAndIngestPaystackReference(reference, options = {}) {
     transaction,
     sessionStatus: nextSessionStatus,
   };
+}
+
+async function triggerBackgroundPaystackVerification(reference, metadata = {}) {
+  const safeReference = sanitizeTransactionRef(reference || "");
+  if (!safeReference || !paystackClient.hasSecretKey) {
+    return { attempted: false, reason: "missing_reference_or_config" };
+  }
+
+  try {
+    const result = await verifyAndIngestPaystackReference(safeReference, {
+      actorReq: getPaystackSystemRequest(),
+      verifiedBy: "system-paystack",
+      verifiedByRole: "system-paystack",
+    });
+    await resolvePendingPaystackReferenceRequestsByReference(result.reference, {
+      status: "verified",
+      resolvedBy: "system-paystack",
+      resolvedByRole: "system-paystack",
+      result: {
+        verified_at: new Date().toISOString(),
+        reference: result.reference,
+        transaction_id: result.transaction?.id || null,
+        status: result.transaction?.status || null,
+        gateway_status: result.gatewayStatus,
+        idempotent: !!result.ingest?.idempotent,
+        inserted: !!result.ingest?.inserted,
+        session_status: result.sessionStatus || null,
+        trigger: "callback_background_verify",
+      },
+    });
+    console.info(
+      `[paystack] background verify succeeded reference=${result.reference} status=${String(
+        result.transaction?.status || result.sessionStatus || "unknown"
+      )} inserted=${Boolean(result.ingest?.inserted)} idempotent=${Boolean(result.ingest?.idempotent)} trigger=${
+        metadata.trigger || "unknown"
+      }`
+    );
+    return { attempted: true, ok: true, result };
+  } catch (err) {
+    const normalizedError = normalizePaystackError(err, "paystack_background_verify_failed");
+    console.error(
+      `[paystack] background verify failed reference=${safeReference} code=${normalizedError.code} message=${normalizedError.message} trigger=${
+        metadata.trigger || "unknown"
+      }`
+    );
+    return { attempted: true, ok: false, error: normalizedError };
+  }
 }
 
 function reconciliationDecisionFromStatus(statusValue) {
@@ -7443,6 +7640,14 @@ app.get("/api/payments/paystack/callback", async (req, res) => {
       });
     } catch (_err) {
       // Callback endpoint must stay non-blocking for UX redirects.
+    }
+    const backgroundVerifyTimer = setTimeout(() => {
+      triggerBackgroundPaystackVerification(reference, {
+        trigger: "callback_redirect",
+      }).catch(() => undefined);
+    }, 1500);
+    if (typeof backgroundVerifyTimer.unref === "function") {
+      backgroundVerifyTimer.unref();
     }
   }
   const params = new URLSearchParams();
