@@ -259,6 +259,14 @@ async function requestJson(url, { method = "GET", payload } = {}) {
   return data;
 }
 
+function asArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function asObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
 const paymentState = {
   me: null,
   paymentItems: [],
@@ -461,6 +469,7 @@ function syncPostPaystackReferenceInputFromLatest() {
 }
 
 function renderPaymentItemSelects(items) {
+  const safeItems = asArray(items);
   const selectIds = ["queuePaymentItem"];
   selectIds.forEach((id) => {
     const select = document.getElementById(id);
@@ -470,7 +479,7 @@ function renderPaymentItemSelects(items) {
     const existingValue = select.value;
     const options = ['<option value="">All</option>']
       .concat(
-        items.map(
+        safeItems.map(
           (item) =>
             `<option value="${item.id}">${escapeHtml(item.title)} - ${escapeHtml(item.currency)} ${escapeHtml(item.expected_amount)}${
               item.my_reference ? ` (Ref: ${escapeHtml(item.my_reference)})` : ""
@@ -479,7 +488,7 @@ function renderPaymentItemSelects(items) {
       )
       .join("");
     select.innerHTML = options;
-    if (existingValue && items.some((item) => String(item.id) === existingValue)) {
+    if (existingValue && safeItems.some((item) => String(item.id) === existingValue)) {
       select.value = existingValue;
     }
   });
@@ -520,7 +529,7 @@ function getLatestApprovedReceiptIdForPaymentItem(paymentItemId) {
   if (!Number.isFinite(itemId) || itemId <= 0) {
     return 0;
   }
-  const rows = Array.isArray(paymentState.myReceipts) ? paymentState.myReceipts : [];
+  const rows = asArray(paymentState.myReceipts);
   const match = rows.find((row) => {
     const sameItem = Number(row.payment_item_id || 0) === itemId;
     const approved = String(row.status || "").toLowerCase() === "approved";
@@ -539,7 +548,7 @@ function renderReminderCalendar(ledger) {
   if (!container) {
     return;
   }
-  const items = ledger && Array.isArray(ledger.items) ? ledger.items : [];
+  const items = asArray(ledger?.items);
   container.innerHTML = "";
   if (!items.length) {
     container.innerHTML = '<p class="details-tile-list__empty">No payment items available.</p>';
@@ -607,7 +616,7 @@ function renderPaymentTimeline(ledger) {
   if (!tbody) {
     return;
   }
-  const rows = ledger && Array.isArray(ledger.timeline) ? ledger.timeline : [];
+  const rows = asArray(ledger?.timeline);
   tbody.innerHTML = "";
   if (!rows.length) {
     tbody.innerHTML = '<tr><td colspan="4" style="color:#636b8a;">No reconciliation updates yet.</td></tr>';
@@ -630,7 +639,7 @@ function renderMyReceipts(rows) {
     return;
   }
   container.innerHTML = "";
-  const approvedRows = rows.filter((row) => String(row.status || "").toLowerCase() === "approved");
+  const approvedRows = asArray(rows).filter((row) => String(row.status || "").toLowerCase() === "approved");
   if (!approvedRows.length) {
     container.innerHTML = '<p class="details-tile-list__empty">No approved receipts yet.</p>';
     return;
@@ -686,11 +695,12 @@ function renderMyPaystackReferenceRequests(rows) {
     return;
   }
   container.innerHTML = "";
-  if (!Array.isArray(rows) || !rows.length) {
+  const safeRows = asArray(rows);
+  if (!safeRows.length) {
     container.innerHTML = '<p class="details-tile-list__empty">No posted Paystack references yet.</p>';
     return;
   }
-  rows.forEach((row) => {
+  safeRows.forEach((row) => {
     const tile = document.createElement("article");
     tile.className = "details-tile";
     tile.innerHTML = `
@@ -727,8 +737,9 @@ function renderPaystackReferenceRequests(rows) {
   if (!tbody) {
     return;
   }
+  const safeRows = asArray(rows);
   tbody.innerHTML = "";
-  if (!Array.isArray(rows) || !rows.length) {
+  if (!safeRows.length) {
     tbody.innerHTML = '<tr><td colspan="8" style="color:#636b8a;">No Paystack reference requests found.</td></tr>';
     if (selectAllNode) {
       selectAllNode.checked = false;
@@ -736,7 +747,7 @@ function renderPaystackReferenceRequests(rows) {
     return;
   }
 
-  rows.forEach((row) => {
+  safeRows.forEach((row) => {
     const id = Number(row.id || 0);
     const checkedAttr = paymentState.selectedPaystackReferenceRequestIds.has(id) ? "checked" : "";
     const tr = document.createElement("tr");
@@ -754,8 +765,10 @@ function renderPaystackReferenceRequests(rows) {
   });
 
   if (selectAllNode) {
-    const selectableRows = rows.length;
-    const selectedCount = rows.filter((row) => paymentState.selectedPaystackReferenceRequestIds.has(Number(row.id || 0))).length;
+    const selectableRows = safeRows.length;
+    const selectedCount = safeRows.filter((row) =>
+      paymentState.selectedPaystackReferenceRequestIds.has(Number(row.id || 0))
+    ).length;
     selectAllNode.checked = selectableRows > 0 && selectedCount === selectableRows;
   }
 }
@@ -766,7 +779,9 @@ function renderPaymentItemsTable(items) {
     return;
   }
   container.innerHTML = "";
-  const manageable = items.filter((item) => paymentState.me.role === "admin" || item.created_by === paymentState.me.username);
+  const manageable = asArray(items).filter(
+    (item) => paymentState.me.role === "admin" || item.created_by === paymentState.me.username
+  );
   if (!manageable.length) {
     container.innerHTML = '<p class="details-tile-list__empty">No payment items yet.</p>';
     return;
@@ -807,12 +822,13 @@ function renderQueue(rows) {
   if (!tbody) {
     return;
   }
+  const safeRows = asArray(rows);
   tbody.innerHTML = "";
-  if (!rows.length) {
+  if (!safeRows.length) {
     tbody.innerHTML = '<tr><td colspan="7" style="color:#636b8a;">No approved transactions match the current filters.</td></tr>';
     return;
   }
-  rows.forEach((row) => {
+  safeRows.forEach((row) => {
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td>${escapeHtml(row.student_full_name || row.student_username || "-")}</td>
@@ -844,13 +860,15 @@ function renderQueuePagination() {
 }
 
 async function loadPaymentItems() {
-  paymentState.paymentItems = await requestJson("/api/payment-items");
+  const payload = await requestJson("/api/payment-items");
+  paymentState.paymentItems = Array.isArray(payload) ? payload : asArray(payload?.items);
   renderPaymentItemSelects(paymentState.paymentItems);
   renderPaymentItemsTable(paymentState.paymentItems);
 }
 
 async function loadStudentReceipts() {
-  paymentState.myReceipts = await requestJson("/api/my/payment-receipts");
+  const payload = await requestJson("/api/my/payment-receipts");
+  paymentState.myReceipts = Array.isArray(payload) ? payload : asArray(payload?.items);
   renderMyReceipts(paymentState.myReceipts);
   if (paymentState.ledger) {
     renderReminderCalendar(paymentState.ledger);
@@ -858,7 +876,11 @@ async function loadStudentReceipts() {
 }
 
 async function loadStudentLedger() {
-  paymentState.ledger = await requestJson("/api/my/payment-ledger");
+  const payload = await requestJson("/api/my/payment-ledger");
+  paymentState.ledger = asObject(payload);
+  paymentState.ledger.items = asArray(paymentState.ledger.items);
+  paymentState.ledger.timeline = asArray(paymentState.ledger.timeline);
+  paymentState.ledger.summary = asObject(paymentState.ledger.summary);
   renderLedger(paymentState.ledger);
   renderReminderCalendar(paymentState.ledger);
   renderPaymentTimeline(paymentState.ledger);
@@ -883,7 +905,7 @@ async function loadPaystackReferenceRequests() {
       : "/api/lecturer/paystack-reference-requests";
   const payload = await requestJson(endpoint);
   paymentState.paystackReferenceRequests = Array.isArray(payload?.items) ? payload.items : [];
-  const validIds = new Set(paymentState.paystackReferenceRequests.map((row) => Number(row.id || 0)));
+  const validIds = new Set(asArray(paymentState.paystackReferenceRequests).map((row) => Number(row.id || 0)));
   paymentState.selectedPaystackReferenceRequestIds = new Set(
     [...paymentState.selectedPaystackReferenceRequestIds].filter((id) => validIds.has(id))
   );
@@ -1025,7 +1047,7 @@ async function loadReconciliationSummary() {
     paymentState.me.role === "admin"
       ? "/api/admin/reconciliation/summary"
       : "/api/lecturer/reconciliation/summary";
-  paymentState.reconciliationSummary = await requestJson(endpoint);
+  paymentState.reconciliationSummary = asObject(await requestJson(endpoint));
   renderReconciliationSummary();
 }
 
@@ -1049,7 +1071,7 @@ function bindPostPaystackReferenceForm() {
       reference,
       note: noteInput instanceof HTMLTextAreaElement ? String(noteInput.value || "").trim() : "",
     };
-    const ledgerItems = Array.isArray(paymentState?.ledger?.items) ? paymentState.ledger.items : [];
+    const ledgerItems = asArray(paymentState?.ledger?.items);
     const matchedItem = ledgerItems.find(
       (item) => String(item?.paystack_reference || "").trim().toLowerCase() === reference.toLowerCase()
     );
@@ -1204,7 +1226,7 @@ function bindPaymentItemsManagement() {
       }
       const action = button.dataset.action;
       const id = Number.parseInt(button.dataset.id || "", 10);
-      const item = paymentState.paymentItems.find((entry) => entry.id === id);
+      const item = asArray(paymentState.paymentItems).find((entry) => entry.id === id);
       if (!item) {
         return;
       }
@@ -1281,7 +1303,7 @@ function bindPaymentItemsManagement() {
 }
 
 function getSelectedPaystackReferenceRequestIds() {
-  return paymentState.paystackReferenceRequests
+  return asArray(paymentState.paystackReferenceRequests)
     .filter((row) => paymentState.selectedPaystackReferenceRequestIds.has(Number(row.id || 0)))
     .map((row) => Number(row.id || 0))
     .filter((id) => Number.isFinite(id) && id > 0);
@@ -1456,7 +1478,10 @@ async function initPaymentsPage() {
     root.dataset.paymentsInitialized = "1";
   }
   try {
-    paymentState.me = await requestJson("/api/me");
+    paymentState.me = asObject(await requestJson("/api/me"));
+    if (!paymentState.me.role) {
+      throw new Error("Could not load your payment access profile.");
+    }
     await loadPaymentItems();
 
     const studentSection = document.getElementById("studentPaymentsSection");
