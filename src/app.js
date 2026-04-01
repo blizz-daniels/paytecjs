@@ -2658,6 +2658,26 @@ function requireTeacher(req, res, next) {
   return res.status(403).redirect("/");
 }
 
+function requireTeacherOnly(req, res, next) {
+  if (!isAuthenticated(req) || !req.session.user) {
+    return res.status(401).redirect("/login");
+  }
+  if (req.session.user.role === "teacher") {
+    return next();
+  }
+  return res.redirect(req.session.user.role === "admin" ? "/admin" : "/");
+}
+
+function requireNonAdmin(req, res, next) {
+  if (!isAuthenticated(req) || !req.session.user) {
+    return res.status(401).redirect("/login");
+  }
+  if (req.session.user.role !== "admin") {
+    return next();
+  }
+  return res.redirect("/admin");
+}
+
 function requireStudent(req, res, next) {
   if (!isAuthenticated(req) || !req.session.user) {
     return res.status(401).json({ error: "Authentication required." });
@@ -9734,6 +9754,8 @@ registerPageRoutes(app, {
   PROJECT_ROOT,
   requireAuth,
   requireTeacher,
+  requireTeacherOnly,
+  requireNonAdmin,
 });
 
 async function startServer() {

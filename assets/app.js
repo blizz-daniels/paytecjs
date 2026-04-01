@@ -527,6 +527,15 @@ function arrangeSidebarNav() {
     return;
   }
 
+  const currentPath = normalizePath(window.location.pathname);
+  if (currentPath === "/admin" || currentPath === "/admin/import") {
+    return;
+  }
+
+  if (nav.querySelector('a[href="/admin"], a[href="/admin/import"]')) {
+    return;
+  }
+
   if (nav.querySelector(".nav-section")) {
     return;
   }
