@@ -45,6 +45,10 @@ const LECTURER_ROSTER_PATH = path.resolve(
 const DEPARTMENT_GROUPS_PATH = path.resolve(
   process.env.DEPARTMENT_GROUPS_PATH || path.join(PROJECT_ROOT, "data", "department-groups.csv")
 );
+const ROSTER_PASSWORD_HASH_ROUNDS = (() => {
+  const value = Number.parseInt(String(process.env.ROSTER_PASSWORD_HASH_ROUNDS || "9"), 10);
+  return Number.isFinite(value) && value >= 8 && value <= 14 ? value : 9;
+})();
 
 if (isProduction && !process.env.SESSION_SECRET) {
   throw new Error("SESSION_SECRET is required when NODE_ENV=production");
@@ -1450,6 +1454,7 @@ async function processRosterCsv(csvText, options) {
   const existingIds = new Set(existingRows.map((row) => normalizeIdentifier(row.auth_id)));
   const seenInFile = new Set();
   const results = [];
+  const pendingWrites = [];
   const summary = {
     totalRows: Math.max(0, lines.length - 1),
     validRows: 0,
@@ -1523,21 +1528,13 @@ async function processRosterCsv(csvText, options) {
     };
 
     if (applyChanges) {
-      const passwordHash = await bcrypt.hash(surnamePassword, 12);
-      await run(
-        `
-          INSERT INTO auth_roster (auth_id, role, password_hash, source_file, department)
-          VALUES (?, ?, ?, ?, ?)
-          ON CONFLICT(auth_id, role) DO UPDATE SET
-            password_hash = excluded.password_hash,
-            source_file = excluded.source_file,
-            department = excluded.department
-        `,
-        [identifier, role, passwordHash, sourceName, department]
-      );
-      if (rawDisplayName) {
-        await upsertProfileDisplayName(identifier, rawDisplayName);
-      }
+      const passwordHash = await bcrypt.hash(surnamePassword, ROSTER_PASSWORD_HASH_ROUNDS);
+      pendingWrites.push({
+        identifier,
+        passwordHash,
+        rawDisplayName,
+        department,
+      });
       result.message = exists ? "Updated existing account." : "Created new account.";
     }
 
@@ -1550,6 +1547,27 @@ async function processRosterCsv(csvText, options) {
     summary.validRows += 1;
     summary.imported += 1;
     results.push(result);
+  }
+
+  if (applyChanges && pendingWrites.length) {
+    await withSqlTransaction(async () => {
+      for (const entry of pendingWrites) {
+        await run(
+          `
+            INSERT INTO auth_roster (auth_id, role, password_hash, source_file, department)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(auth_id, role) DO UPDATE SET
+              password_hash = excluded.password_hash,
+              source_file = excluded.source_file,
+              department = excluded.department
+          `,
+          [entry.identifier, role, entry.passwordHash, sourceName, entry.department]
+        );
+        if (entry.rawDisplayName) {
+          await upsertProfileDisplayName(entry.identifier, entry.rawDisplayName);
+        }
+      }
+    });
   }
 
   return {
