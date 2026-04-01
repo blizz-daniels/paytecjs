@@ -6,7 +6,7 @@ const {
   DEFAULT_EMAIL_SUBJECT,
   generateApprovedStudentReceipts,
 } = require("../services/approved-receipt-generator");
-const { openSqliteDatabase } = require("../services/sqlite-client");
+const { openDatabaseClient } = require("../services/sqlite-client");
 
 const projectRoot = path.resolve(__dirname, "..");
 
@@ -118,6 +118,9 @@ function resolveDefaultDataDir() {
 }
 
 function resolveDbPath(defaultDataDir) {
+  if (String(process.env.DATABASE_URL || "").trim()) {
+    return null;
+  }
   if (process.env.RECEIPT_DB_PATH) {
     return path.resolve(process.env.RECEIPT_DB_PATH);
   }
@@ -186,6 +189,7 @@ function createEmailSender() {
 async function runOnce(cliOptions) {
   const dataDir = resolveDefaultDataDir();
   const dbPath = resolveDbPath(dataDir);
+  const databaseUrl = String(process.env.DATABASE_URL || "").trim();
   const outputDir = path.resolve(process.env.RECEIPT_OUTPUT_DIR || path.join(projectRoot, "outputs", "receipts"));
   const templateHtmlPath = path.resolve(
     process.env.RECEIPT_TEMPLATE_HTML || path.join(projectRoot, "templates", "approved-student-receipt.html")
@@ -194,11 +198,14 @@ async function runOnce(cliOptions) {
     process.env.RECEIPT_TEMPLATE_CSS || path.join(projectRoot, "templates", "approved-student-receipt.css")
   );
 
-  if (!fs.existsSync(dbPath)) {
+  if (!databaseUrl && !fs.existsSync(dbPath)) {
     throw new Error(`Database not found at ${dbPath}. Start the app once to initialize the database.`);
   }
 
-  const db = openSqliteDatabase(dbPath);
+  const db = openDatabaseClient({
+    sqlitePath: dbPath || path.join(dataDir, "paytec.sqlite"),
+    databaseUrl,
+  });
   let mailer = null;
   try {
     mailer = createEmailSender();

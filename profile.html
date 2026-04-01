@@ -89,6 +89,80 @@
         </form>
       </section>
 
+      <section id="profilePayoutSection" class="card payout-card" hidden>
+        <div class="payout-card__header">
+          <div>
+            <h2>Lecturer Payout Account</h2>
+            <p class="auth-subtitle">Manage the bank account used for lecturer payouts. Bank details are never shown in full after saving.</p>
+          </div>
+          <span id="profilePayoutBadge" class="status-badge status-badge--warning">Loading</span>
+        </div>
+        <p id="profilePayoutStatus" class="auth-subtitle"></p>
+        <div id="profilePayoutStats" class="payout-stats" aria-live="polite"></div>
+
+        <section class="grid two-col" style="margin-top: 1rem;">
+          <article class="payout-subcard">
+            <h3>Linked Bank Account</h3>
+            <div id="profilePayoutAccount" class="payout-account"></div>
+          </article>
+
+          <article class="payout-subcard">
+            <h3>Update Bank Details</h3>
+            <form id="profilePayoutForm" class="auth-form payout-form">
+              <label for="profilePayoutBankName">Bank name</label>
+              <input id="profilePayoutBankName" name="bankName" type="text" maxlength="80" autocomplete="off" />
+
+              <label for="profilePayoutBankCode">Bank code</label>
+              <input id="profilePayoutBankCode" name="bankCode" type="text" maxlength="10" autocomplete="off" />
+
+              <label for="profilePayoutAccountName">Account name</label>
+              <input id="profilePayoutAccountName" name="accountName" type="text" maxlength="100" autocomplete="off" />
+
+              <label for="profilePayoutAccountNumber">Account number</label>
+              <input id="profilePayoutAccountNumber" name="accountNumber" type="text" maxlength="10" inputmode="numeric" autocomplete="off" />
+
+              <label class="payout-toggle">
+                <input id="profilePayoutAutoEnabled" name="autoPayoutEnabled" type="checkbox" checked />
+                Auto payout when earnings are available
+              </label>
+
+              <label class="payout-toggle">
+                <input id="profilePayoutReviewRequired" name="reviewRequired" type="checkbox" />
+                Mark for admin review
+              </label>
+
+              <p class="auth-subtitle payout-inline-note">
+                Leave the bank fields blank if you only want to update payout preferences.
+              </p>
+
+              <button type="submit" class="btn">Save payout account</button>
+            </form>
+          </article>
+        </section>
+
+        <section class="payout-history-block">
+          <h3>Payout History</h3>
+          <div class="table-wrap">
+            <table class="data-table payout-history-table">
+              <thead>
+                <tr>
+                  <th>Date</th>
+                  <th>Reference</th>
+                  <th>Amount</th>
+                  <th>Status</th>
+                  <th>Review</th>
+                </tr>
+              </thead>
+              <tbody id="profilePayoutHistoryBody">
+                <tr>
+                  <td colspan="5">Loading payout history...</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
       <section class="card profile-checklist-card">
         <h2>Department Checklist</h2>
         <p class="auth-subtitle">make sure your done with your task before checking.</p>

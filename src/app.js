@@ -8,9 +8,9 @@ const nodemailer = require("nodemailer");
 const express = require("express");
 const multer = require("multer");
 const session = require("express-session");
-const sqlite3 = require("sqlite3").verbose();
-const SQLiteStore = require("connect-sqlite3")(session);
+const { openDatabaseClient } = require("../services/database-client");
 const { createPaystackClient } = require("../services/paystack");
+const { createPaystackTransferClient } = require("../services/paystack-transfers");
 const { registerMessageRoutes } = require("./routes/messages.routes");
 const { registerPageRoutes } = require("./routes/page.routes");
 const { registerSharedFileRoutes } = require("./routes/shared-files.routes");
@@ -36,6 +36,7 @@ const isProduction = process.env.NODE_ENV === "production";
 const defaultDataDir = isProduction ? "/tmp/paytec" : path.join(PROJECT_ROOT, "data");
 const dataDir = path.resolve(process.env.DATA_DIR || defaultDataDir);
 const dbPath = path.join(dataDir, "paytec.sqlite");
+const DATABASE_URL = String(process.env.DATABASE_URL || "").trim();
 const ADMIN_USERNAME = String(process.env.ADMIN_USERNAME || "admin").trim().toLowerCase();
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 const STUDENT_ROSTER_PATH = path.resolve(process.env.STUDENT_ROSTER_PATH || path.join(PROJECT_ROOT, "data", "students.csv"));
@@ -52,6 +53,9 @@ const ROSTER_PASSWORD_HASH_ROUNDS = (() => {
 
 if (isProduction && !process.env.SESSION_SECRET) {
   throw new Error("SESSION_SECRET is required when NODE_ENV=production");
+}
+if (isProduction && !DATABASE_URL) {
+  throw new Error("DATABASE_URL is required when NODE_ENV=production");
 }
 if (isProduction && !ADMIN_PASSWORD) {
   throw new Error("ADMIN_PASSWORD is required when NODE_ENV=production");
@@ -168,6 +172,8 @@ let contentStreamClientSequence = 0;
 const contentStreamClients = new Map();
 const approvedReceiptDispatchInflight = new Map();
 let approvedReceiptDispatchQueue = Promise.resolve();
+const lecturerPayoutDispatchInflight = new Map();
+let lecturerPayoutDispatchQueue = Promise.resolve();
 let nextRateLimitPruneAt = 0;
 const CONTENT_STREAM_KEEPALIVE_MS = 25 * 1000;
 const execFileAsync = promisify(execFile);
@@ -183,6 +189,20 @@ const PAYSTACK_SECRET_KEY = String(process.env.PAYSTACK_SECRET_KEY || "").trim()
 const PAYSTACK_PUBLIC_KEY = String(process.env.PAYSTACK_PUBLIC_KEY || "").trim();
 const PAYSTACK_WEBHOOK_SECRET = String(process.env.PAYSTACK_WEBHOOK_SECRET || PAYSTACK_SECRET_KEY).trim();
 const PAYSTACK_CALLBACK_URL = String(process.env.PAYSTACK_CALLBACK_URL || "").trim();
+const PAYOUT_ENCRYPTION_KEY = String(process.env.PAYOUT_ENCRYPTION_KEY || "").trim();
+const PAYOUT_DEFAULT_SHARE_BPS = (() => {
+  const value = Number.parseInt(String(process.env.PAYOUT_DEFAULT_SHARE_BPS || "10000"), 10);
+  return Number.isFinite(value) && value >= 0 && value <= 10000 ? value : 10000;
+})();
+const PAYOUT_MINIMUM_AMOUNT = (() => {
+  const value = Number.parseFloat(String(process.env.PAYOUT_MINIMUM_AMOUNT || "1000"));
+  return Number.isFinite(value) && value >= 0 ? value : 1000;
+})();
+const PAYOUT_WORKER_INTERVAL_MS = (() => {
+  const defaultValue = isTestEnvironment ? 0 : 60000;
+  const value = Number.parseInt(String(process.env.PAYOUT_WORKER_INTERVAL_MS || String(defaultValue)), 10);
+  return Number.isFinite(value) && value >= 10000 ? value : defaultValue;
+})();
 const PAYMENT_REFERENCE_PREFIX = String(process.env.PAYMENT_REFERENCE_PREFIX || "PAYTEC").trim().toUpperCase();
 const PAYMENT_REFERENCE_TENANT_ID = String(
   process.env.PAYMENT_REFERENCE_TENANT_ID || process.env.SCHOOL_ID || process.env.TENANT_ID || "default-school"
@@ -193,6 +213,9 @@ const AUTO_RECONCILE_CONFIDENCE = Number.parseFloat(String(process.env.AUTO_RECO
 const REVIEW_RECONCILE_CONFIDENCE = Number.parseFloat(String(process.env.REVIEW_RECONCILE_CONFIDENCE || "0.65"));
 const PAYSTACK_SOURCE = "paystack";
 const paystackClient = createPaystackClient({
+  secretKey: PAYSTACK_SECRET_KEY,
+});
+const paystackTransferClient = createPaystackTransferClient({
   secretKey: PAYSTACK_SECRET_KEY,
 });
 if (isProduction) {
@@ -207,6 +230,11 @@ if (isProduction) {
       `[startup] Missing Paystack env var(s): ${missingPaystackEnv.join(
         ", "
       )}. Paystack endpoints will remain unavailable until configured.`
+    );
+  }
+  if (!PAYOUT_ENCRYPTION_KEY) {
+    console.warn(
+      "[startup] PAYOUT_ENCRYPTION_KEY is missing. Lecturer payout account storage will remain unavailable until configured."
     );
   }
 }
@@ -267,7 +295,11 @@ const {
   handoutsFilesDir,
   sharedFilesUploadDir,
 });
-const db = new sqlite3.Database(dbPath);
+const databaseClient = openDatabaseClient({
+  sqlitePath: dbPath,
+  databaseUrl: DATABASE_URL,
+});
+const db = databaseClient;
 
 function toMemoryMegabytes(value) {
   const bytes = Number(value || 0);
@@ -375,6 +407,19 @@ if (MEMORY_LOG_INTERVAL_MS > 0) {
   }
 }
 
+if (PAYOUT_WORKER_INTERVAL_MS > 0) {
+  const payoutWorkerTimer = setInterval(() => {
+    queueLecturerPayoutDispatch("payout-worker", () =>
+      processLecturerPayoutQueue({ req: createSystemActorRequest("system-payout", "system-payout"), triggerSource: "worker" })
+    ).catch((err) => {
+      console.error("[payout] worker processing failed:", err);
+    });
+  }, PAYOUT_WORKER_INTERVAL_MS);
+  if (typeof payoutWorkerTimer.unref === "function") {
+    payoutWorkerTimer.unref();
+  }
+}
+
 function resolveStoredContentPath(relativeUrl) {
   if (!relativeUrl || typeof relativeUrl !== "string") {
     return null;
@@ -438,39 +483,15 @@ function parseReactionDetails(detailsString) {
 }
 
 function run(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.run(sql, params, function onRun(err) {
-      if (err) {
-        reject(err);
-        return;
-      }
-      resolve(this);
-    });
-  });
+  return databaseClient.run(sql, params);
 }
 
 function get(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.get(sql, params, (err, row) => {
-      if (err) {
-        reject(err);
-        return;
-      }
-      resolve(row || null);
-    });
-  });
+  return databaseClient.get(sql, params);
 }
 
 function all(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.all(sql, params, (err, rows) => {
-      if (err) {
-        reject(err);
-        return;
-      }
-      resolve(rows || []);
-    });
-  });
+  return databaseClient.all(sql, params);
 }
 
 async function runMigrationSql(sql, params = []) {
@@ -491,19 +512,7 @@ async function runMigrationSql(sql, params = []) {
 }
 
 async function withSqlTransaction(work) {
-  await run("BEGIN IMMEDIATE TRANSACTION");
-  try {
-    const result = await work();
-    await run("COMMIT");
-    return result;
-  } catch (err) {
-    try {
-      await run("ROLLBACK");
-    } catch (_rollbackErr) {
-      // ignore
-    }
-    throw err;
-  }
+  return databaseClient.transaction(work);
 }
 
 function parseCsvLine(line) {
@@ -842,6 +851,191 @@ function maskEmailAddress(value) {
     return `${localPart.charAt(0)}***@${domainPart}`;
   }
   return `${localPart.slice(0, 2)}***@${domainPart}`;
+}
+
+let payoutEncryptionKeyBuffer = null;
+
+function getPayoutEncryptionKeyBuffer() {
+  if (!PAYOUT_ENCRYPTION_KEY) {
+    return null;
+  }
+  if (payoutEncryptionKeyBuffer) {
+    return payoutEncryptionKeyBuffer;
+  }
+  payoutEncryptionKeyBuffer = crypto.createHash("sha256").update(PAYOUT_ENCRYPTION_KEY, "utf8").digest();
+  return payoutEncryptionKeyBuffer;
+}
+
+function encryptPayoutValue(value) {
+  const key = getPayoutEncryptionKeyBuffer();
+  if (!key) {
+    throw new Error("Payout encryption key is not configured.");
+  }
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const plaintext = Buffer.from(String(value || ""), "utf8");
+  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  const authTag = cipher.getAuthTag();
+  return Buffer.concat([iv, authTag, ciphertext]).toString("base64");
+}
+
+function decryptPayoutValue(value) {
+  const key = getPayoutEncryptionKeyBuffer();
+  if (!key || !value) {
+    return "";
+  }
+  try {
+    const buffer = Buffer.from(String(value || ""), "base64");
+    if (buffer.length <= 28) {
+      return "";
+    }
+    const iv = buffer.subarray(0, 12);
+    const authTag = buffer.subarray(12, 28);
+    const ciphertext = buffer.subarray(28);
+    const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+    decipher.setAuthTag(authTag);
+    const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+    return plaintext.toString("utf8");
+  } catch (_err) {
+    return "";
+  }
+}
+
+function maskBankAccountNumber(value) {
+  const digits = String(value || "").replace(/\D/g, "");
+  if (!digits) {
+    return "";
+  }
+  const tail = digits.slice(-4);
+  return `**** ${tail}`;
+}
+
+function normalizeBankCode(value) {
+  return String(value || "")
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, "");
+}
+
+function normalizeBankAccountNumber(value) {
+  return String(value || "").replace(/\D/g, "").trim();
+}
+
+function normalizePayoutStatus(value) {
+  const status = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (["queued", "processing", "success", "failed", "reversed", "review", "paid", "reserved"].includes(status)) {
+    return status;
+  }
+  return "queued";
+}
+
+function normalizePayoutReviewState(value) {
+  const status = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (["not_required", "pending", "required", "approved", "rejected"].includes(status)) {
+    return status;
+  }
+  return "not_required";
+}
+
+function roundCurrencyAmount(value) {
+  const amount = Number(value || 0);
+  if (!Number.isFinite(amount)) {
+    return 0;
+  }
+  return Number(amount.toFixed(2));
+}
+
+function amountToKobo(amount) {
+  return toKoboFromAmount(roundCurrencyAmount(amount));
+}
+
+function koboToAmount(kobo) {
+  return toAmountFromKobo(Number(kobo || 0));
+}
+
+function buildLecturerPayoutTransferReference(lecturerUsername, ledgerIds = []) {
+  const lecturerToken = normalizeIdentifier(lecturerUsername || "").replace(/[^a-z0-9]/g, "").slice(0, 18) || "lecturer";
+  const ledgerToken = Array.isArray(ledgerIds) && ledgerIds.length ? ledgerIds.join("-").slice(0, 24) : "batch";
+  const reference = sanitizeTransactionRef(`PAYOUT-${lecturerToken}-${ledgerToken}-${Date.now()}-${crypto.randomBytes(3).toString("hex")}`);
+  return reference.slice(0, 120);
+}
+
+function summarizePayoutAccountRow(row) {
+  if (!row) {
+    return null;
+  }
+  return {
+    id: Number(row.id || 0),
+    lecturer_username: String(row.lecturer_username || ""),
+    bank_name: String(row.bank_name || ""),
+    bank_code: String(row.bank_code || ""),
+    account_name: String(row.account_name || ""),
+    account_last4: String(row.account_last4 || ""),
+    account_masked: maskBankAccountNumber(row.account_last4 || row.account_number_encrypted || ""),
+    recipient_type: String(row.recipient_type || "nuban"),
+    recipient_status: String(row.recipient_status || "active"),
+    auto_payout_enabled: Number(row.auto_payout_enabled || 0) === 1,
+    review_required: Number(row.review_required || 0) === 1,
+    verified_at: row.verified_at || null,
+    created_at: row.created_at || null,
+    updated_at: row.updated_at || null,
+  };
+}
+
+function summarizePayoutTransferRow(row) {
+  if (!row) {
+    return null;
+  }
+  return {
+    id: Number(row.id || 0),
+    lecturer_username: String(row.lecturer_username || ""),
+    payout_account_id: Number(row.payout_account_id || 0),
+    transfer_reference: String(row.transfer_reference || ""),
+    transfer_code: row.transfer_code || null,
+    total_amount: roundCurrencyAmount(row.total_amount),
+    currency: String(row.currency || "NGN").toUpperCase(),
+    status: normalizePayoutStatus(row.status),
+    trigger_source: String(row.trigger_source || "auto"),
+    review_state: normalizePayoutReviewState(row.review_state),
+    failure_reason: row.failure_reason || null,
+    attempt_count: Number(row.attempt_count || 0),
+    ledger_count: Number(row.ledger_count || 0),
+    requested_by: row.requested_by || null,
+    reviewed_by: row.reviewed_by || null,
+    reviewed_at: row.reviewed_at || null,
+    dispatched_at: row.dispatched_at || null,
+    completed_at: row.completed_at || null,
+    created_at: row.created_at || null,
+    updated_at: row.updated_at || null,
+  };
+}
+
+function summarizePayoutLedgerRow(row) {
+  if (!row) {
+    return null;
+  }
+  return {
+    id: Number(row.id || 0),
+    lecturer_username: String(row.lecturer_username || ""),
+    payment_transaction_id: Number(row.payment_transaction_id || 0),
+    payment_item_id: Number(row.payment_item_id || 0),
+    obligation_id: row.obligation_id ? Number(row.obligation_id) : null,
+    gross_amount: roundCurrencyAmount(row.gross_amount),
+    share_bps: Number(row.share_bps || 0),
+    payout_amount: roundCurrencyAmount(row.payout_amount),
+    currency: String(row.currency || "NGN").toUpperCase(),
+    status: normalizePayoutStatus(row.status),
+    available_at: row.available_at || null,
+    payout_transfer_id: row.payout_transfer_id ? Number(row.payout_transfer_id) : null,
+    review_reason: row.review_reason || null,
+    source_status: String(row.source_status || "approved"),
+    created_at: row.created_at || null,
+    updated_at: row.updated_at || null,
+  };
 }
 
 function withPromiseTimeout(promise, timeoutMs, timeoutMessage) {
@@ -2046,12 +2240,102 @@ async function initDatabase() {
       description TEXT NOT NULL DEFAULT '',
       expected_amount REAL NOT NULL,
       currency TEXT NOT NULL DEFAULT 'NGN',
+      lecturer_share_bps INTEGER NOT NULL DEFAULT 10000,
       due_date TEXT,
       available_until TEXT,
       availability_days INTEGER,
       target_department TEXT NOT NULL DEFAULT 'all',
       created_by TEXT NOT NULL,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  await run(`
+    CREATE TABLE IF NOT EXISTS lecturer_payout_accounts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      lecturer_username TEXT NOT NULL UNIQUE,
+      bank_name TEXT NOT NULL,
+      bank_code TEXT NOT NULL,
+      account_name TEXT NOT NULL,
+      account_last4 TEXT NOT NULL,
+      account_number_encrypted TEXT NOT NULL,
+      recipient_code TEXT NOT NULL UNIQUE,
+      recipient_type TEXT NOT NULL DEFAULT 'nuban',
+      recipient_status TEXT NOT NULL DEFAULT 'active',
+      auto_payout_enabled INTEGER NOT NULL DEFAULT 1,
+      review_required INTEGER NOT NULL DEFAULT 0,
+      last_provider_response_json TEXT NOT NULL DEFAULT '{}',
+      verified_at TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  await run(`
+    CREATE TABLE IF NOT EXISTS lecturer_payout_transfers (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      lecturer_username TEXT NOT NULL,
+      payout_account_id INTEGER NOT NULL,
+      transfer_reference TEXT NOT NULL UNIQUE,
+      transfer_code TEXT,
+      total_amount REAL NOT NULL,
+      currency TEXT NOT NULL DEFAULT 'NGN',
+      status TEXT NOT NULL DEFAULT 'queued',
+      trigger_source TEXT NOT NULL DEFAULT 'auto',
+      review_state TEXT NOT NULL DEFAULT 'not_required',
+      provider_response_json TEXT NOT NULL DEFAULT '{}',
+      failure_reason TEXT,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      ledger_count INTEGER NOT NULL DEFAULT 0,
+      requested_by TEXT,
+      reviewed_by TEXT,
+      reviewed_at TEXT,
+      dispatched_at TEXT,
+      completed_at TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (payout_account_id) REFERENCES lecturer_payout_accounts(id) ON UPDATE CASCADE ON DELETE CASCADE
+    )
+  `);
+
+  await run(`
+    CREATE TABLE IF NOT EXISTS lecturer_payout_ledger (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      lecturer_username TEXT NOT NULL,
+      payment_transaction_id INTEGER NOT NULL UNIQUE,
+      payment_item_id INTEGER NOT NULL,
+      obligation_id INTEGER,
+      gross_amount REAL NOT NULL,
+      share_bps INTEGER NOT NULL DEFAULT 10000,
+      payout_amount REAL NOT NULL,
+      currency TEXT NOT NULL DEFAULT 'NGN',
+      status TEXT NOT NULL DEFAULT 'available',
+      available_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      payout_transfer_id INTEGER,
+      review_reason TEXT,
+      source_status TEXT NOT NULL DEFAULT 'approved',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (payment_transaction_id) REFERENCES payment_transactions(id) ON UPDATE CASCADE ON DELETE CASCADE,
+      FOREIGN KEY (payment_item_id) REFERENCES payment_items(id) ON UPDATE CASCADE ON DELETE CASCADE,
+      FOREIGN KEY (obligation_id) REFERENCES payment_obligations(id) ON UPDATE CASCADE ON DELETE SET NULL,
+      FOREIGN KEY (payout_transfer_id) REFERENCES lecturer_payout_transfers(id) ON UPDATE CASCADE ON DELETE SET NULL
+    )
+  `);
+
+  await run(`
+    CREATE TABLE IF NOT EXISTS lecturer_payout_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      transfer_id INTEGER,
+      ledger_id INTEGER,
+      actor_username TEXT NOT NULL,
+      actor_role TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      note TEXT,
+      payload_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (transfer_id) REFERENCES lecturer_payout_transfers(id) ON UPDATE CASCADE ON DELETE CASCADE,
+      FOREIGN KEY (ledger_id) REFERENCES lecturer_payout_ledger(id) ON UPDATE CASCADE ON DELETE SET NULL
     )
   `);
 
@@ -2292,6 +2576,15 @@ async function initDatabase() {
   await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_reconciliation_exceptions_status ON reconciliation_exceptions(status)");
   await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_reconciliation_events_tx ON reconciliation_events(transaction_id)");
   await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_audit_events_entity ON audit_events(entity_type, entity_id)");
+  await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_lecturer_payout_accounts_lecturer ON lecturer_payout_accounts(lecturer_username)");
+  await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_lecturer_payout_accounts_recipient ON lecturer_payout_accounts(recipient_code)");
+  await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_lecturer_payout_transfers_lecturer ON lecturer_payout_transfers(lecturer_username)");
+  await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_lecturer_payout_transfers_status ON lecturer_payout_transfers(status)");
+  await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_lecturer_payout_transfers_account ON lecturer_payout_transfers(payout_account_id)");
+  await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_lecturer_payout_ledger_lecturer ON lecturer_payout_ledger(lecturer_username)");
+  await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_lecturer_payout_ledger_status ON lecturer_payout_ledger(status)");
+  await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_lecturer_payout_ledger_item ON lecturer_payout_ledger(payment_item_id)");
+  await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_lecturer_payout_events_transfer ON lecturer_payout_events(transfer_id)");
   await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_notifications_payment_item ON notifications(related_payment_item_id)");
   await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_payment_items_created_by ON payment_items(created_by)");
   await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_payment_items_target_department ON payment_items(target_department)");
@@ -2416,6 +2709,9 @@ async function initDatabase() {
   }
   if (!paymentItemsColumns.some((column) => column.name === "currency")) {
     await run("ALTER TABLE payment_items ADD COLUMN currency TEXT NOT NULL DEFAULT 'NGN'");
+  }
+  if (!paymentItemsColumns.some((column) => column.name === "lecturer_share_bps")) {
+    await run("ALTER TABLE payment_items ADD COLUMN lecturer_share_bps INTEGER NOT NULL DEFAULT 10000");
   }
   if (!paymentItemsColumns.some((column) => column.name === "due_date")) {
     await run("ALTER TABLE payment_items ADD COLUMN due_date TEXT");
@@ -2573,11 +2869,22 @@ app.use(
   })
 );
 
-const sessionStore = new SQLiteStore({
-  db: "sessions.sqlite",
-  dir: dataDir,
-  concurrentDB: true,
-});
+let sessionStore;
+if (DATABASE_URL) {
+  const PgSessionStore = require("connect-pg-simple")(session);
+  sessionStore = new PgSessionStore({
+    conString: DATABASE_URL,
+    tableName: "sessions",
+    createTableIfMissing: true,
+  });
+} else {
+  const SQLiteStore = require("connect-sqlite3")(session);
+  sessionStore = new SQLiteStore({
+    db: "sessions.sqlite",
+    dir: dataDir,
+    concurrentDB: true,
+  });
+}
 
 app.use(
   session({
@@ -3901,7 +4208,7 @@ async function listMessageThreadSummariesForUser(username) {
         GROUP BY mp3.thread_id
       ) unread_rollup ON unread_rollup.thread_id = mt.id
       WHERE mp_self.username = ?
-      ORDER BY datetime(COALESCE(last_msg.created_at, mt.updated_at, mt.created_at)) DESC, mt.id DESC
+      ORDER BY CAST(COALESCE(last_msg.created_at, mt.updated_at, mt.created_at) AS timestamp) DESC, mt.id DESC
     `,
     [username, username]
   );
@@ -4260,11 +4567,11 @@ function buildReceiptQueueQuery(filters, limit = 100, options = {}) {
     params.push(filters.student);
   }
   if (filters.dateFrom && isValidIsoLikeDate(filters.dateFrom)) {
-    conditions.push("DATE(pr.submitted_at) >= DATE(?)");
+    conditions.push("CAST(pr.submitted_at AS date) >= CAST(? AS date)");
     params.push(filters.dateFrom);
   }
   if (filters.dateTo && isValidIsoLikeDate(filters.dateTo)) {
-    conditions.push("DATE(pr.submitted_at) <= DATE(?)");
+    conditions.push("CAST(pr.submitted_at AS date) <= CAST(? AS date)");
     params.push(filters.dateTo);
   }
   if (filters.paymentItemId) {
@@ -5288,6 +5595,1155 @@ async function resolvePendingPaystackReferenceRequestsByReference(reference, inp
   return updates;
 }
 
+async function getLecturerPayoutAccount(lecturerUsername) {
+  const username = normalizeIdentifier(lecturerUsername || "");
+  if (!username) {
+    return null;
+  }
+  return get("SELECT * FROM lecturer_payout_accounts WHERE lecturer_username = ? LIMIT 1", [username]);
+}
+
+async function getLecturerPayoutTransferById(id) {
+  const transferId = parseResourceId(id);
+  if (!transferId) {
+    return null;
+  }
+  return get("SELECT * FROM lecturer_payout_transfers WHERE id = ? LIMIT 1", [transferId]);
+}
+
+async function getLecturerPayoutTransferByReference(reference) {
+  const safeReference = sanitizeTransactionRef(reference || "");
+  if (!safeReference) {
+    return null;
+  }
+  return get(
+    `
+      SELECT *
+      FROM lecturer_payout_transfers
+      WHERE transfer_reference = ?
+         OR transfer_code = ?
+      ORDER BY id DESC
+      LIMIT 1
+    `,
+    [safeReference, safeReference]
+  );
+}
+
+async function getLecturerPayoutLedgerRows(options = {}) {
+  const lecturerUsername = normalizeIdentifier(options.lecturerUsername || "");
+  if (!lecturerUsername) {
+    return [];
+  }
+  const filters = ["lecturer_username = ?"];
+  const params = [lecturerUsername];
+  const status = String(options.status || "").trim().toLowerCase();
+  if (status) {
+    if (status.includes(",")) {
+      const statuses = status.split(",").map((entry) => normalizePayoutStatus(entry)).filter(Boolean);
+      if (statuses.length) {
+        filters.push(`status IN (${statuses.map(() => "?").join(", ")})`);
+        params.push(...statuses);
+      }
+    } else {
+      filters.push("status = ?");
+      params.push(normalizePayoutStatus(status));
+    }
+  }
+  const whereSql = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+  const limit = Number.isFinite(Number(options.limit)) ? Math.max(1, Math.min(Number(options.limit), 500)) : 200;
+  const offset = Number.isFinite(Number(options.offset)) ? Math.max(0, Number(options.offset)) : 0;
+  return all(
+    `
+      SELECT *
+      FROM lecturer_payout_ledger
+      ${whereSql}
+      ORDER BY CAST(available_at AS timestamp) ASC, id ASC
+      LIMIT ? OFFSET ?
+    `,
+    [...params, limit, offset]
+  );
+}
+
+async function getLecturerPayoutSummary(lecturerUsername) {
+  const username = normalizeIdentifier(lecturerUsername || "");
+  if (!username) {
+    return {
+      account: null,
+      summary: {
+        totalEarned: 0,
+        pendingBalance: 0,
+        availableBalance: 0,
+        reservedBalance: 0,
+        paidBalance: 0,
+        failedBalance: 0,
+        reviewBalance: 0,
+        ledgerCount: 0,
+        queuedTransferCount: 0,
+        processingTransferCount: 0,
+      },
+    };
+  }
+
+  const [account, aggregate, queued, processing, nextEntry, latestTransfers] = await Promise.all([
+    getLecturerPayoutAccount(username),
+    get(
+      `
+        SELECT
+          COALESCE(SUM(payout_amount), 0) AS total_earned,
+          COALESCE(SUM(CASE WHEN status IN ('available', 'reserved', 'review') THEN payout_amount ELSE 0 END), 0) AS pending_balance,
+          COALESCE(SUM(CASE WHEN status = 'available' THEN payout_amount ELSE 0 END), 0) AS available_balance,
+          COALESCE(SUM(CASE WHEN status = 'reserved' THEN payout_amount ELSE 0 END), 0) AS reserved_balance,
+          COALESCE(SUM(CASE WHEN status = 'paid' THEN payout_amount ELSE 0 END), 0) AS paid_balance,
+          COALESCE(SUM(CASE WHEN status IN ('failed', 'reversed') THEN payout_amount ELSE 0 END), 0) AS failed_balance,
+          COALESCE(SUM(CASE WHEN status = 'review' THEN payout_amount ELSE 0 END), 0) AS review_balance,
+          COUNT(*) AS ledger_count
+        FROM lecturer_payout_ledger
+        WHERE lecturer_username = ?
+      `,
+      [username]
+    ),
+    get(
+      `
+        SELECT COUNT(*) AS total
+        FROM lecturer_payout_transfers
+        WHERE lecturer_username = ?
+          AND status = 'queued'
+      `,
+      [username]
+    ),
+    get(
+      `
+        SELECT COUNT(*) AS total
+        FROM lecturer_payout_transfers
+        WHERE lecturer_username = ?
+          AND status = 'processing'
+      `,
+      [username]
+    ),
+    get(
+      `
+        SELECT available_at, payout_amount, status, review_reason
+        FROM lecturer_payout_ledger
+        WHERE lecturer_username = ?
+          AND status IN ('available', 'reserved', 'review')
+        ORDER BY CAST(available_at AS timestamp) ASC, id ASC
+        LIMIT 1
+      `,
+      [username]
+    ),
+    all(
+      `
+        SELECT *
+        FROM lecturer_payout_transfers
+        WHERE lecturer_username = ?
+        ORDER BY CAST(created_at AS timestamp) DESC, id DESC
+        LIMIT 5
+      `,
+      [username]
+    ),
+  ]);
+
+  return {
+    account: summarizePayoutAccountRow(account),
+    summary: {
+      totalEarned: roundCurrencyAmount(aggregate?.total_earned || 0),
+      pendingBalance: roundCurrencyAmount(aggregate?.pending_balance || 0),
+      availableBalance: roundCurrencyAmount(aggregate?.available_balance || 0),
+      reservedBalance: roundCurrencyAmount(aggregate?.reserved_balance || 0),
+      paidBalance: roundCurrencyAmount(aggregate?.paid_balance || 0),
+      failedBalance: roundCurrencyAmount(aggregate?.failed_balance || 0),
+      reviewBalance: roundCurrencyAmount(aggregate?.review_balance || 0),
+      ledgerCount: Number(aggregate?.ledger_count || 0),
+      queuedTransferCount: Number(queued?.total || 0),
+      processingTransferCount: Number(processing?.total || 0),
+      nextAvailableAt: nextEntry?.available_at || null,
+      nextAvailableAmount: roundCurrencyAmount(nextEntry?.payout_amount || 0),
+      nextAvailableStatus: nextEntry?.status || null,
+      latestTransfers: latestTransfers.map(summarizePayoutTransferRow),
+    },
+  };
+}
+
+function buildPayoutProviderResponseSnapshot(payload = {}) {
+  const data = payload && typeof payload === "object" && !Array.isArray(payload) ? payload.data || payload : {};
+  return {
+    status: payload?.status === false ? false : true,
+    message: String(payload?.message || "").slice(0, 200),
+    data: {
+      recipient_code: data?.recipient_code || data?.transfer_code || null,
+      transfer_code: data?.transfer_code || null,
+      status: data?.status || null,
+      currency: data?.currency || null,
+      amount: data?.amount || null,
+      bank_name: data?.details?.bank_name || null,
+      account_name: data?.details?.account_name || null,
+      recipient_type: data?.type || null,
+      active: typeof data?.active === "boolean" ? data.active : null,
+    },
+  };
+}
+
+async function logLecturerPayoutEvent({
+  transferId = null,
+  ledgerId = null,
+  req = null,
+  eventType = "event",
+  note = "",
+  payload = {},
+}) {
+  const actorUsername = req?.session?.user?.username || "system-payout";
+  const actorRole = req?.session?.user?.role || "system-payout";
+  const safeEventType = String(eventType || "event").slice(0, 80);
+  const safeNote = String(note || "").slice(0, 500);
+  const safePayload = payload && typeof payload === "object" && !Array.isArray(payload) ? payload : {};
+  await run(
+    `
+      INSERT INTO lecturer_payout_events (
+        transfer_id,
+        ledger_id,
+        actor_username,
+        actor_role,
+        event_type,
+        note,
+        payload_json
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `,
+    [transferId || null, ledgerId || null, actorUsername, actorRole, safeEventType, safeNote, JSON.stringify(safePayload)]
+  );
+  await run(
+    `
+      INSERT INTO audit_logs (
+        actor_username,
+        actor_role,
+        action,
+        content_type,
+        content_id,
+        target_owner,
+        summary
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `,
+    [
+      actorUsername,
+      actorRole,
+      safeEventType,
+      "lecturer_payout",
+      transferId || ledgerId || null,
+      payload?.lecturer_username || null,
+      safeNote || safeEventType,
+    ]
+  );
+}
+
+async function promotePendingLedgerRowsAfterAccountSave(lecturerUsername) {
+  const username = normalizeIdentifier(lecturerUsername || "");
+  if (!username) {
+    return 0;
+  }
+  const result = await run(
+    `
+      UPDATE lecturer_payout_ledger
+      SET status = 'available',
+          review_reason = NULL,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE lecturer_username = ?
+        AND status = 'review'
+        AND review_reason IN ('missing_payout_account', 'missing_recipient')
+    `,
+    [username]
+  );
+  const changes = Number(result?.changes || 0);
+  if (changes > 0) {
+    await queueLecturerPayoutDispatch(`payout-account-${username}`, async () =>
+      processLecturerPayoutQueue({
+        req: createSystemActorRequest("system-payout", "system-payout"),
+        triggerSource: "account-linked",
+      })
+    );
+  }
+  return changes;
+}
+
+async function createLecturerPayoutLedgerForApprovedTransaction(transactionId, options = {}) {
+  const id = parseResourceId(transactionId);
+  if (!id) {
+    return null;
+  }
+  const tx = await get(
+    `
+      SELECT
+        pt.*,
+        po.student_username,
+        po.payment_item_id,
+        po.expected_amount,
+        po.payment_reference,
+        pi.title AS payment_item_title,
+        pi.currency,
+        pi.created_by AS payment_item_owner,
+        COALESCE(pi.lecturer_share_bps, ${PAYOUT_DEFAULT_SHARE_BPS}) AS lecturer_share_bps
+      FROM payment_transactions pt
+      LEFT JOIN payment_obligations po ON po.id = pt.matched_obligation_id
+      LEFT JOIN payment_items pi ON pi.id = po.payment_item_id
+      WHERE pt.id = ?
+      LIMIT 1
+    `,
+    [id]
+  );
+  if (!tx || String(tx.status || "").toLowerCase() !== "approved") {
+    return null;
+  }
+  const paymentItemId = parseResourceId(tx.payment_item_id);
+  const lecturerUsername = normalizeIdentifier(tx.payment_item_owner || "");
+  if (!paymentItemId || !lecturerUsername) {
+    return null;
+  }
+  const existing = await get("SELECT * FROM lecturer_payout_ledger WHERE payment_transaction_id = ? LIMIT 1", [id]);
+  if (existing) {
+    return summarizePayoutLedgerRow(existing);
+  }
+
+  const grossAmount = roundCurrencyAmount(tx.amount || 0);
+  const shareBps = Number.isFinite(Number(tx.lecturer_share_bps)) ? Number(tx.lecturer_share_bps) : PAYOUT_DEFAULT_SHARE_BPS;
+  const payoutAmount = roundCurrencyAmount((grossAmount * Math.max(0, Math.min(10000, shareBps))) / 10000);
+  if (payoutAmount <= 0) {
+    return null;
+  }
+
+  const account = await getLecturerPayoutAccount(lecturerUsername);
+  const status = account && Number(account.review_required || 0) !== 1 && String(account.recipient_code || "").trim() ? "available" : "review";
+  const reviewReason = status === "available" ? null : account ? "payout_account_review_required" : "missing_payout_account";
+  const availableAt = new Date().toISOString();
+
+  await run(
+    `
+      INSERT INTO lecturer_payout_ledger (
+        lecturer_username,
+        payment_transaction_id,
+        payment_item_id,
+        obligation_id,
+        gross_amount,
+        share_bps,
+        payout_amount,
+        currency,
+        status,
+        available_at,
+        review_reason,
+        source_status,
+        created_at,
+        updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+    `,
+    [
+      lecturerUsername,
+      id,
+      paymentItemId,
+      parseResourceId(tx.matched_obligation_id) || null,
+      grossAmount,
+      shareBps,
+      payoutAmount,
+      String(tx.currency || "NGN").toUpperCase(),
+      status,
+      availableAt,
+      reviewReason,
+      "approved",
+    ]
+  );
+  const ledger = await get("SELECT * FROM lecturer_payout_ledger WHERE payment_transaction_id = ? LIMIT 1", [id]);
+  await logLecturerPayoutEvent({
+    ledgerId: ledger?.id || null,
+    req: options.req || createSystemActorRequest("system-payout", "system-payout"),
+    eventType: "payout_ledger_created",
+    note: status === "available" ? "Ledger entry created and available for payout." : "Ledger entry created but queued for review.",
+    payload: {
+      lecturer_username: lecturerUsername,
+      payment_transaction_id: id,
+      payout_amount: payoutAmount,
+      status,
+      review_reason: reviewReason,
+    },
+  });
+  if (ledger && status === "available") {
+    await queueLecturerPayoutDispatch(`payout-ledger-${ledger.id}`, async () =>
+      processLecturerPayoutQueue({
+        req: options.req || createSystemActorRequest("system-payout", "system-payout"),
+        triggerSource: "approved-status",
+      })
+    );
+  }
+  return summarizePayoutLedgerRow(ledger);
+}
+
+async function getActiveLecturerPayoutTransfer(lecturerUsername) {
+  const username = normalizeIdentifier(lecturerUsername || "");
+  if (!username) {
+    return null;
+  }
+  return get(
+    `
+      SELECT *
+      FROM lecturer_payout_transfers
+      WHERE lecturer_username = ?
+        AND status IN ('queued', 'processing')
+      ORDER BY id DESC
+      LIMIT 1
+    `,
+    [username]
+  );
+}
+
+async function reserveLecturerPayoutBatch(lecturerUsername, options = {}) {
+  const username = normalizeIdentifier(lecturerUsername || "");
+  if (!username) {
+    throw { status: 400, error: "Lecturer account is required." };
+  }
+  if (!PAYOUT_ENCRYPTION_KEY) {
+    throw { status: 503, error: "Payout encryption is not configured on this server." };
+  }
+  if (!paystackTransferClient.hasSecretKey) {
+    throw { status: 503, error: "Paystack transfers are not configured on this server." };
+  }
+
+  const account = await getLecturerPayoutAccount(username);
+  if (!account) {
+    throw { status: 409, error: "Link a payout bank account before requesting a payout." };
+  }
+  if (Number(account.review_required || 0) === 1) {
+    throw { status: 409, error: "This payout account is under review." };
+  }
+  if (String(account.recipient_status || "").toLowerCase() !== "active" || !String(account.recipient_code || "").trim()) {
+    throw { status: 409, error: "This payout account is not active yet." };
+  }
+
+  const activeTransfer = await getActiveLecturerPayoutTransfer(username);
+  if (activeTransfer) {
+    return {
+      activeTransfer: summarizePayoutTransferRow(activeTransfer),
+      alreadyQueued: true,
+    };
+  }
+
+  const availableRows = await all(
+    `
+      SELECT *
+      FROM lecturer_payout_ledger
+      WHERE lecturer_username = ?
+        AND status = 'available'
+      ORDER BY CAST(available_at AS timestamp) ASC, id ASC
+    `,
+    [username]
+  );
+  if (!availableRows.length) {
+    throw { status: 409, error: "No available payout balance was found." };
+  }
+
+  const totalAvailable = availableRows.reduce((sum, row) => sum + roundCurrencyAmount(row.payout_amount || 0), 0);
+  const requestedAmountRaw = String(options.amount ?? "").trim();
+  const requestedAmount = requestedAmountRaw ? roundCurrencyAmount(requestedAmountRaw) : roundCurrencyAmount(totalAvailable);
+  if (!Number.isFinite(requestedAmount) || requestedAmount <= 0) {
+    throw { status: 400, error: "Payout amount must be greater than zero." };
+  }
+  if (Math.abs(requestedAmount - totalAvailable) > 0.01) {
+    throw { status: 400, error: "Partial payouts are not supported yet. Request the full available balance." };
+  }
+  if (requestedAmount < PAYOUT_MINIMUM_AMOUNT) {
+    throw { status: 400, error: `Payout amount must be at least ${PAYOUT_MINIMUM_AMOUNT.toFixed(2)}.` };
+  }
+
+  const transferReference = buildLecturerPayoutTransferReference(username, availableRows.map((row) => Number(row.id || 0)).slice(0, 6));
+  const triggerSource = String(options.triggerSource || "auto")
+    .trim()
+    .toLowerCase()
+    .slice(0, 40) || "auto";
+  const requestedBy = String(options.requestedBy || username)
+    .trim()
+    .slice(0, 80) || username;
+
+  await withSqlTransaction(async () => {
+    await run(
+      `
+        INSERT INTO lecturer_payout_transfers (
+          lecturer_username,
+          payout_account_id,
+          transfer_reference,
+          total_amount,
+          currency,
+          status,
+          trigger_source,
+          review_state,
+          ledger_count,
+          requested_by,
+          created_at,
+          updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      `,
+      [
+        username,
+        Number(account.id || 0),
+        transferReference,
+        requestedAmount,
+        String(availableRows[0]?.currency || "NGN").toUpperCase(),
+        triggerSource,
+        Number(account.review_required || 0) === 1 ? "required" : "not_required",
+        availableRows.length,
+        requestedBy,
+      ]
+    );
+    const transfer = await get("SELECT * FROM lecturer_payout_transfers WHERE transfer_reference = ? LIMIT 1", [transferReference]);
+    for (const ledgerRow of availableRows) {
+      await run(
+        `
+          UPDATE lecturer_payout_ledger
+          SET status = 'reserved',
+              payout_transfer_id = ?,
+              updated_at = CURRENT_TIMESTAMP
+          WHERE id = ?
+        `,
+        [transfer?.id || null, ledgerRow.id]
+      );
+    }
+    await logLecturerPayoutEvent({
+      transferId: transfer?.id || null,
+      req: options.req || createSystemActorRequest("system-payout", "system-payout"),
+      eventType: "payout_transfer_queued",
+      note: `Queued payout transfer for ${username}.`,
+      payload: {
+        lecturer_username: username,
+        transfer_reference: transferReference,
+        total_amount: requestedAmount,
+        ledger_count: availableRows.length,
+        trigger_source: triggerSource,
+      },
+    });
+  });
+
+  const transfer = await getLecturerPayoutTransferByReference(transferReference);
+  return {
+    activeTransfer: summarizePayoutTransferRow(transfer),
+    alreadyQueued: false,
+  };
+}
+
+async function settleLecturerPayoutTransferByReference(reference, outcome, payload = {}, options = {}) {
+  const transfer = await getLecturerPayoutTransferByReference(reference);
+  if (!transfer) {
+    return null;
+  }
+  const safeOutcome = normalizePayoutStatus(outcome);
+  const note = String(payload?.reason || payload?.message || "").trim().slice(0, 500);
+  const payloadSnapshot = buildPayoutProviderResponseSnapshot(payload);
+  const now = new Date().toISOString();
+
+  await withSqlTransaction(async () => {
+    const current = await get("SELECT * FROM lecturer_payout_transfers WHERE id = ? LIMIT 1", [transfer.id]);
+    if (!current) {
+      return;
+    }
+    if (safeOutcome === "success") {
+      await run(
+        `
+          UPDATE lecturer_payout_transfers
+          SET status = 'success',
+              transfer_code = COALESCE(?, transfer_code),
+              provider_response_json = ?,
+              failure_reason = NULL,
+              completed_at = COALESCE(completed_at, ?),
+              updated_at = CURRENT_TIMESTAMP
+          WHERE id = ?
+        `,
+        [payload?.transfer_code || null, JSON.stringify(payloadSnapshot), now, current.id]
+      );
+      await run(
+        `
+          UPDATE lecturer_payout_ledger
+          SET status = 'paid',
+              review_reason = NULL,
+              updated_at = CURRENT_TIMESTAMP
+          WHERE payout_transfer_id = ?
+        `,
+        [current.id]
+      );
+      await logLecturerPayoutEvent({
+        transferId: current.id,
+        req: options.req || createSystemActorRequest("system-payout", "system-payout"),
+        eventType: "payout_transfer_success",
+        note: `Payout transfer ${current.transfer_reference} completed successfully.`,
+        payload: {
+          lecturer_username: current.lecturer_username,
+          transfer_reference: current.transfer_reference,
+          transfer_code: payload?.transfer_code || null,
+          outcome: safeOutcome,
+        },
+      });
+      return;
+    }
+
+    if (safeOutcome === "failed" || safeOutcome === "reversed") {
+      await run(
+        `
+          UPDATE lecturer_payout_transfers
+          SET status = ?,
+              transfer_code = COALESCE(?, transfer_code),
+              provider_response_json = ?,
+              failure_reason = ?,
+              completed_at = COALESCE(completed_at, ?),
+              updated_at = CURRENT_TIMESTAMP
+          WHERE id = ?
+        `,
+        [safeOutcome, payload?.transfer_code || null, JSON.stringify(payloadSnapshot), note || safeOutcome, now, current.id]
+      );
+      await run(
+        `
+          UPDATE lecturer_payout_ledger
+          SET status = 'review',
+              review_reason = ?,
+              updated_at = CURRENT_TIMESTAMP
+          WHERE payout_transfer_id = ?
+        `,
+        [note || safeOutcome, current.id]
+      );
+      await logLecturerPayoutEvent({
+        transferId: current.id,
+        req: options.req || createSystemActorRequest("system-payout", "system-payout"),
+        eventType: `payout_transfer_${safeOutcome}`,
+        note: `Payout transfer ${current.transfer_reference} ${safeOutcome}.`,
+        payload: {
+          lecturer_username: current.lecturer_username,
+          transfer_reference: current.transfer_reference,
+          transfer_code: payload?.transfer_code || null,
+          outcome: safeOutcome,
+          failure_reason: note || safeOutcome,
+        },
+      });
+      return;
+    }
+
+    if (safeOutcome === "review") {
+      await run(
+        `
+          UPDATE lecturer_payout_transfers
+          SET status = 'review',
+              review_state = 'required',
+              provider_response_json = ?,
+              failure_reason = ?,
+              updated_at = CURRENT_TIMESTAMP
+          WHERE id = ?
+        `,
+        [JSON.stringify(payloadSnapshot), note || "review_required", current.id]
+      );
+      await run(
+        `
+          UPDATE lecturer_payout_ledger
+          SET status = 'review',
+              review_reason = ?,
+              updated_at = CURRENT_TIMESTAMP
+          WHERE payout_transfer_id = ?
+        `,
+        [note || "review_required", current.id]
+      );
+      await logLecturerPayoutEvent({
+        transferId: current.id,
+        req: options.req || createSystemActorRequest("system-payout", "system-payout"),
+        eventType: "payout_transfer_review",
+        note: `Payout transfer ${current.transfer_reference} flagged for review.`,
+        payload: {
+          lecturer_username: current.lecturer_username,
+          transfer_reference: current.transfer_reference,
+          outcome: safeOutcome,
+          reason: note || "review_required",
+        },
+      });
+    }
+  });
+
+  return getLecturerPayoutTransferByReference(reference);
+}
+
+async function dispatchQueuedLecturerPayoutTransfer(transferId, options = {}) {
+  const transfer = await getLecturerPayoutTransferById(transferId);
+  if (!transfer) {
+    return null;
+  }
+  const account = await get("SELECT * FROM lecturer_payout_accounts WHERE id = ? LIMIT 1", [transfer.payout_account_id]);
+  if (!account) {
+    await settleLecturerPayoutTransferByReference(transfer.transfer_reference, "review", {
+      reason: "missing_payout_account",
+      message: "Linked payout account is missing.",
+    });
+    return getLecturerPayoutTransferById(transferId);
+  }
+  if (Number(account.review_required || 0) === 1 || String(account.recipient_status || "").toLowerCase() !== "active") {
+    await settleLecturerPayoutTransferByReference(transfer.transfer_reference, "review", {
+      reason: "payout_account_review_required",
+      message: "Linked payout account requires review.",
+    });
+    return getLecturerPayoutTransferById(transferId);
+  }
+
+  const amountKobo = amountToKobo(transfer.total_amount);
+  if (!amountKobo || amountKobo <= 0) {
+    await settleLecturerPayoutTransferByReference(transfer.transfer_reference, "review", {
+      reason: "invalid_payout_amount",
+      message: "Payout amount is invalid.",
+    });
+    return getLecturerPayoutTransferById(transferId);
+  }
+
+  const reason = `Lecturer payout for ${transfer.lecturer_username}`;
+  let providerPayload = null;
+  try {
+    providerPayload = await paystackTransferClient.initiateTransfer({
+      source: "balance",
+      amount: amountKobo,
+      recipient: account.recipient_code,
+      reference: transfer.transfer_reference,
+      reason,
+    });
+  } catch (err) {
+    const normalizedError = normalizePaystackError(err, "paystack_transfer_failed");
+    const failureStatus = normalizedError.status >= 500 ? "queued" : "review";
+    await run(
+      `
+        UPDATE lecturer_payout_transfers
+        SET status = ?,
+            review_state = ?,
+            attempt_count = attempt_count + 1,
+            failure_reason = ?,
+            provider_response_json = ?,
+            updated_at = CURRENT_TIMESTAMP,
+            dispatched_at = COALESCE(dispatched_at, CURRENT_TIMESTAMP)
+        WHERE id = ?
+      `,
+      [
+        failureStatus,
+        failureStatus === "queued" ? "not_required" : "required",
+        normalizedError.message,
+        JSON.stringify({ error: normalizedError.message, code: normalizedError.code, status: normalizedError.status }),
+        transfer.id,
+      ]
+    );
+    if (failureStatus === "review") {
+      await run(
+        `
+          UPDATE lecturer_payout_ledger
+          SET status = 'review',
+              review_reason = ?,
+              updated_at = CURRENT_TIMESTAMP
+          WHERE payout_transfer_id = ?
+        `,
+        [normalizedError.message, transfer.id]
+      );
+    }
+    await logLecturerPayoutEvent({
+      transferId: transfer.id,
+      req: options.req || createSystemActorRequest("system-payout", "system-payout"),
+      eventType: "payout_transfer_dispatch_failed",
+      note: normalizedError.message,
+      payload: {
+        lecturer_username: transfer.lecturer_username,
+        transfer_reference: transfer.transfer_reference,
+        error: normalizedError.message,
+        code: normalizedError.code,
+        status: normalizedError.status,
+      },
+    });
+    return getLecturerPayoutTransferById(transferId);
+  }
+
+  const providerSnapshot = buildPayoutProviderResponseSnapshot(providerPayload);
+  const providerData = providerPayload?.data || {};
+  const providerStatus = String(providerData.status || "").trim().toLowerCase();
+  const transferCode = String(providerData.transfer_code || providerData.reference || providerData.id || "").trim() || null;
+  const isFinalSuccess = providerStatus === "success";
+  const isReviewRequired = ["failed", "reversed", "blocked", "rejected", "abandoned", "otp"].includes(providerStatus);
+
+  await run(
+    `
+      UPDATE lecturer_payout_transfers
+      SET status = ?,
+          transfer_code = COALESCE(?, transfer_code),
+          provider_response_json = ?,
+          attempt_count = attempt_count + 1,
+          dispatched_at = COALESCE(dispatched_at, CURRENT_TIMESTAMP),
+          review_state = ?,
+          failure_reason = ?,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `,
+    [
+      isFinalSuccess ? "success" : isReviewRequired ? "review" : "processing",
+      transferCode,
+      JSON.stringify(providerSnapshot),
+      isReviewRequired ? "required" : "not_required",
+      isReviewRequired ? String(providerData.message || providerData.reason || "transfer_review_required").slice(0, 500) : null,
+      transfer.id,
+    ]
+  );
+
+  if (isFinalSuccess) {
+    await run(
+      `
+        UPDATE lecturer_payout_ledger
+        SET status = 'paid',
+            review_reason = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE payout_transfer_id = ?
+      `,
+      [transfer.id]
+    );
+    await run(
+      `
+        UPDATE lecturer_payout_transfers
+        SET completed_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+      `,
+      [transfer.id]
+    );
+    await logLecturerPayoutEvent({
+      transferId: transfer.id,
+      req: options.req || createSystemActorRequest("system-payout", "system-payout"),
+      eventType: "payout_transfer_success",
+      note: `Transfer ${transfer.transfer_reference} completed successfully.`,
+      payload: {
+        lecturer_username: transfer.lecturer_username,
+        transfer_reference: transfer.transfer_reference,
+        transfer_code: transferCode,
+      },
+    });
+  } else if (isReviewRequired) {
+    await run(
+      `
+        UPDATE lecturer_payout_ledger
+        SET status = 'review',
+            review_reason = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE payout_transfer_id = ?
+      `,
+      [String(providerData.message || providerData.reason || "transfer_review_required").slice(0, 500), transfer.id]
+    );
+    await logLecturerPayoutEvent({
+      transferId: transfer.id,
+      req: options.req || createSystemActorRequest("system-payout", "system-payout"),
+      eventType: "payout_transfer_review",
+      note: `Transfer ${transfer.transfer_reference} requires review.`,
+      payload: {
+        lecturer_username: transfer.lecturer_username,
+        transfer_reference: transfer.transfer_reference,
+        transfer_code: transferCode,
+        provider_status: providerStatus || null,
+      },
+    });
+  } else {
+    await logLecturerPayoutEvent({
+      transferId: transfer.id,
+      req: options.req || createSystemActorRequest("system-payout", "system-payout"),
+      eventType: "payout_transfer_processing",
+      note: `Transfer ${transfer.transfer_reference} is processing.`,
+      payload: {
+        lecturer_username: transfer.lecturer_username,
+        transfer_reference: transfer.transfer_reference,
+        transfer_code: transferCode,
+        provider_status: providerStatus || null,
+      },
+    });
+  }
+
+  return getLecturerPayoutTransferById(transferId);
+}
+
+async function queueLecturerPayoutDispatch(taskKey, taskFactory) {
+  const dispatchKey = String(taskKey || "").trim() || `payout-${Date.now()}`;
+  const existing = lecturerPayoutDispatchInflight.get(dispatchKey);
+  if (existing) {
+    return existing;
+  }
+
+  const scheduled = lecturerPayoutDispatchQueue
+    .catch(() => undefined)
+    .then(async () => taskFactory());
+
+  lecturerPayoutDispatchQueue = scheduled.catch(() => undefined);
+
+  const tracked = scheduled.finally(() => {
+    if (lecturerPayoutDispatchInflight.get(dispatchKey) === tracked) {
+      lecturerPayoutDispatchInflight.delete(dispatchKey);
+    }
+  });
+
+  lecturerPayoutDispatchInflight.set(dispatchKey, tracked);
+  return tracked;
+}
+
+async function processLecturerPayoutQueue(options = {}) {
+  if (!PAYOUT_ENCRYPTION_KEY || !paystackTransferClient.hasSecretKey) {
+    return { queued: 0, created: 0 };
+  }
+
+  let created = 0;
+  let dispatched = 0;
+
+  const queuedTransfers = await all(
+    `
+      SELECT id
+      FROM lecturer_payout_transfers
+      WHERE status = 'queued'
+        ORDER BY CAST(created_at AS timestamp) ASC, id ASC
+      LIMIT 25
+    `
+  );
+  for (const row of queuedTransfers) {
+    const transfer = await queueLecturerPayoutDispatch(`transfer-${row.id}`, async () =>
+      dispatchQueuedLecturerPayoutTransfer(row.id, { req: options.req || createSystemActorRequest("system-payout", "system-payout") })
+    );
+    if (transfer) {
+      dispatched += 1;
+    }
+  }
+
+  const eligibleLecturers = await all(
+    `
+      SELECT
+        lpl.lecturer_username,
+        SUM(CASE WHEN lpl.status = 'available' THEN lpl.payout_amount ELSE 0 END) AS available_balance
+      FROM lecturer_payout_ledger lpl
+      LEFT JOIN lecturer_payout_accounts lpa ON lpa.lecturer_username = lpl.lecturer_username
+      WHERE lpl.status = 'available'
+        AND COALESCE(lpa.auto_payout_enabled, 1) = 1
+        AND COALESCE(lpa.review_required, 0) = 0
+        AND lpl.payout_transfer_id IS NULL
+      GROUP BY lpl.lecturer_username
+      HAVING available_balance >= ?
+      ORDER BY lpl.lecturer_username ASC
+      LIMIT 25
+    `,
+    [PAYOUT_MINIMUM_AMOUNT]
+  );
+
+  for (const row of eligibleLecturers) {
+    const username = normalizeIdentifier(row.lecturer_username || "");
+    if (!username) {
+      continue;
+    }
+    const account = await getLecturerPayoutAccount(username);
+    if (!account) {
+      continue;
+    }
+    try {
+      const batch = await reserveLecturerPayoutBatch(username, {
+        triggerSource: options.triggerSource || "auto",
+        requestedBy: options.requestedBy || "system-payout",
+        req: options.req || createSystemActorRequest("system-payout", "system-payout"),
+      });
+      if (batch && batch.activeTransfer) {
+        created += 1;
+        await queueLecturerPayoutDispatch(`transfer-${batch.activeTransfer.id}`, async () =>
+          dispatchQueuedLecturerPayoutTransfer(batch.activeTransfer.id, {
+            req: options.req || createSystemActorRequest("system-payout", "system-payout"),
+          })
+        );
+      }
+    } catch (_err) {
+      // Leave the balance untouched if a batch cannot be created.
+    }
+  }
+
+  return { queued: dispatched, created };
+}
+
+async function getLecturerPayoutTransfers(options = {}) {
+  const lecturerUsername = normalizeIdentifier(options.lecturerUsername || "");
+  const filters = [];
+  const params = [];
+  if (lecturerUsername) {
+    filters.push("lpt.lecturer_username = ?");
+    params.push(lecturerUsername);
+  }
+  const status = String(options.status || "").trim().toLowerCase();
+  if (status) {
+    filters.push("lpt.status = ?");
+    params.push(normalizePayoutStatus(status));
+  }
+  const whereSql = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+  const limit = Number.isFinite(Number(options.limit)) ? Math.max(1, Math.min(Number(options.limit), 200)) : 50;
+  const offset = Number.isFinite(Number(options.offset)) ? Math.max(0, Number(options.offset)) : 0;
+  const rows = await all(
+    `
+      SELECT
+        lpt.*,
+        lpa.bank_name,
+        lpa.account_name,
+        lpa.account_last4,
+        lpa.recipient_status,
+        lpa.auto_payout_enabled,
+        lpa.review_required
+      FROM lecturer_payout_transfers lpt
+      LEFT JOIN lecturer_payout_accounts lpa ON lpa.id = lpt.payout_account_id
+      ${whereSql}
+        ORDER BY CAST(lpt.created_at AS timestamp) DESC, lpt.id DESC
+      LIMIT ? OFFSET ?
+    `,
+    [...params, limit, offset]
+  );
+  return rows.map((row) => ({
+    ...summarizePayoutTransferRow(row),
+    payout_account: {
+      bank_name: String(row.bank_name || ""),
+      account_name: String(row.account_name || ""),
+      account_last4: String(row.account_last4 || ""),
+      account_masked: maskBankAccountNumber(row.account_last4 || ""),
+      recipient_status: String(row.recipient_status || "active"),
+      auto_payout_enabled: Number(row.auto_payout_enabled || 0) === 1,
+      review_required: Number(row.review_required || 0) === 1,
+    },
+  }));
+}
+
+async function updateLecturerPayoutAccount(lecturerUsername, input = {}, options = {}) {
+  const username = normalizeIdentifier(lecturerUsername || "");
+  if (!username) {
+    throw { status: 400, error: "Lecturer account is required." };
+  }
+  if (!PAYOUT_ENCRYPTION_KEY) {
+    throw { status: 503, error: "Payout encryption is not configured on this server." };
+  }
+  if (!paystackTransferClient.hasSecretKey) {
+    throw { status: 503, error: "Paystack transfers are not configured on this server." };
+  }
+
+  const bankCode = normalizeBankCode(input.bankCode || input.bank_code || "");
+  const bankName = String(input.bankName || input.bank_name || "").trim().slice(0, 80);
+  const accountName = String(input.accountName || input.account_name || "").trim().slice(0, 100);
+  const accountNumber = normalizeBankAccountNumber(input.accountNumber || input.account_number || "");
+  const autoPayoutEnabled = input.autoPayoutEnabled ?? input.auto_payout_enabled;
+  const reviewRequired = input.reviewRequired ?? input.review_required;
+  const existingAccount = await getLecturerPayoutAccount(username);
+  const hasBankInput = !!(bankCode || bankName || accountName || accountNumber);
+
+  let responseBankName = String(existingAccount?.bank_name || "").trim();
+  let responseAccountName = String(existingAccount?.account_name || "").trim();
+  let recipientCode = String(existingAccount?.recipient_code || "").trim();
+  let recipientType = String(existingAccount?.recipient_type || "nuban");
+  let recipientStatus = String(existingAccount?.recipient_status || "active");
+  let encryptedAccountNumber = String(existingAccount?.account_number_encrypted || "").trim();
+  let last4 = String(existingAccount?.account_last4 || "").trim();
+  let responseSnapshot = buildPayoutProviderResponseSnapshot(
+    existingAccount?.last_provider_response_json ? parseJsonObject(existingAccount.last_provider_response_json, {}) : {}
+  );
+
+  if (hasBankInput) {
+    if (!bankCode || !/^[0-9A-Z]{2,10}$/.test(bankCode)) {
+      throw { status: 400, error: "Enter a valid bank code." };
+    }
+    if (!accountName || accountName.length < 2) {
+      throw { status: 400, error: "Account name is required." };
+    }
+    if (!/^\d{10}$/.test(accountNumber)) {
+      throw { status: 400, error: "Account number must be exactly 10 digits." };
+    }
+
+    const recipientPayload = await paystackTransferClient.createTransferRecipient({
+      type: "nuban",
+      name: accountName,
+      account_number: accountNumber,
+      bank_code: bankCode,
+      currency: "NGN",
+      description: `Lecturer payout account for ${username}`,
+      metadata: {
+        lecturer_username: username,
+        actor: options.req?.session?.user?.username || username,
+      },
+    });
+    const recipientData = recipientPayload?.data || {};
+    recipientCode = String(recipientData.recipient_code || "").trim();
+    if (!recipientCode) {
+      throw { status: 502, error: "Paystack did not return a recipient code." };
+    }
+    responseBankName = String(recipientData?.details?.bank_name || recipientData.bank_name || bankName || "").trim();
+    responseAccountName = String(recipientData?.details?.account_name || accountName || "").trim();
+    recipientType = String(recipientData.type || "nuban");
+    recipientStatus = String(recipientData.active === false ? "inactive" : "active");
+    last4 = accountNumber.slice(-4);
+    encryptedAccountNumber = encryptPayoutValue(accountNumber);
+    responseSnapshot = buildPayoutProviderResponseSnapshot(recipientPayload);
+  } else if (!existingAccount) {
+    throw { status: 400, error: "Bank details are required before a payout account can be saved." };
+  }
+
+  const nextAutoPayoutEnabled = Number(autoPayoutEnabled ?? existingAccount?.auto_payout_enabled ?? 1) === 0 ? 0 : 1;
+  const nextReviewRequired = Number(reviewRequired ?? existingAccount?.review_required ?? 0) === 1 ? 1 : 0;
+
+  await run(
+    `
+      INSERT INTO lecturer_payout_accounts (
+        lecturer_username,
+        bank_name,
+        bank_code,
+        account_name,
+        account_last4,
+        account_number_encrypted,
+        recipient_code,
+        recipient_type,
+        recipient_status,
+        auto_payout_enabled,
+        review_required,
+        last_provider_response_json,
+        verified_at,
+        created_at,
+        updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      ON CONFLICT(lecturer_username) DO UPDATE SET
+        bank_name = excluded.bank_name,
+        bank_code = excluded.bank_code,
+        account_name = excluded.account_name,
+        account_last4 = excluded.account_last4,
+        account_number_encrypted = excluded.account_number_encrypted,
+        recipient_code = excluded.recipient_code,
+        recipient_type = excluded.recipient_type,
+        recipient_status = excluded.recipient_status,
+        auto_payout_enabled = excluded.auto_payout_enabled,
+        review_required = excluded.review_required,
+        last_provider_response_json = excluded.last_provider_response_json,
+        verified_at = CURRENT_TIMESTAMP,
+        updated_at = CURRENT_TIMESTAMP
+    `,
+    [
+      username,
+      responseBankName,
+      bankCode || String(existingAccount?.bank_code || ""),
+      responseAccountName,
+      last4,
+      encryptedAccountNumber,
+      recipientCode,
+      recipientType,
+      recipientStatus,
+      nextAutoPayoutEnabled,
+      nextReviewRequired,
+      JSON.stringify(responseSnapshot),
+    ]
+  );
+
+  await promotePendingLedgerRowsAfterAccountSave(username);
+  const account = await getLecturerPayoutAccount(username);
+  await logLecturerPayoutEvent({
+    ledgerId: null,
+    req: options.req || createSystemActorRequest("system-payout", "system-payout"),
+    eventType: "payout_account_saved",
+    note: `Saved payout account for ${username}.`,
+    payload: {
+      lecturer_username: username,
+      bank_name: responseBankName,
+      bank_code: bankCode,
+      account_last4: last4,
+      recipient_code: recipientCode,
+    },
+  });
+  return summarizePayoutAccountRow(account);
+}
+
 async function listPaystackReferenceRequests(options = {}) {
   const filters = [];
   const params = [];
@@ -5625,6 +7081,26 @@ async function syncPaymentMatchAndExceptionRecords(transactionId, req, decidedBy
         `[approved-receipts] status-based generation failed transaction_id=${id} reason=${
           receiptGeneration.delivery?.error || receiptGeneration.reason || receiptGeneration.error || "unknown"
         }`
+      );
+    }
+  }
+
+  if (status === "approved") {
+    const payoutLedger = await createLecturerPayoutLedgerForApprovedTransaction(id, {
+      req:
+        req && req.session && req.session.user
+          ? req
+          : createSystemActorRequest("system-reconciliation", "system-reconciliation"),
+    });
+    if (payoutLedger && payoutLedger.status === "available") {
+      await queueLecturerPayoutDispatch(`payout-ledger-${id}`, async () =>
+        processLecturerPayoutQueue({
+          req:
+            req && req.session && req.session.user
+              ? req
+              : createSystemActorRequest("system-payout", "system-payout"),
+          triggerSource: "approved-status",
+        })
       );
     }
   }
@@ -6081,11 +7557,11 @@ function buildReconciliationExceptionQuery(filters) {
     params.push(filters.paymentItemId);
   }
   if (filters.dateFrom && isValidIsoLikeDate(filters.dateFrom)) {
-    conditions.push("DATE(COALESCE(pt.reviewed_at, pt.created_at, pt.paid_at)) >= DATE(?)");
+    conditions.push("CAST(COALESCE(pt.reviewed_at, pt.created_at, pt.paid_at) AS date) >= CAST(? AS date)");
     params.push(filters.dateFrom);
   }
   if (filters.dateTo && isValidIsoLikeDate(filters.dateTo)) {
-    conditions.push("DATE(COALESCE(pt.reviewed_at, pt.created_at, pt.paid_at)) <= DATE(?)");
+    conditions.push("CAST(COALESCE(pt.reviewed_at, pt.created_at, pt.paid_at) AS date) <= CAST(? AS date)");
     params.push(filters.dateTo);
   }
   const whereClause = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
@@ -6118,7 +7594,7 @@ function buildReconciliationExceptionQuery(filters) {
         pt.reviewed_at
       ${baseFrom}
       ${whereClause}
-      ORDER BY datetime(COALESCE(pt.reviewed_at, pt.created_at)) DESC, pt.id DESC
+      ORDER BY CAST(COALESCE(pt.reviewed_at, pt.created_at) AS timestamp) DESC, pt.id DESC
       LIMIT ${filters.pageSize}
       OFFSET ${offset}
     `,
@@ -7179,7 +8655,7 @@ app.get("/api/admin/stats", requireAdmin, async (_req, res) => {
         `
           SELECT COUNT(*) AS today_logins
           FROM login_events
-          WHERE DATE(logged_in_at) = DATE('now')
+          WHERE CAST(logged_in_at AS date) = CURRENT_DATE
         `
       ),
       all(
@@ -7265,7 +8741,7 @@ app.get("/api/payment-items", requireAuth, async (_req, res) => {
           LEFT JOIN payment_obligations po
             ON po.payment_item_id = pi.id
            AND po.student_username = ?
-          WHERE (pi.available_until IS NULL OR datetime(pi.available_until) > CURRENT_TIMESTAMP)
+          WHERE (pi.available_until IS NULL OR CAST(pi.available_until AS timestamp) > CURRENT_TIMESTAMP)
           ORDER BY pi.created_at DESC, pi.id DESC
         `,
         [student]
@@ -7874,8 +9350,37 @@ app.post("/api/payments/webhook/paystack", async (req, res) => {
 
     const payload = req.body || {};
     const eventType = String(payload.event || "").trim().toLowerCase();
-    if (eventType !== "charge.success") {
+    if (eventType !== "charge.success" && !eventType.startsWith("transfer.")) {
       return res.status(200).json({ ok: true, ignored: true });
+    }
+
+    if (eventType.startsWith("transfer.")) {
+      const transferData = payload.data && typeof payload.data === "object" ? payload.data : {};
+      const transferReference = sanitizeTransactionRef(
+        transferData.reference || transferData.transfer_reference || transferData.transfer_code || transferData.id || ""
+      );
+      if (!transferReference) {
+        return res.status(400).json({
+          error: "Invalid Paystack transfer payload.",
+          code: "paystack_transfer_webhook_invalid_payload",
+        });
+      }
+      const outcome =
+        eventType === "transfer.success"
+          ? "success"
+          : eventType === "transfer.reversed"
+            ? "reversed"
+            : eventType === "transfer.failed"
+              ? "failed"
+              : "review";
+      const settled = await settleLecturerPayoutTransferByReference(transferReference, outcome, transferData, {
+        req: getPaystackSystemRequest(),
+      });
+      return res.status(200).json({
+        ok: true,
+        transfer_reference: transferReference,
+        status: settled?.status || outcome,
+      });
     }
 
     const normalized = normalizePaystackTransactionForIngestion(payload);
@@ -8231,6 +9736,306 @@ app.post("/api/payments/paystack/reference-requests/bulk-verify", requireTeacher
 
 app.post("/api/payments/webhook", async (req, res) => {
   return sendPaystackOnlyGone(res, "Generic payment webhook ingestion");
+});
+
+app.get(["/api/lecturer/payout-summary", "/api/teacher/payout-summary"], requireTeacher, async (req, res) => {
+  try {
+    const payout = await getLecturerPayoutSummary(req.session.user.username);
+    return res.json(payout);
+  } catch (_err) {
+    return res.status(500).json({
+      error: "Could not load payout summary.",
+      code: "payout_summary_failed",
+    });
+  }
+});
+
+app.get(["/api/lecturer/payout-account", "/api/teacher/payout-account"], requireTeacher, async (req, res) => {
+  try {
+    const account = await getLecturerPayoutAccount(req.session.user.username);
+    return res.json({
+      account: summarizePayoutAccountRow(account),
+    });
+  } catch (_err) {
+    return res.status(500).json({
+      error: "Could not load payout account.",
+      code: "payout_account_failed",
+    });
+  }
+});
+
+app.post(["/api/lecturer/payout-account", "/api/teacher/payout-account"], requireTeacher, async (req, res) => {
+  try {
+    const account = await updateLecturerPayoutAccount(req.session.user.username, req.body || {}, { req });
+    return res.status(200).json({
+      ok: true,
+      account,
+    });
+  } catch (err) {
+    if (err && err.status && err.error) {
+      return res.status(err.status).json({
+        error: err.error,
+        code: "payout_account_save_failed",
+      });
+    }
+    return res.status(500).json({
+      error: "Could not save payout account.",
+      code: "payout_account_save_failed",
+    });
+  }
+});
+
+app.put(["/api/lecturer/payout-account", "/api/teacher/payout-account"], requireTeacher, async (req, res) => {
+  try {
+    const account = await updateLecturerPayoutAccount(req.session.user.username, req.body || {}, { req });
+    return res.status(200).json({
+      ok: true,
+      account,
+    });
+  } catch (err) {
+    if (err && err.status && err.error) {
+      return res.status(err.status).json({
+        error: err.error,
+        code: "payout_account_update_failed",
+      });
+    }
+    return res.status(500).json({
+      error: "Could not update payout account.",
+      code: "payout_account_update_failed",
+    });
+  }
+});
+
+app.get(["/api/lecturer/payout-history", "/api/teacher/payout-history"], requireTeacher, async (req, res) => {
+  try {
+    const limit = Number.isFinite(Number(req.query?.limit)) ? Number(req.query.limit) : 25;
+    const offset = Number.isFinite(Number(req.query?.offset)) ? Number(req.query.offset) : 0;
+    const status = String(req.query?.status || "").trim().toLowerCase();
+    const [payout, transfers, ledger] = await Promise.all([
+      getLecturerPayoutSummary(req.session.user.username),
+      getLecturerPayoutTransfers({
+        lecturerUsername: req.session.user.username,
+        status,
+        limit,
+        offset,
+      }),
+      getLecturerPayoutLedgerRows({
+        lecturerUsername: req.session.user.username,
+        status,
+        limit,
+        offset,
+      }),
+    ]);
+    return res.json({
+      account: payout.account,
+      summary: payout.summary,
+      transfers,
+      ledger: ledger.map(summarizePayoutLedgerRow),
+    });
+  } catch (_err) {
+    return res.status(500).json({
+      error: "Could not load payout history.",
+      code: "payout_history_failed",
+    });
+  }
+});
+
+app.post(["/api/lecturer/payout-request", "/api/teacher/payout-request"], requireTeacher, async (req, res) => {
+  try {
+    const requestedAmount = req.body?.amount;
+    const batch = await reserveLecturerPayoutBatch(req.session.user.username, {
+      amount: requestedAmount,
+      triggerSource: "manual",
+      requestedBy: req.session.user.username,
+      req,
+    });
+    if (batch?.activeTransfer?.id) {
+      await queueLecturerPayoutDispatch(`transfer-${batch.activeTransfer.id}`, async () =>
+        dispatchQueuedLecturerPayoutTransfer(batch.activeTransfer.id, { req })
+      );
+    }
+    return res.status(200).json({
+      ok: true,
+      ...batch,
+      payout: await getLecturerPayoutSummary(req.session.user.username),
+    });
+  } catch (err) {
+    if (err && err.status && err.error) {
+      return res.status(err.status).json({
+        error: err.error,
+        code: "payout_request_failed",
+      });
+    }
+    return res.status(500).json({
+      error: "Could not request payout.",
+      code: "payout_request_failed",
+    });
+  }
+});
+
+app.get("/api/admin/lecturer/payout-transfers", requireAdmin, async (req, res) => {
+  try {
+    const lecturerUsername = normalizeIdentifier(req.query?.lecturerUsername || "");
+    const limit = Number.isFinite(Number(req.query?.limit)) ? Number(req.query.limit) : 50;
+    const offset = Number.isFinite(Number(req.query?.offset)) ? Number(req.query.offset) : 0;
+    const status = String(req.query?.status || "").trim().toLowerCase();
+    const [transfers, payout] = await Promise.all([
+      getLecturerPayoutTransfers({
+        lecturerUsername,
+        status,
+        limit,
+        offset,
+      }),
+      lecturerUsername ? getLecturerPayoutSummary(lecturerUsername) : Promise.resolve(null),
+    ]);
+    return res.json({
+      payout: payout || null,
+      transfers,
+    });
+  } catch (_err) {
+    return res.status(500).json({
+      error: "Could not load payout transfers.",
+      code: "payout_transfer_list_failed",
+    });
+  }
+});
+
+app.post("/api/admin/lecturer/payout-transfers/:id/review", requireAdmin, async (req, res) => {
+  const transferId = parseResourceId(req.params.id);
+  if (!transferId) {
+    return res.status(400).json({
+      error: "A payout transfer id is required.",
+      code: "payout_transfer_review_invalid_id",
+    });
+  }
+
+  try {
+    const transfer = await getLecturerPayoutTransferById(transferId);
+    if (!transfer) {
+      return res.status(404).json({
+        error: "Payout transfer not found.",
+        code: "payout_transfer_not_found",
+      });
+    }
+    const note = String(req.body?.note || req.body?.reason || "manual_review").trim().slice(0, 500) || "manual_review";
+    await withSqlTransaction(async () => {
+      await run(
+        `
+          UPDATE lecturer_payout_transfers
+          SET status = 'review',
+              review_state = 'required',
+              reviewed_by = ?,
+              reviewed_at = CURRENT_TIMESTAMP,
+              failure_reason = ?,
+              updated_at = CURRENT_TIMESTAMP
+          WHERE id = ?
+        `,
+        [req.session.user.username || "admin", note, transfer.id]
+      );
+      await run(
+        `
+          UPDATE lecturer_payout_ledger
+          SET status = 'review',
+              review_reason = ?,
+              updated_at = CURRENT_TIMESTAMP
+          WHERE payout_transfer_id = ?
+        `,
+        [note, transfer.id]
+      );
+    });
+    await logLecturerPayoutEvent({
+      transferId: transfer.id,
+      req,
+      eventType: "payout_transfer_reviewed",
+      note: `Admin marked payout transfer ${transfer.transfer_reference} for review.`,
+      payload: {
+        lecturer_username: transfer.lecturer_username,
+        transfer_reference: transfer.transfer_reference,
+        reason: note,
+      },
+    });
+    return res.json({
+      ok: true,
+      transfer: await getLecturerPayoutTransferById(transferId),
+    });
+  } catch (_err) {
+    return res.status(500).json({
+      error: "Could not mark payout transfer for review.",
+      code: "payout_transfer_review_failed",
+    });
+  }
+});
+
+app.post("/api/admin/lecturer/payout-transfers/:id/retry", requireAdmin, async (req, res) => {
+  const transferId = parseResourceId(req.params.id);
+  if (!transferId) {
+    return res.status(400).json({
+      error: "A payout transfer id is required.",
+      code: "payout_transfer_retry_invalid_id",
+    });
+  }
+
+  try {
+    const transfer = await getLecturerPayoutTransferById(transferId);
+    if (!transfer) {
+      return res.status(404).json({
+        error: "Payout transfer not found.",
+        code: "payout_transfer_not_found",
+      });
+    }
+    const currentStatus = String(transfer.status || "").trim().toLowerCase();
+    if (currentStatus === "success") {
+      return res.status(409).json({
+        error: "Completed payout transfers cannot be retried.",
+        code: "payout_transfer_retry_conflict",
+      });
+    }
+    await run(
+      `
+        UPDATE lecturer_payout_transfers
+        SET status = 'queued',
+            review_state = 'not_required',
+            failure_reason = NULL,
+            reviewed_by = NULL,
+            reviewed_at = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+      `,
+      [transfer.id]
+    );
+    await run(
+      `
+        UPDATE lecturer_payout_ledger
+        SET status = 'available',
+            review_reason = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE payout_transfer_id = ?
+      `,
+      [transfer.id]
+    );
+    await logLecturerPayoutEvent({
+      transferId: transfer.id,
+      req,
+      eventType: "payout_transfer_retry_requested",
+      note: `Admin retried payout transfer ${transfer.transfer_reference}.`,
+      payload: {
+        lecturer_username: transfer.lecturer_username,
+        transfer_reference: transfer.transfer_reference,
+      },
+    });
+    await queueLecturerPayoutDispatch(`transfer-${transfer.id}`, async () =>
+      dispatchQueuedLecturerPayoutTransfer(transfer.id, { req })
+    );
+    return res.json({
+      ok: true,
+      transfer: await getLecturerPayoutTransferById(transferId),
+    });
+  } catch (_err) {
+    return res.status(500).json({
+      error: "Could not retry payout transfer.",
+      code: "payout_transfer_retry_failed",
+    });
+  }
 });
 
 async function loadReconciliationExceptionsPayload(queryInput) {
@@ -8624,7 +10429,7 @@ app.get("/api/my/payment-ledger", requireStudent, async (req, res) => {
         LEFT JOIN payment_obligations po
           ON po.payment_item_id = pi.id
          AND po.student_username = ?
-        WHERE (pi.available_until IS NULL OR datetime(pi.available_until) > CURRENT_TIMESTAMP)
+        WHERE (pi.available_until IS NULL OR CAST(pi.available_until AS timestamp) > CURRENT_TIMESTAMP)
         ORDER BY
           CASE WHEN pi.due_date IS NULL OR pi.due_date = '' THEN 1 ELSE 0 END ASC,
           pi.due_date ASC,
@@ -9234,7 +11039,7 @@ app.get("/api/notifications", requireAuth, async (req, res) => {
   try {
     const isStudent = req.session.user.role === "student";
     const studentDepartment = isStudent ? await getSessionUserDepartment(req) : "";
-    const whereClause = isStudent ? "WHERE (n.expires_at IS NULL OR datetime(n.expires_at) > CURRENT_TIMESTAMP)" : "";
+    const whereClause = isStudent ? "WHERE (n.expires_at IS NULL OR CAST(n.expires_at AS timestamp) > CURRENT_TIMESTAMP)" : "";
     const rows = await all(
       `
         SELECT

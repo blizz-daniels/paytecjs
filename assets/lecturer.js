@@ -61,6 +61,182 @@ async function requestJson(url, { method = "GET", payload } = {}) {
   return data;
 }
 
+function formatMoney(value) {
+  const amount = Number(value || 0);
+  return new Intl.NumberFormat("en-NG", {
+    style: "currency",
+    currency: "NGN",
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(Number.isFinite(amount) ? amount : 0);
+}
+
+function formatPayoutDate(value) {
+  if (!value) {
+    return "—";
+  }
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "—" : date.toLocaleString();
+}
+
+function normalizePayoutBadge(summary, account) {
+  if (!account) {
+    return { text: "Bank missing", className: "status-badge status-badge--warning" };
+  }
+  if (Number(account.review_required || 0) === 1 || String(account.recipient_status || "").toLowerCase() !== "active") {
+    return { text: "Needs review", className: "status-badge status-badge--error" };
+  }
+  if (Number(summary?.availableBalance || 0) > 0) {
+    return { text: "Ready", className: "status-badge status-badge--success" };
+  }
+  return { text: "Linked", className: "status-badge" };
+}
+
+function setPayoutMessage(nodeId, message, isError = false) {
+  const node = document.getElementById(nodeId);
+  if (!node) {
+    return;
+  }
+  node.textContent = String(message || "");
+  node.style.color = isError ? "var(--danger)" : "var(--muted)";
+}
+
+function renderPayoutStats(root, summary) {
+  if (!root) {
+    return;
+  }
+  const stats = [
+    { label: "Total earned", value: formatMoney(summary?.totalEarned || 0), hint: "All approved lecturer share amounts" },
+    { label: "Pending payout", value: formatMoney(summary?.pendingBalance || 0), hint: "Reserved or under review" },
+    { label: "Available", value: formatMoney(summary?.availableBalance || 0), hint: "Ready for payout" },
+    { label: "Paid out", value: formatMoney(summary?.paidBalance || 0), hint: "Already transferred" },
+  ];
+  root.innerHTML = stats
+    .map(
+      (stat) => `
+        <article class="payout-stat">
+          <span class="payout-stat__label">${escapeHtml(stat.label)}</span>
+          <strong class="payout-stat__value">${escapeHtml(stat.value)}</strong>
+          <span class="payout-stat__hint">${escapeHtml(stat.hint)}</span>
+        </article>
+      `
+    )
+    .join("");
+}
+
+function renderPayoutAccount(root, account, summary) {
+  if (!root) {
+    return;
+  }
+  if (!account) {
+    root.innerHTML = `
+      <div class="payout-account__empty">
+        <strong>No bank account linked yet.</strong>
+        <p>Save your payout bank details to enable lecturer payouts.</p>
+      </div>
+    `;
+    return;
+  }
+
+  const badge = normalizePayoutBadge(summary, account);
+  root.innerHTML = `
+    <dl class="payout-account__details">
+      <div><dt>Bank</dt><dd>${escapeHtml(account.bank_name || "-")}</dd></div>
+      <div><dt>Account name</dt><dd>${escapeHtml(account.account_name || "-")}</dd></div>
+      <div><dt>Account</dt><dd>${escapeHtml(account.account_masked || `•••• ${account.account_last4 || ""}`)}</dd></div>
+      <div><dt>Status</dt><dd><span class="${badge.className}">${escapeHtml(badge.text)}</span></dd></div>
+      <div><dt>Auto payout</dt><dd>${account.auto_payout_enabled ? "Enabled" : "Disabled"}</dd></div>
+      <div><dt>Reviewed</dt><dd>${account.review_required ? "Yes" : "No"}</dd></div>
+    </dl>
+  `;
+}
+
+function renderPayoutHistory(root, transfers) {
+  if (!root) {
+    return;
+  }
+  const rows = Array.isArray(transfers) ? transfers : [];
+  if (!rows.length) {
+    root.innerHTML = '<tr><td colspan="5">No payout transfers yet.</td></tr>';
+    return;
+  }
+  root.innerHTML = rows
+    .map((row) => {
+      const statusClass =
+        row.status === "success"
+          ? "status-badge status-badge--success"
+          : row.status === "review" || row.status === "failed" || row.status === "reversed"
+            ? "status-badge status-badge--error"
+            : "status-badge status-badge--warning";
+      return `
+        <tr>
+          <td>${escapeHtml(formatPayoutDate(row.created_at || row.completed_at || row.updated_at))}</td>
+          <td>${escapeHtml(row.transfer_reference || row.transfer_code || "—")}</td>
+          <td>${escapeHtml(formatMoney(row.total_amount || 0))}</td>
+          <td><span class="${statusClass}">${escapeHtml(String(row.status || "queued"))}</span></td>
+          <td>${escapeHtml(row.failure_reason || row.review_state || "—")}</td>
+        </tr>
+      `;
+    })
+    .join("");
+}
+
+async function loadLecturerPayoutData() {
+  const section = document.getElementById("lecturerPayoutSection");
+  const statsRoot = document.getElementById("lecturerPayoutStats");
+  const accountRoot = document.getElementById("lecturerPayoutAccount");
+  const historyRoot = document.getElementById("lecturerPayoutHistoryBody");
+  const badge = document.getElementById("lecturerPayoutBadge");
+  if (!section || !statsRoot || !accountRoot || !historyRoot) {
+    return;
+  }
+  const role = String(currentUser?.role || "").trim().toLowerCase();
+  if (role !== "teacher" && role !== "admin") {
+    section.hidden = true;
+    return;
+  }
+
+  section.hidden = false;
+  setPayoutMessage("lecturerPayoutStatus", "Loading payout information...");
+  if (badge) {
+    badge.className = "status-badge status-badge--warning";
+    badge.textContent = "Loading";
+  }
+
+  try {
+    const payload = await requestJson("/api/lecturer/payout-history?limit=10");
+    const summary = payload?.summary || {};
+    const account = payload?.account || null;
+    const transfers = Array.isArray(payload?.transfers) ? payload.transfers : [];
+
+    renderPayoutStats(statsRoot, summary);
+    renderPayoutAccount(accountRoot, account, summary);
+    renderPayoutHistory(historyRoot, transfers);
+
+    const badgeState = normalizePayoutBadge(summary, account);
+    if (badge) {
+      badge.className = badgeState.className;
+      badge.textContent = badgeState.text;
+    }
+
+    setPayoutMessage(
+      "lecturerPayoutStatus",
+      account
+        ? `Available balance ${formatMoney(summary.availableBalance || 0)} is ready for payout handling.`
+        : "Link a bank account to start receiving lecturer payouts."
+    );
+  } catch (err) {
+    setPayoutMessage("lecturerPayoutStatus", err.message || "Could not load payout information.", true);
+    if (badge) {
+      badge.className = "status-badge status-badge--error";
+      badge.textContent = "Error";
+    }
+    renderPayoutStats(statsRoot, {});
+    accountRoot.innerHTML = '<p class="auth-subtitle">Could not load payout account details.</p>';
+    historyRoot.innerHTML = '<tr><td colspan="5">Could not load payout history.</td></tr>';
+  }
+}
+
 const manageConfigs = [
   {
     key: "notifications",
@@ -528,11 +704,59 @@ function initLecturerPage() {
           loadingToast.close();
         }
       }
+      });
+  }
+
+  const payoutRequestForm = document.getElementById("lecturerPayoutRequestForm");
+  if (payoutRequestForm) {
+    payoutRequestForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const submitButton = payoutRequestForm.querySelector('button[type="submit"]');
+      const amountInput = document.getElementById("lecturerPayoutAmount");
+      const amount = String(amountInput?.value || "").trim();
+      const payload = amount ? { amount } : {};
+      const loadingToast = window.showToast
+        ? window.showToast("Submitting payout request...", { type: "loading", sticky: true })
+        : null;
+      setButtonBusy(submitButton, true, "Requesting...");
+      setPayoutMessage("lecturerPayoutStatus", "Submitting payout request...");
+
+      try {
+        const response = await requestJson("/api/lecturer/payout-request", {
+          method: "POST",
+          payload,
+        });
+        if (window.showToast) {
+          window.showToast("Payout request submitted.", { type: "success" });
+        }
+        setPayoutMessage(
+          "lecturerPayoutStatus",
+          response?.activeTransfer?.status === "queued"
+            ? "Payout request queued for processing."
+            : "Payout request processed."
+        );
+        if (amountInput) {
+          amountInput.value = "";
+        }
+        await loadLecturerPayoutData();
+      } catch (err) {
+        setPayoutMessage("lecturerPayoutStatus", err.message || "Could not request payout.", true);
+        if (window.showToast) {
+          window.showToast(err.message || "Could not request payout.", { type: "error" });
+        }
+      } finally {
+        setButtonBusy(submitButton, false, "");
+        if (loadingToast) {
+          loadingToast.close();
+        }
+      }
     });
   }
 
   manageConfigs.forEach(bindManageActions);
-  loadCurrentUser().then(loadManageData);
+  loadCurrentUser().then(async () => {
+    await Promise.all([loadManageData(), loadLecturerPayoutData()]);
+  });
 }
 
 window.initLecturerPage = initLecturerPage;

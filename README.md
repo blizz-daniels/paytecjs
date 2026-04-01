@@ -68,6 +68,25 @@ The payment system runs in strict Paystack mode:
 - `POST /api/payments/paystack/reference-requests` (student fallback for delayed webhook confirmation)
 - `POST /api/payments/paystack/reference-requests/bulk-verify` (lecturer/admin)
 
+### Lecturer Payouts
+
+- `GET /api/lecturer/payout-summary`
+- `GET /api/lecturer/payout-account`
+- `POST /api/lecturer/payout-account`
+- `PUT /api/lecturer/payout-account`
+- `GET /api/lecturer/payout-history`
+- `POST /api/lecturer/payout-request`
+- `GET /api/admin/lecturer/payout-transfers`
+- `POST /api/admin/lecturer/payout-transfers/:id/review`
+- `POST /api/admin/lecturer/payout-transfers/:id/retry`
+
+Lecturer payout account responses are masked by default. Only `bank_name`, `account_name`, `account_last4`, and provider status fields are returned to the client.
+
+Lecturer-facing UI is split across:
+
+- `/lecturer` for payout balance, transfer history, and payout requests
+- `/profile` for payout bank account setup and update
+
 ### Exception Queue + Actions
 
 - `GET /api/lecturer/reconciliation/summary`
@@ -131,6 +150,16 @@ Threshold behavior:
 - `reconciliation_exceptions`
 - `reconciliation_events`
 - `audit_events`
+
+## Database Additions (Lecturer Payouts)
+
+- `payment_items.lecturer_share_bps`
+- `lecturer_payout_accounts`
+- `lecturer_payout_ledger`
+- `lecturer_payout_transfers`
+- `lecturer_payout_events`
+
+Payout rows are linked to approved reconciliation rows so the payout ledger can be audited from the original student payment.
 
 Legacy data migration is run in `initDatabase()`:
 
@@ -239,16 +268,82 @@ Runtime notes:
 
 See `.env.example`, including:
 
+- `DATABASE_URL`
 - `PAYMENT_REFERENCE_PREFIX`
 - `PAYMENT_REFERENCE_TENANT_ID`
 - `AUTO_RECONCILE_CONFIDENCE`
 - `REVIEW_RECONCILE_CONFIDENCE`
 - `PAYSTACK_SECRET_KEY`
+- `PAYSTACK_API_BASE_URL`
 - `PAYSTACK_WEBHOOK_SECRET`
 - `PAYSTACK_INTERNAL_VERIFY_SECRET`
+- `PAYOUT_ENCRYPTION_KEY`
+- `PAYOUT_DEFAULT_SHARE_BPS`
+- `PAYOUT_MINIMUM_AMOUNT`
+- `PAYOUT_WORKER_INTERVAL_MS`
 - `RECEIPT_*` values for approved receipt generation/download
 - `EMAIL_PROVIDER`, `PASSWORD_RESET_EMAIL_FROM`, and either `SMTP_*` (SMTP mode) or `RESEND_API_KEY` (Resend API mode)
 - `PASSWORD_RESET_RATE_LIMIT_WINDOW_SECONDS`, `PASSWORD_RESET_SEND_RATE_LIMIT_MAX_ATTEMPTS`, `PASSWORD_RESET_RESET_RATE_LIMIT_MAX_ATTEMPTS`, `PASSWORD_RESET_RATE_LIMIT_BLOCK_SECONDS`
+
+## Lecturer Payout Setup
+
+- Configure `PAYOUT_ENCRYPTION_KEY` before enabling payouts. Bank account numbers are encrypted at rest with this key.
+- Keep `PAYSTACK_SECRET_KEY` and `PAYSTACK_WEBHOOK_SECRET` set so transfer creation and transfer webhooks can both be verified.
+- Use PostgreSQL for production data. `DATABASE_URL` must point to your live database before startup in production.
+- Keep `DATA_DIR` on persistent storage for receipts, uploads, and generated files. The default `DATA_DIR=/tmp/paytec` is fine for local dev only.
+- The current `render.yaml` includes a managed Postgres resource plus a persistent disk for the web service. If you deploy on Render, keep the disk mounted at `/var/data` and ensure `DATABASE_URL` comes from the Postgres resource.
+- Store only masked bank details in API responses and UI; do not log raw account numbers or full recipient payloads.
+- The payout worker can run automatically via `PAYOUT_WORKER_INTERVAL_MS`, but manual payout requests still require a linked and active Paystack recipient.
+- Keep transfer review and retry permissions restricted to admins.
+
+## PostgreSQL Production Setup
+
+For production, replace the SQLite file database with PostgreSQL:
+
+1. Provision a PostgreSQL database.
+2. Set `DATABASE_URL` in production.
+3. Keep `SESSION_SECRET` and all Paystack/payout secrets set.
+4. Run the app once so `initDatabase()` creates the schema in Postgres.
+5. Import any existing SQLite data before opening the site to users.
+6. Keep `DATA_DIR` on persistent storage for files that are still written to disk.
+
+The app will still run locally with SQLite if `DATABASE_URL` is not set, which keeps development and tests simple.
+
+### Existing SQLite Data Cutover
+
+If you already have live data in `paytec.sqlite`, use a maintenance window and:
+
+1. Back up the SQLite file first.
+2. Point a staging copy of the app at a fresh Postgres database.
+3. Let `initDatabase()` create the Postgres schema.
+4. Copy your tables across with a one-off import job or export/import tool.
+5. Verify row counts for:
+   - `users`
+   - `auth_roster`
+   - `payment_items`
+   - `payment_obligations`
+   - `payment_transactions`
+   - `payment_receipts`
+   - `lecturer_payout_accounts`
+   - `lecturer_payout_ledger`
+   - `lecturer_payout_transfers`
+6. Switch production traffic to the new `DATABASE_URL` only after the imports and reconciliation checks pass.
+
+### Migration Script
+
+You can use the built-in importer to move rows from SQLite to Postgres:
+
+```bash
+npm run migrate:sqlite-to-postgres -- --sqlite=./data/paytec.sqlite --database-url=postgres://user:pass@host:5432/paytec
+```
+
+Helpful flags:
+
+- `--dry-run` prints the plan without copying rows.
+- `--replace` clears the target tables before import.
+- `--include-sessions` copies a source `sessions` table if you are using one in a custom SQLite setup.
+
+The importer expects the Postgres schema to exist first, so run the app once with `DATABASE_URL` set or use the normal startup path before importing data.
 
 ## Running Tests
 

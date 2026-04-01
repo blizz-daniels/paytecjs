@@ -102,6 +102,65 @@
         </article>
       </section>
 
+      <section id="lecturerPayoutSection" class="card payout-card" hidden>
+        <div class="payout-card__header">
+          <div>
+            <h2>Lecturer Payouts</h2>
+            <p class="auth-subtitle">Track earnings, bank status, and payout history in one place.</p>
+          </div>
+          <span id="lecturerPayoutBadge" class="status-badge status-badge--warning">Loading</span>
+        </div>
+        <p id="lecturerPayoutStatus" class="auth-subtitle"></p>
+        <div id="lecturerPayoutStats" class="payout-stats" aria-live="polite"></div>
+
+        <section class="grid two-col" style="margin-top: 1rem;">
+          <article class="payout-subcard">
+            <h3>Linked Bank Account</h3>
+            <div id="lecturerPayoutAccount" class="payout-account"></div>
+          </article>
+
+          <article class="payout-subcard">
+            <h3>Request Payout</h3>
+            <p class="auth-subtitle">Manual payouts send your available balance to the linked account.</p>
+            <form id="lecturerPayoutRequestForm" class="auth-form payout-form">
+              <label for="lecturerPayoutAmount">Amount to request</label>
+              <input
+                id="lecturerPayoutAmount"
+                name="amount"
+                type="number"
+                min="0"
+                step="0.01"
+                inputmode="decimal"
+                placeholder="Leave blank for full available balance"
+              />
+              <button type="submit" class="btn">Request payout</button>
+            </form>
+          </article>
+        </section>
+
+        <section class="payout-history-block">
+          <h3>Payout History</h3>
+          <div class="table-wrap">
+            <table class="data-table payout-history-table">
+              <thead>
+                <tr>
+                  <th>Date</th>
+                  <th>Reference</th>
+                  <th>Amount</th>
+                  <th>Status</th>
+                  <th>Review</th>
+                </tr>
+              </thead>
+              <tbody id="lecturerPayoutHistoryBody">
+                <tr>
+                  <td colspan="5">Loading payout history...</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
       <section class="page-title" style="margin-top: 2rem;">
         <h2>Manage Posted Content</h2>
         <p>Edit or remove items you posted. Admins can manage all items.</p>

@@ -178,9 +178,9 @@ function createAnalyticsHelpers(options = {}) {
     const paymentItemOwnerExpression = String(options.paymentItemOwnerExpression || "pi.created_by");
 
     if (includeDateRange) {
-      conditions.push(`DATE(${dateExpression}) >= DATE(?)`);
+      conditions.push(`CAST(${dateExpression} AS date) >= CAST(? AS date)`);
       params.push(filters.from);
-      conditions.push(`DATE(${dateExpression}) <= DATE(?)`);
+      conditions.push(`CAST(${dateExpression} AS date) <= CAST(? AS date)`);
       params.push(filters.to);
     }
     if (includePaymentItemFilter && filters.paymentItemId) {
@@ -210,14 +210,14 @@ function createAnalyticsHelpers(options = {}) {
 
   function getAnalyticsBucketExpression(granularity, dateExpression) {
     const normalized = String(granularity || "day").trim().toLowerCase();
-    const safeDateExpression = `DATE(${String(dateExpression || "CURRENT_TIMESTAMP")})`;
+    const safeDateExpression = `CAST(${String(dateExpression || "CURRENT_TIMESTAMP")} AS timestamp)`;
     if (normalized === "week") {
-      return `strftime('%Y-W%W', ${safeDateExpression})`;
+      return `to_char(${safeDateExpression}, 'IYYY-"W"IW')`;
     }
     if (normalized === "month") {
-      return `strftime('%Y-%m', ${safeDateExpression})`;
+      return `to_char(${safeDateExpression}, 'YYYY-MM')`;
     }
-    return `strftime('%Y-%m-%d', ${safeDateExpression})`;
+    return `to_char(${safeDateExpression}, 'YYYY-MM-DD')`;
   }
 
   async function getAnalyticsOverviewPayload(req, filters) {
@@ -497,8 +497,8 @@ function createAnalyticsHelpers(options = {}) {
             COUNT(*) AS transaction_count
           FROM payment_transactions pt
           LEFT JOIN payment_obligations po ON po.id = pt.matched_obligation_id
-          WHERE DATE(COALESCE(pt.paid_at, pt.created_at)) >= DATE(?)
-            AND DATE(COALESCE(pt.paid_at, pt.created_at)) <= DATE(?)
+          WHERE CAST(COALESCE(pt.paid_at, pt.created_at) AS date) >= CAST(? AS date)
+            AND CAST(COALESCE(pt.paid_at, pt.created_at) AS date) <= CAST(? AS date)
           GROUP BY COALESCE(po.payment_item_id, pt.payment_item_hint_id)
         ),
         obligation_totals AS (
@@ -615,9 +615,9 @@ function createAnalyticsHelpers(options = {}) {
           CASE
             WHEN po.expected_amount - COALESCE(po.amount_paid_total, 0) <= 0.01 THEN 'settled'
             WHEN po.due_date IS NULL OR TRIM(po.due_date) = '' THEN 'current'
-            WHEN CAST(julianday(DATE(?)) - julianday(DATE(po.due_date)) AS INTEGER) <= 0 THEN 'current'
-            WHEN CAST(julianday(DATE(?)) - julianday(DATE(po.due_date)) AS INTEGER) BETWEEN 1 AND 7 THEN 'overdue_1_7'
-            WHEN CAST(julianday(DATE(?)) - julianday(DATE(po.due_date)) AS INTEGER) BETWEEN 8 AND 30 THEN 'overdue_8_30'
+            WHEN CAST(? AS date) - CAST(po.due_date AS date) <= 0 THEN 'current'
+            WHEN CAST(? AS date) - CAST(po.due_date AS date) BETWEEN 1 AND 7 THEN 'overdue_1_7'
+            WHEN CAST(? AS date) - CAST(po.due_date AS date) BETWEEN 8 AND 30 THEN 'overdue_8_30'
             ELSE 'overdue_31_plus'
           END AS bucket,
           COUNT(*) AS obligations_count,
