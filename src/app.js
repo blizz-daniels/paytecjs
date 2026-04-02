@@ -2384,47 +2384,6 @@ async function initDatabase() {
   `);
 
   await run(`
-    CREATE TABLE IF NOT EXISTS lecturer_payout_ledger (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      lecturer_username TEXT NOT NULL,
-      payment_transaction_id INTEGER NOT NULL UNIQUE,
-      payment_item_id INTEGER NOT NULL,
-      obligation_id INTEGER,
-      gross_amount REAL NOT NULL,
-      share_bps INTEGER NOT NULL DEFAULT 10000,
-      payout_amount REAL NOT NULL,
-      currency TEXT NOT NULL DEFAULT 'NGN',
-      status TEXT NOT NULL DEFAULT 'available',
-      available_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      payout_transfer_id INTEGER,
-      review_reason TEXT,
-      source_status TEXT NOT NULL DEFAULT 'approved',
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (payment_transaction_id) REFERENCES payment_transactions(id) ON UPDATE CASCADE ON DELETE CASCADE,
-      FOREIGN KEY (payment_item_id) REFERENCES payment_items(id) ON UPDATE CASCADE ON DELETE CASCADE,
-      FOREIGN KEY (obligation_id) REFERENCES payment_obligations(id) ON UPDATE CASCADE ON DELETE SET NULL,
-      FOREIGN KEY (payout_transfer_id) REFERENCES lecturer_payout_transfers(id) ON UPDATE CASCADE ON DELETE SET NULL
-    )
-  `);
-
-  await run(`
-    CREATE TABLE IF NOT EXISTS lecturer_payout_events (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      transfer_id INTEGER,
-      ledger_id INTEGER,
-      actor_username TEXT NOT NULL,
-      actor_role TEXT NOT NULL,
-      event_type TEXT NOT NULL,
-      note TEXT,
-      payload_json TEXT NOT NULL DEFAULT '{}',
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (transfer_id) REFERENCES lecturer_payout_transfers(id) ON UPDATE CASCADE ON DELETE CASCADE,
-      FOREIGN KEY (ledger_id) REFERENCES lecturer_payout_ledger(id) ON UPDATE CASCADE ON DELETE SET NULL
-    )
-  `);
-
-  await run(`
     CREATE TABLE IF NOT EXISTS teacher_payment_statements (
       teacher_username TEXT PRIMARY KEY,
       original_filename TEXT NOT NULL,
@@ -2564,6 +2523,47 @@ async function initDatabase() {
       resolved_by TEXT,
       resolved_by_role TEXT,
       FOREIGN KEY (obligation_id) REFERENCES payment_obligations(id) ON UPDATE CASCADE ON DELETE SET NULL
+    )
+  `);
+
+  await run(`
+    CREATE TABLE IF NOT EXISTS lecturer_payout_ledger (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      lecturer_username TEXT NOT NULL,
+      payment_transaction_id INTEGER NOT NULL UNIQUE,
+      payment_item_id INTEGER NOT NULL,
+      obligation_id INTEGER,
+      gross_amount REAL NOT NULL,
+      share_bps INTEGER NOT NULL DEFAULT 10000,
+      payout_amount REAL NOT NULL,
+      currency TEXT NOT NULL DEFAULT 'NGN',
+      status TEXT NOT NULL DEFAULT 'available',
+      available_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      payout_transfer_id INTEGER,
+      review_reason TEXT,
+      source_status TEXT NOT NULL DEFAULT 'approved',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (payment_transaction_id) REFERENCES payment_transactions(id) ON UPDATE CASCADE ON DELETE CASCADE,
+      FOREIGN KEY (payment_item_id) REFERENCES payment_items(id) ON UPDATE CASCADE ON DELETE CASCADE,
+      FOREIGN KEY (obligation_id) REFERENCES payment_obligations(id) ON UPDATE CASCADE ON DELETE SET NULL,
+      FOREIGN KEY (payout_transfer_id) REFERENCES lecturer_payout_transfers(id) ON UPDATE CASCADE ON DELETE SET NULL
+    )
+  `);
+
+  await run(`
+    CREATE TABLE IF NOT EXISTS lecturer_payout_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      transfer_id INTEGER,
+      ledger_id INTEGER,
+      actor_username TEXT NOT NULL,
+      actor_role TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      note TEXT,
+      payload_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (transfer_id) REFERENCES lecturer_payout_transfers(id) ON UPDATE CASCADE ON DELETE CASCADE,
+      FOREIGN KEY (ledger_id) REFERENCES lecturer_payout_ledger(id) ON UPDATE CASCADE ON DELETE SET NULL
     )
   `);
 
