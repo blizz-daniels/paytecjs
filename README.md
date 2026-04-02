@@ -23,6 +23,7 @@ The payment system runs in strict Paystack mode:
 ## Department Scoping
 
 - Student and lecturer roster CSVs now require a `department` column.
+- Roster rows are stored in `auth_roster`; CSV files are used for bootstrap/admin imports, not as the live runtime source after import.
 - Lecturer content (notifications, handouts, shared files, payment items) is automatically scoped to the lecturer department.
 - Superdepartment targeting is supported through `data/department-groups.csv` (for example, `science` can cover multiple science departments).
 - Student feeds and payment views are filtered by department scope.
@@ -308,6 +309,7 @@ For production, replace the SQLite file database with PostgreSQL:
 6. Keep `DATA_DIR` on persistent storage for files that are still written to disk.
 
 The app will still run locally with SQLite if `DATABASE_URL` is not set, which keeps development and tests simple.
+If Postgres starts with an empty `auth_roster`, the app will bootstrap each missing roster once from `STUDENT_ROSTER_PATH` / `LECTURER_ROSTER_PATH` and then keep the database as the durable source of truth on later restarts.
 
 ### Existing SQLite Data Cutover
 
@@ -320,6 +322,7 @@ If you already have live data in `paytec.sqlite`, use a maintenance window and:
 5. Verify row counts for:
    - `users`
    - `auth_roster`
+   - `roster_import_state`
    - `payment_items`
    - `payment_obligations`
    - `payment_transactions`
@@ -344,6 +347,7 @@ Helpful flags:
 - `--include-sessions` copies a source `sessions` table if you are using one in a custom SQLite setup.
 
 The importer expects the Postgres schema to exist first, so run the app once with `DATABASE_URL` set or use the normal startup path before importing data.
+For CSV-only roster cutovers, you can also start the app once against an empty database with `STUDENT_ROSTER_PATH` / `LECTURER_ROSTER_PATH` set; startup will import each missing roster a single time and record the bootstrap in `roster_import_state`.
 
 ## Running Tests
 

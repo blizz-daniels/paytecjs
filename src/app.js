@@ -1412,13 +1412,87 @@ function deriveDisplayNameFromIdentifier(identifier) {
     .join(" ");
 }
 
-async function importRoster(filePath, role, idHeader) {
+function getRosterBootstrapStateKey(role) {
+  return `csv_bootstrap:${String(role || "").trim().toLowerCase()}`;
+}
+
+async function getRosterBootstrapState(role) {
+  const rosterKey = getRosterBootstrapStateKey(role);
+  return get(
+    `
+      SELECT roster_key, role, source_name, import_status, imported_count, completed_at
+      FROM roster_import_state
+      WHERE roster_key = ?
+      LIMIT 1
+    `,
+    [rosterKey]
+  );
+}
+
+async function recordRosterBootstrapState(role, details = {}) {
+  const normalizedRole = String(role || "")
+    .trim()
+    .toLowerCase();
+  const rosterKey = getRosterBootstrapStateKey(normalizedRole);
+  await run(
+    `
+      INSERT INTO roster_import_state (roster_key, role, source_name, import_status, imported_count, completed_at)
+      VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(roster_key) DO UPDATE SET
+        role = excluded.role,
+        source_name = excluded.source_name,
+        import_status = excluded.import_status,
+        imported_count = excluded.imported_count,
+        completed_at = CURRENT_TIMESTAMP
+    `,
+    [
+      rosterKey,
+      normalizedRole,
+      details.sourceName || null,
+      String(details.importStatus || "completed").trim().toLowerCase() || "completed",
+      Number.parseInt(String(details.importedCount || 0), 10) || 0,
+    ]
+  );
+}
+
+async function importRosterBootstrapIfNeeded(filePath, role, idHeader) {
+  const normalizedRole = String(role || "")
+    .trim()
+    .toLowerCase();
+  const existingState = await getRosterBootstrapState(normalizedRole);
+  if (existingState) {
+    return 0;
+  }
+
+  const rosterCountRow = await get("SELECT COUNT(*) AS count FROM auth_roster WHERE role = ?", [normalizedRole]);
+  const existingCount = Number(rosterCountRow?.count || 0);
+  if (existingCount > 0) {
+    await recordRosterBootstrapState(normalizedRole, {
+      importStatus: "adopted_existing_roster",
+      importedCount: existingCount,
+    });
+    console.info(`[roster] ${normalizedRole} roster already present in database; skipping CSV bootstrap.`);
+    return 0;
+  }
+
   if (!fs.existsSync(filePath)) {
     return 0;
   }
 
   const raw = fs.readFileSync(filePath, "utf8");
-  return importRosterCsvText(raw, role, idHeader, path.basename(filePath));
+  if (!String(raw || "").trim()) {
+    return 0;
+  }
+
+  const sourceName = path.basename(filePath);
+  const importedCount = await importRosterCsvText(raw, normalizedRole, idHeader, sourceName);
+  await recordRosterBootstrapState(normalizedRole, {
+    sourceName,
+    importStatus: "imported_from_csv",
+    importedCount,
+  });
+  console.info(`[roster] Imported ${importedCount} ${normalizedRole} roster row(s) from ${sourceName}.`);
+  return importedCount;
 }
 
 function escapeCsvValue(value) {
@@ -2081,6 +2155,17 @@ async function initDatabase() {
       source_file TEXT,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (auth_id, role)
+    )
+  `);
+
+  await run(`
+    CREATE TABLE IF NOT EXISTS roster_import_state (
+      roster_key TEXT PRIMARY KEY,
+      role TEXT NOT NULL,
+      source_name TEXT,
+      import_status TEXT NOT NULL DEFAULT 'completed',
+      imported_count INTEGER NOT NULL DEFAULT 0,
+      completed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   `);
 
@@ -2850,8 +2935,8 @@ async function initDatabase() {
     ]);
   }
 
-  await importRoster(STUDENT_ROSTER_PATH, "student", "matric_number");
-  await importRoster(LECTURER_ROSTER_PATH, "teacher", "teacher_code");
+  await importRosterBootstrapIfNeeded(STUDENT_ROSTER_PATH, "student", "matric_number");
+  await importRosterBootstrapIfNeeded(LECTURER_ROSTER_PATH, "teacher", "teacher_code");
   await migrateLegacyReceiptsToReconciliation();
 }
 

@@ -7,6 +7,7 @@ const projectRoot = path.resolve(__dirname, "..");
 const DEFAULT_IMPORT_ORDER = [
   "users",
   "auth_roster",
+  "roster_import_state",
   "user_password_overrides",
   "user_profiles",
   "department_checklists",
