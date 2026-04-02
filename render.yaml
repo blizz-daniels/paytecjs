@@ -1,12 +1,12 @@
 databases:
   - name: paytec-db
-    plan: basic-1gb
+    plan: free
 
 services:
   - type: web
     name: paytec
     runtime: node
-    plan: standard
+    plan: free
     buildCommand: npm install && npx puppeteer browsers install chrome
     startCommand: npm start
     healthCheckPath: /health
@@ -20,9 +20,9 @@ services:
       - key: SESSION_SECRET
         generateValue: true
       - key: DATA_DIR
-        value: /var/data/paytec
+        value: /tmp/paytec
       - key: RECEIPT_OUTPUT_DIR
-        value: /var/data/paytec/approved-receipts
+        value: /tmp/paytec/approved-receipts
       - key: RATE_LIMIT_PRUNE_INTERVAL_MS
         value: 300000
       - key: MEMORY_LOG_INTERVAL_MS
@@ -37,7 +37,3 @@ services:
         value: /opt/render/project/src/data/students.csv
       - key: LECTURER_ROSTER_PATH
         value: /opt/render/project/src/data/teachers.csv
-    disk:
-      name: paytec-data
-      mountPath: /var/data
-      sizeGB: 1
