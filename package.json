@@ -5,12 +5,16 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
+    "dev:legacy": "node server.js",
+    "dev:next": "next dev",
+    "build:next": "next build",
+    "start:next": "next start",
     "test": "jest --runInBand",
     "generate:approved-receipts": "node scripts/generate-receipts.js",
     "migrate:sqlite-to-postgres": "node scripts/migrate-sqlite-to-postgres.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20.9"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -24,10 +28,17 @@
     "puppeteer": "^24.2.1",
     "pg": "^8.13.1",
     "sqlite3": "^5.1.7",
-    "xlsx": "^0.18.5"
+    "xlsx": "^0.18.5",
+    "next": "^16.1.6",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4"
   },
   "devDependencies": {
     "jest": "^29.7.0",
-    "supertest": "^7.1.1"
+    "supertest": "^7.1.1",
+    "typescript": "^5.8.3",
+    "@types/node": "^22.15.3",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0"
   }
 }

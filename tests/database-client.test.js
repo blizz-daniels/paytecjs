@@ -44,4 +44,14 @@ describe("database client", () => {
     const existsRow = await db.get("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'payment_items'");
     expect(existsRow).toMatchObject({ name: "payment_items" });
   });
+
+  test("blocks sqlite driver in production mode", () => {
+    expect(() =>
+      openDatabaseClient({
+        driver: "sqlite",
+        isProduction: true,
+        sqlitePath: path.join(tmpDir, "prod.sqlite"),
+      })
+    ).toThrow(/SQLite is not allowed in production/i);
+  });
 });

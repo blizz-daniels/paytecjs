@@ -1,0 +1,1535 @@
+function setPaymentStatus(id, message, isError) {
+  const node = document.getElementById(id);
+  if (!node) {
+    return;
+  }
+  node.textContent = message;
+  node.style.color = isError ? "var(--danger)" : "var(--text)";
+}
+
+function escapeHtml(value) {
+  return String(value || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function formatDate(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value || "-";
+  }
+  return date.toLocaleString();
+}
+
+function formatMoney(value, currency = "NGN") {
+  const amount = Number(value || 0);
+  const safeCurrency = String(currency || "NGN").toUpperCase();
+  if (!Number.isFinite(amount)) {
+    return `${safeCurrency} 0.00`;
+  }
+  return `${safeCurrency} ${amount.toFixed(2)}`;
+}
+
+function normalizePaystackSessionState(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized) {
+    return "";
+  }
+  if (normalized === "pending" || normalized === "processing") {
+    return "pending_webhook";
+  }
+  return normalized;
+}
+
+function formatPaystackCheckoutStatusMessage(status, reference = "") {
+  const state = normalizePaystackSessionState(status);
+  const refPart = reference ? ` (${reference})` : "";
+  if (state === "approved") {
+    return {
+      text: `Paystack payment${refPart} is confirmed and approved.`,
+      isError: false,
+      toastType: "success",
+    };
+  }
+  if (state === "under_review") {
+    return {
+      text: `Paystack payment${refPart} was received and is under review.`,
+      isError: false,
+      toastType: "warning",
+    };
+  }
+  if (state === "failed") {
+    return {
+      text: `Paystack payment${refPart} could not be confirmed yet.`,
+      isError: true,
+      toastType: "error",
+    };
+  }
+  if (state === "pending_webhook") {
+    return {
+      text: `Paystack checkout${refPart} returned. Waiting for webhook confirmation.`,
+      isError: false,
+      toastType: "warning",
+    };
+  }
+  if (state === "initiated") {
+    return {
+      text: `Paystack checkout${refPart} was initiated.`,
+      isError: false,
+      toastType: "warning",
+    };
+  }
+  return {
+    text: `Paystack status: ${state || "unknown"}${refPart}.`,
+    isError: false,
+    toastType: "warning",
+  };
+}
+
+function statusBadge(status) {
+  const normalized = String(status || "").toLowerCase();
+  if (normalized === "approved") {
+    return '<span class="status-badge status-badge--success">approved</span>';
+  }
+  if (normalized === "rejected") {
+    return '<span class="status-badge status-badge--error">rejected</span>';
+  }
+  if (normalized === "under_review") {
+    return '<span class="status-badge status-badge--warning">under review</span>';
+  }
+  if (normalized === "needs_review") {
+    return '<span class="status-badge status-badge--warning">needs review</span>';
+  }
+  if (normalized === "needs_student_confirmation") {
+    return '<span class="status-badge status-badge--warning">needs student confirmation</span>';
+  }
+  if (normalized === "duplicate") {
+    return '<span class="status-badge status-badge--error">duplicate</span>';
+  }
+  if (normalized === "unmatched") {
+    return '<span class="status-badge status-badge--error">unmatched</span>';
+  }
+  return `<span class="status-badge">${escapeHtml(normalized || "unknown")}</span>`;
+}
+
+function sourceBadge(source) {
+  const normalized = String(source || "").toLowerCase();
+  if (normalized === "paystack") {
+    return '<span class="status-badge status-badge--success">paystack</span>';
+  }
+  return `<span class="status-badge">${escapeHtml(normalized || "unknown")}</span>`;
+}
+
+function paystackStateBadge(item) {
+  const explicitState = normalizePaystackSessionState(item?.paystack_state);
+  const obligationStatus = String(item?.obligation_status || "").toLowerCase();
+  if (obligationStatus === "paid" || obligationStatus === "overpaid") {
+    return '<span class="status-badge status-badge--success">approved</span>';
+  }
+  if (explicitState === "approved") {
+    return '<span class="status-badge status-badge--success">approved</span>';
+  }
+  if (explicitState === "under_review") {
+    return '<span class="status-badge status-badge--warning">under review</span>';
+  }
+  if (explicitState === "failed") {
+    return '<span class="status-badge status-badge--error">failed</span>';
+  }
+  if (explicitState === "pending_webhook") {
+    return '<span class="status-badge status-badge--warning">pending webhook</span>';
+  }
+  if (explicitState === "initiated") {
+    return '<span class="status-badge">initiated</span>';
+  }
+  return '<span class="status-badge">not started</span>';
+}
+
+function normalizePaystackReferenceRequestStatus(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized === "pending" || normalized === "verified" || normalized === "failed") {
+    return normalized;
+  }
+  return "pending";
+}
+
+function paystackReferenceRequestStatusBadge(statusValue) {
+  const status = normalizePaystackReferenceRequestStatus(statusValue);
+  if (status === "verified") {
+    return '<span class="status-badge status-badge--success">verified</span>';
+  }
+  if (status === "failed") {
+    return '<span class="status-badge status-badge--error">failed</span>';
+  }
+  return '<span class="status-badge status-badge--warning">pending</span>';
+}
+
+function formatPaystackReferenceRequestResult(result) {
+  if (!result || typeof result !== "object") {
+    return "-";
+  }
+  if (result.error) {
+    return String(result.error);
+  }
+  const transactionId = Number(result.transaction_id || 0);
+  const status = String(result.status || "").trim().toLowerCase();
+  if (transactionId > 0) {
+    if (status) {
+      return `Txn #${transactionId} (${status})`;
+    }
+    return `Txn #${transactionId}`;
+  }
+  if (status) {
+    return status;
+  }
+  const gatewayStatus = String(result.gateway_status || "").trim().toLowerCase();
+  if (gatewayStatus) {
+    return `Gateway: ${gatewayStatus}`;
+  }
+  return "-";
+}
+
+function reminderBadge(level, text) {
+  const normalized = String(level || "").toLowerCase();
+  if (normalized === "overdue") {
+    return `<span class="status-badge status-badge--error">${escapeHtml(text)}</span>`;
+  }
+  if (normalized === "today" || normalized === "urgent") {
+    return `<span class="status-badge status-badge--warning">${escapeHtml(text)}</span>`;
+  }
+  if (normalized === "settled") {
+    return `<span class="status-badge status-badge--success">${escapeHtml(text)}</span>`;
+  }
+  return `<span class="status-badge">${escapeHtml(text || "No reminder")}</span>`;
+}
+
+function getSlaMeta(row) {
+  const status = String(row?.status || "").toLowerCase();
+  if (status !== "submitted" && status !== "under_review") {
+    return null;
+  }
+  const submittedAt = new Date(row?.submitted_at || "");
+  if (Number.isNaN(submittedAt.getTime())) {
+    return null;
+  }
+  const targetHours = status === "submitted" ? 24 : 8;
+  const elapsedHours = (Date.now() - submittedAt.getTime()) / (1000 * 60 * 60);
+  const remaining = targetHours - elapsedHours;
+  if (remaining >= 0) {
+    return {
+      className: "status-badge status-badge--success",
+      text: `${Math.ceil(remaining)}h left`,
+    };
+  }
+  return {
+    className: "status-badge status-badge--error",
+    text: `${Math.ceil(Math.abs(remaining))}h overdue`,
+  };
+}
+
+function setButtonBusy(button, isBusy, busyLabel) {
+  if (!button) {
+    return;
+  }
+  if (!button.dataset.defaultLabel) {
+    button.dataset.defaultLabel = button.textContent || "";
+  }
+  button.disabled = !!isBusy;
+  button.textContent = isBusy ? busyLabel : button.dataset.defaultLabel;
+}
+
+async function requestJson(url, { method = "GET", payload } = {}) {
+  const response = await fetch(url, {
+    method,
+    credentials: "same-origin",
+    headers: payload ? { "Content-Type": "application/json" } : undefined,
+    body: payload ? JSON.stringify(payload) : undefined,
+  });
+  let data = null;
+  try {
+    data = await response.json();
+  } catch (_err) {
+    data = null;
+  }
+  if (!response.ok) {
+    throw new Error((data && data.error) || "Request failed.");
+  }
+  return data;
+}
+
+function asArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function asObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+const paymentState = {
+  me: null,
+  paymentItems: [],
+  myReceipts: [],
+  ledger: null,
+  myPaystackReferenceRequests: [],
+  paystackReferenceRequests: [],
+  selectedPaystackReferenceRequestIds: new Set(),
+  queueRows: [],
+  queuePagination: {
+    page: 1,
+    pageSize: 50,
+    total: 0,
+    totalPages: 1,
+  },
+  reconciliationSummary: null,
+  paystack: {
+    pollTimer: null,
+    pollAttempts: 0,
+    maxAttempts: 20,
+    pollEveryMs: 6000,
+  },
+};
+
+function getPaystackStatusStorageKey(kind) {
+  const username = String(paymentState?.me?.username || "anonymous")
+    .trim()
+    .toLowerCase();
+  return `paytec:paystack:${username}:${kind}`;
+}
+
+function persistLatestPaystackStatus(status, reference = "") {
+  if (!window.sessionStorage) {
+    return;
+  }
+  const normalizedStatus = normalizePaystackSessionState(status);
+  if (!normalizedStatus) {
+    return;
+  }
+  try {
+    window.sessionStorage.setItem(getPaystackStatusStorageKey("status"), normalizedStatus);
+    window.sessionStorage.setItem(getPaystackStatusStorageKey("reference"), String(reference || ""));
+    window.sessionStorage.setItem(getPaystackStatusStorageKey("updated_at"), String(Date.now()));
+  } catch (_err) {
+    // Ignore storage failures.
+  }
+}
+
+function readLatestPaystackStatus() {
+  if (!window.sessionStorage) {
+    return null;
+  }
+  try {
+    const status = window.sessionStorage.getItem(getPaystackStatusStorageKey("status")) || "";
+    const reference = window.sessionStorage.getItem(getPaystackStatusStorageKey("reference")) || "";
+    const updatedAtRaw = window.sessionStorage.getItem(getPaystackStatusStorageKey("updated_at")) || "";
+    const updatedAt = Number(updatedAtRaw || 0);
+    if (!status) {
+      return null;
+    }
+    return {
+      status: normalizePaystackSessionState(status),
+      reference: String(reference || "").trim(),
+      updatedAt: Number.isFinite(updatedAt) ? updatedAt : 0,
+    };
+  } catch (_err) {
+    return null;
+  }
+}
+
+function stopPaystackLedgerPolling() {
+  if (paymentState.paystack.pollTimer) {
+    window.clearInterval(paymentState.paystack.pollTimer);
+    paymentState.paystack.pollTimer = null;
+  }
+  paymentState.paystack.pollAttempts = 0;
+}
+
+function shouldKeepPollingPaystack(ledger) {
+  const items = ledger && Array.isArray(ledger.items) ? ledger.items : [];
+  const hasPendingInLedger = items.some((item) => {
+    const state = normalizePaystackSessionState(item?.paystack_state);
+    return state === "pending_webhook" || state === "initiated";
+  });
+  if (hasPendingInLedger) {
+    return true;
+  }
+  const latest = readLatestPaystackStatus();
+  if (!latest) {
+    return false;
+  }
+  const isPending = latest.status === "pending_webhook" || latest.status === "initiated";
+  if (!isPending) {
+    return false;
+  }
+  const ageMs = Date.now() - Number(latest.updatedAt || 0);
+  return ageMs <= 1000 * 60 * 20;
+}
+
+function startPaystackLedgerPollingIfNeeded() {
+  if (paymentState?.me?.role !== "student") {
+    return;
+  }
+  if (!shouldKeepPollingPaystack(paymentState.ledger)) {
+    stopPaystackLedgerPolling();
+    return;
+  }
+  if (paymentState.paystack.pollTimer) {
+    return;
+  }
+  paymentState.paystack.pollAttempts = 0;
+  paymentState.paystack.pollTimer = window.setInterval(async () => {
+    paymentState.paystack.pollAttempts += 1;
+    if (paymentState.paystack.pollAttempts > paymentState.paystack.maxAttempts) {
+      stopPaystackLedgerPolling();
+      const latest = readLatestPaystackStatus();
+      if (latest && (latest.status === "pending_webhook" || latest.status === "initiated")) {
+        const message = formatPaystackCheckoutStatusMessage(latest.status, latest.reference);
+        setPaymentStatus(
+          "paystackCheckoutStatus",
+          `${message.text} If this takes too long, use Post Reference to Lecturer.`,
+          false
+        );
+      }
+      return;
+    }
+    try {
+      await loadStudentLedger();
+    } catch (_err) {
+      // Keep polling until attempts are exhausted.
+    }
+  }, paymentState.paystack.pollEveryMs);
+}
+
+function pickMostRelevantPaystackLedgerItem(ledger) {
+  const items = ledger && Array.isArray(ledger.items) ? ledger.items : [];
+  if (!items.length) {
+    return null;
+  }
+  const scoreByState = {
+    pending_webhook: 60,
+    initiated: 50,
+    approved: 40,
+    under_review: 30,
+    failed: 20,
+  };
+  let best = null;
+  let bestScore = -1;
+  items.forEach((item) => {
+    const obligationStatus = String(item?.obligation_status || "").toLowerCase();
+    const state =
+      obligationStatus === "paid" || obligationStatus === "overpaid"
+        ? "approved"
+        : normalizePaystackSessionState(item?.paystack_state);
+    const hasRef = String(item?.paystack_reference || "").trim().length > 0;
+    const score = Number(scoreByState[state] || 0) + (hasRef ? 5 : 0);
+    if (score > bestScore) {
+      best = { state, reference: String(item?.paystack_reference || "").trim() };
+      bestScore = score;
+    }
+  });
+  return bestScore > 0 ? best : null;
+}
+
+function syncPaystackCheckoutStatusFromLedger(ledger) {
+  const candidate = pickMostRelevantPaystackLedgerItem(ledger);
+  if (candidate && candidate.state) {
+    persistLatestPaystackStatus(candidate.state, candidate.reference);
+    const message = formatPaystackCheckoutStatusMessage(candidate.state, candidate.reference);
+    setPaymentStatus("paystackCheckoutStatus", message.text, message.isError);
+    return;
+  }
+  const latest = readLatestPaystackStatus();
+  if (latest && latest.status) {
+    const message = formatPaystackCheckoutStatusMessage(latest.status, latest.reference);
+    setPaymentStatus("paystackCheckoutStatus", message.text, message.isError);
+  }
+}
+
+function syncPostPaystackReferenceInputFromLatest() {
+  const referenceInput = document.getElementById("postPaystackReferenceInput");
+  if (!(referenceInput instanceof HTMLInputElement)) {
+    return;
+  }
+  const hasManualValue = String(referenceInput.value || "").trim().length > 0;
+  if (hasManualValue) {
+    return;
+  }
+  const latest = readLatestPaystackStatus();
+  const latestReference = String(latest?.reference || "").trim();
+  if (latestReference) {
+    referenceInput.value = latestReference;
+    return;
+  }
+  const bestLedgerItem = pickMostRelevantPaystackLedgerItem(paymentState.ledger);
+  const ledgerReference = String(bestLedgerItem?.reference || "").trim();
+  if (ledgerReference) {
+    referenceInput.value = ledgerReference;
+  }
+}
+
+function renderPaymentItemSelects(items) {
+  const safeItems = asArray(items);
+  const selectIds = ["queuePaymentItem"];
+  selectIds.forEach((id) => {
+    const select = document.getElementById(id);
+    if (!select) {
+      return;
+    }
+    const existingValue = select.value;
+    const options = ['<option value="">All</option>']
+      .concat(
+        safeItems.map(
+          (item) =>
+            `<option value="${item.id}">${escapeHtml(item.title)} - ${escapeHtml(item.currency)} ${escapeHtml(item.expected_amount)}${
+              item.my_reference ? ` (Ref: ${escapeHtml(item.my_reference)})` : ""
+            }</option>`
+        )
+      )
+      .join("");
+    select.innerHTML = options;
+    if (existingValue && safeItems.some((item) => String(item.id) === existingValue)) {
+      select.value = existingValue;
+    }
+  });
+}
+
+function renderLedger(ledger) {
+  const summary = ledger && ledger.summary ? ledger.summary : {};
+  const nextDueItem = ledger && ledger.nextDueItem ? ledger.nextDueItem : null;
+  const defaultCurrency = (nextDueItem && nextDueItem.currency) || "NGN";
+
+  const mapping = [
+    ["ledgerTotalDue", formatMoney(summary.totalDue, defaultCurrency)],
+    ["ledgerApprovedPaid", formatMoney(summary.totalApprovedPaid, defaultCurrency)],
+    ["ledgerPendingPaid", formatMoney(summary.totalPendingPaid, defaultCurrency)],
+    ["ledgerOutstanding", formatMoney(summary.totalOutstanding, defaultCurrency)],
+    ["ledgerOverdueCount", String(Number(summary.overdueCount || 0))],
+    ["ledgerDueSoonCount", String(Number(summary.dueSoonCount || 0))],
+  ];
+  mapping.forEach(([id, text]) => {
+    const node = document.getElementById(id);
+    if (node) {
+      node.textContent = text;
+    }
+  });
+
+  const nextDueNode = document.getElementById("ledgerNextDue");
+  if (nextDueNode) {
+    if (!nextDueItem) {
+      nextDueNode.textContent = "No upcoming due item.";
+    } else {
+      nextDueNode.textContent = `${nextDueItem.title} (${formatMoney(nextDueItem.outstanding, nextDueItem.currency)}) - ${nextDueItem.reminder_text}`;
+    }
+  }
+}
+
+function getLatestApprovedReceiptIdForPaymentItem(paymentItemId) {
+  const itemId = Number.parseInt(String(paymentItemId || ""), 10);
+  if (!Number.isFinite(itemId) || itemId <= 0) {
+    return 0;
+  }
+  const rows = asArray(paymentState.myReceipts);
+  const match = rows.find((row) => {
+    const sameItem = Number(row.payment_item_id || 0) === itemId;
+    const approved = String(row.status || "").toLowerCase() === "approved";
+    const available = Number(row.approved_receipt_available || 0) === 1;
+    return sameItem && approved && available;
+  });
+  if (!match) {
+    return 0;
+  }
+  const receiptId = Number.parseInt(String(match.id || ""), 10);
+  return Number.isFinite(receiptId) && receiptId > 0 ? receiptId : 0;
+}
+
+function renderReminderCalendar(ledger) {
+  const container = document.getElementById("paymentReminderRows");
+  if (!container) {
+    return;
+  }
+  const items = asArray(ledger?.items);
+  container.innerHTML = "";
+  if (!items.length) {
+    container.innerHTML = '<p class="details-tile-list__empty">No payment items available.</p>';
+    return;
+  }
+
+  items.forEach((item) => {
+    const outstanding = Number(item.outstanding || 0);
+    const isSettled = outstanding <= 0.009;
+    const canPayWithPaystack = Number(item.obligation_id || 0) > 0 && outstanding > 0.009;
+    const ledgerReceiptId = Number.parseInt(String(item.approved_receipt_id || ""), 10);
+    const approvedReceiptId =
+      Number.isFinite(ledgerReceiptId) && ledgerReceiptId > 0
+        ? ledgerReceiptId
+        : getLatestApprovedReceiptIdForPaymentItem(item.id);
+    let actionHtml = isSettled
+      ? '<span class="status-badge status-badge--warning">Preparing receipt...</span>'
+      : '<span class="status-badge status-badge--warning">Awaiting payment</span>';
+    if (canPayWithPaystack) {
+      actionHtml = `<button class="btn btn-secondary" type="button" data-action="paystack-checkout" data-obligation-id="${item.obligation_id}" data-outstanding="${outstanding.toFixed(
+        2
+      )}">Pay with Paystack</button>`;
+    } else if (isSettled && approvedReceiptId > 0) {
+      actionHtml = `<a class="btn btn-secondary" href="/api/payment-receipts/${encodeURIComponent(
+        String(approvedReceiptId)
+      )}/file?variant=approved&refresh=1" target="_blank" rel="noopener" download>Download receipt</a>`;
+    }
+    const tile = document.createElement("article");
+    tile.className = "details-tile";
+    tile.innerHTML = `
+      <div class="details-tile__fields">
+        <div class="details-tile__field">
+          <p class="details-tile__label">Payment item</p>
+          <p class="details-tile__value">${escapeHtml(item.title || "-")}</p>
+        </div>
+        <div class="details-tile__field">
+          <p class="details-tile__label">Due date</p>
+          <p class="details-tile__value">${escapeHtml(item.due_date || "No due date")}</p>
+        </div>
+        <div class="details-tile__field">
+          <p class="details-tile__label">Status</p>
+          <p class="details-tile__value">${reminderBadge(item.reminder_level, item.reminder_text)}</p>
+        </div>
+        <div class="details-tile__field">
+          <p class="details-tile__label">Outstanding</p>
+          <p class="details-tile__value">${escapeHtml(formatMoney(item.outstanding, item.currency))}</p>
+        </div>
+        <div class="details-tile__field">
+          <p class="details-tile__label">Paystack state</p>
+          <p class="details-tile__value">${paystackStateBadge(item)}</p>
+        </div>
+        <div class="details-tile__field">
+          <p class="details-tile__label">Paystack reference</p>
+          <p class="details-tile__value">${escapeHtml(item.paystack_reference || "-")}</p>
+        </div>
+      </div>
+      <div class="details-tile__actions">${actionHtml}</div>
+    `;
+    container.appendChild(tile);
+  });
+}
+
+function renderPaymentTimeline(ledger) {
+  const tbody = document.getElementById("paymentTimelineRows");
+  if (!tbody) {
+    return;
+  }
+  const rows = asArray(ledger?.timeline);
+  tbody.innerHTML = "";
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="4" style="color:#636b8a;">No reconciliation updates yet.</td></tr>';
+    return;
+  }
+  rows.forEach((row) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${escapeHtml(formatDate(row.created_at || ""))}</td>
+      <td>${escapeHtml(row.payment_item_title || "-")}</td>
+      <td>${escapeHtml(String(row.action || "").replaceAll("_", " ") || "-")}</td>
+      <td>${escapeHtml(row.note || "-")}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+function renderMyReceipts(rows) {
+  const container = document.getElementById("myReceiptRows");
+  if (!container) {
+    return;
+  }
+  container.innerHTML = "";
+  const approvedRows = asArray(rows).filter((row) => String(row.status || "").toLowerCase() === "approved");
+  if (!approvedRows.length) {
+    container.innerHTML = '<p class="details-tile-list__empty">No approved receipts yet.</p>';
+    return;
+  }
+  approvedRows.forEach((row) => {
+    const approvedReceiptAvailable = Number(row.approved_receipt_available || 0) === 1;
+    const approvedReceiptField = `
+      <div class="details-tile__field details-tile__field--full">
+        <p class="details-tile__label">Approved receipt</p>
+        <p class="details-tile__value details-tile__value--normal">${
+            approvedReceiptAvailable
+              ? `<a class="btn btn-secondary" href="/api/payment-receipts/${encodeURIComponent(
+                  String(row.id || "")
+                )}/file?variant=approved&refresh=1" target="_blank" rel="noopener" download>Download approved receipt</a>`
+              : '<span class="status-badge status-badge--warning">Pending generation</span>'
+        }</p>
+      </div>
+    `;
+    const tile = document.createElement("article");
+    tile.className = "details-tile";
+    tile.innerHTML = `
+      <div class="details-tile__fields">
+        <div class="details-tile__field">
+          <p class="details-tile__label">Payment item</p>
+          <p class="details-tile__value">${escapeHtml(row.payment_item_title || "-")}</p>
+        </div>
+        <div class="details-tile__field">
+          <p class="details-tile__label">Amount</p>
+          <p class="details-tile__value">${escapeHtml(formatMoney(row.amount_paid, row.currency))}</p>
+        </div>
+        <div class="details-tile__field">
+          <p class="details-tile__label">Reference</p>
+          <p class="details-tile__value">${escapeHtml(row.transaction_ref || "-")}</p>
+        </div>
+        <div class="details-tile__field">
+          <p class="details-tile__label">Status</p>
+          <p class="details-tile__value">${statusBadge(row.status)}</p>
+        </div>
+        <div class="details-tile__field">
+          <p class="details-tile__label">Approved</p>
+          <p class="details-tile__value">${escapeHtml(formatDate(row.reviewed_at || row.submitted_at))}</p>
+        </div>
+        ${approvedReceiptField}
+      </div>
+    `;
+    container.appendChild(tile);
+  });
+}
+
+function renderMyPaystackReferenceRequests(rows) {
+  const container = document.getElementById("myPaystackReferenceRequestRows");
+  if (!container) {
+    return;
+  }
+  container.innerHTML = "";
+  const safeRows = asArray(rows);
+  if (!safeRows.length) {
+    container.innerHTML = '<p class="details-tile-list__empty">No posted Paystack references yet.</p>';
+    return;
+  }
+  safeRows.forEach((row) => {
+    const tile = document.createElement("article");
+    tile.className = "details-tile";
+    tile.innerHTML = `
+      <div class="details-tile__fields">
+        <div class="details-tile__field">
+          <p class="details-tile__label">Reference</p>
+          <p class="details-tile__value">${escapeHtml(row.reference || "-")}</p>
+        </div>
+        <div class="details-tile__field">
+          <p class="details-tile__label">Status</p>
+          <p class="details-tile__value">${paystackReferenceRequestStatusBadge(row.status)}</p>
+        </div>
+        <div class="details-tile__field">
+          <p class="details-tile__label">Posted</p>
+          <p class="details-tile__value">${escapeHtml(formatDate(row.created_at))}</p>
+        </div>
+        <div class="details-tile__field">
+          <p class="details-tile__label">Result</p>
+          <p class="details-tile__value">${escapeHtml(formatPaystackReferenceRequestResult(row.result || {}))}</p>
+        </div>
+        <div class="details-tile__field details-tile__field--full">
+          <p class="details-tile__label">Note</p>
+          <p class="details-tile__value details-tile__value--normal">${escapeHtml(row.note || "-")}</p>
+        </div>
+      </div>
+    `;
+    container.appendChild(tile);
+  });
+}
+
+function renderPaystackReferenceRequests(rows) {
+  const tbody = document.getElementById("paystackReferenceRequestRows");
+  const selectAllNode = document.getElementById("paystackReferenceRequestsSelectAll");
+  if (!tbody) {
+    return;
+  }
+  const safeRows = asArray(rows);
+  tbody.innerHTML = "";
+  if (!safeRows.length) {
+    tbody.innerHTML = '<tr><td colspan="8" style="color:#636b8a;">No Paystack reference requests found.</td></tr>';
+    if (selectAllNode) {
+      selectAllNode.checked = false;
+    }
+    return;
+  }
+
+  safeRows.forEach((row) => {
+    const id = Number(row.id || 0);
+    const checkedAttr = paymentState.selectedPaystackReferenceRequestIds.has(id) ? "checked" : "";
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td><input type="checkbox" class="paystack-ref-request-select-row" data-id="${id}" ${checkedAttr} /></td>
+      <td>${escapeHtml(formatDate(row.created_at || ""))}</td>
+      <td>${escapeHtml(row.student_username || "-")}</td>
+      <td>${escapeHtml(row.payment_item_title || "-")}</td>
+      <td>${escapeHtml(row.reference || "-")}</td>
+      <td>${escapeHtml(row.note || "-")}</td>
+      <td>${paystackReferenceRequestStatusBadge(row.status)}</td>
+      <td>${escapeHtml(formatPaystackReferenceRequestResult(row.result || {}))}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+
+  if (selectAllNode) {
+    const selectableRows = safeRows.length;
+    const selectedCount = safeRows.filter((row) =>
+      paymentState.selectedPaystackReferenceRequestIds.has(Number(row.id || 0))
+    ).length;
+    selectAllNode.checked = selectableRows > 0 && selectedCount === selectableRows;
+  }
+}
+
+function renderPaymentItemsTable(items) {
+  const container = document.getElementById("paymentItemRows");
+  if (!container || !paymentState.me) {
+    return;
+  }
+  container.innerHTML = "";
+  const manageable = asArray(items).filter(
+    (item) => paymentState.me.role === "admin" || item.created_by === paymentState.me.username
+  );
+  if (!manageable.length) {
+    container.innerHTML = '<p class="details-tile-list__empty">No payment items yet.</p>';
+    return;
+  }
+  manageable.forEach((item) => {
+    const tile = document.createElement("article");
+    tile.className = "details-tile";
+    tile.innerHTML = `
+      <div class="details-tile__fields">
+        <div class="details-tile__field">
+          <p class="details-tile__label">Title</p>
+          <p class="details-tile__value">${escapeHtml(item.title || "-")}</p>
+        </div>
+        <div class="details-tile__field">
+          <p class="details-tile__label">Amount</p>
+          <p class="details-tile__value">${escapeHtml(formatMoney(item.expected_amount, item.currency))}</p>
+        </div>
+        <div class="details-tile__field">
+          <p class="details-tile__label">Due date</p>
+          <p class="details-tile__value">${escapeHtml(item.due_date || "-")}</p>
+        </div>
+        <div class="details-tile__field">
+          <p class="details-tile__label">Owner</p>
+          <p class="details-tile__value">${escapeHtml(item.created_by || "-")}</p>
+        </div>
+      </div>
+      <div class="details-tile__actions">
+        <button class="btn btn-secondary" type="button" data-action="edit-item" data-id="${item.id}">Edit</button>
+        <button class="btn" type="button" data-action="delete-item" data-id="${item.id}" style="background:#b42318;">Delete</button>
+      </div>
+    `;
+    container.appendChild(tile);
+  });
+}
+
+function renderQueue(rows) {
+  const tbody = document.getElementById("receiptQueueRows");
+  if (!tbody) {
+    return;
+  }
+  const safeRows = asArray(rows);
+  tbody.innerHTML = "";
+  if (!safeRows.length) {
+    tbody.innerHTML = '<tr><td colspan="7" style="color:#636b8a;">No approved transactions match the current filters.</td></tr>';
+    return;
+  }
+  safeRows.forEach((row) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${escapeHtml(row.student_full_name || row.student_username || "-")}</td>
+      <td>${escapeHtml(row.student_username || "-")}</td>
+      <td>${escapeHtml(row.payment_item_title || "-")}</td>
+      <td>${escapeHtml(formatMoney(row.amount, row.currency))}</td>
+      <td>${escapeHtml(row.paystack_reference || row.txn_ref || "-")}</td>
+      <td>${escapeHtml(formatDate(row.approved_at || row.reviewed_at || row.created_at || ""))}</td>
+      <td>${statusBadge(row.status)}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+
+function renderQueuePagination() {
+  const infoNode = document.getElementById("queuePageInfo");
+  const prevButton = document.getElementById("queuePrevPage");
+  const nextButton = document.getElementById("queueNextPage");
+  const pagination = paymentState.queuePagination || { page: 1, totalPages: 1, total: 0 };
+  if (infoNode) {
+    infoNode.textContent = `Page ${pagination.page} of ${pagination.totalPages} (${pagination.total} total)`;
+  }
+  if (prevButton) {
+    prevButton.disabled = pagination.page <= 1;
+  }
+  if (nextButton) {
+    nextButton.disabled = pagination.page >= pagination.totalPages;
+  }
+}
+
+async function loadPaymentItems() {
+  const payload = await requestJson("/api/payment-items");
+  paymentState.paymentItems = Array.isArray(payload) ? payload : asArray(payload?.items);
+  renderPaymentItemSelects(paymentState.paymentItems);
+  renderPaymentItemsTable(paymentState.paymentItems);
+}
+
+async function loadStudentReceipts() {
+  const payload = await requestJson("/api/my/payment-receipts");
+  paymentState.myReceipts = Array.isArray(payload) ? payload : asArray(payload?.items);
+  renderMyReceipts(paymentState.myReceipts);
+  if (paymentState.ledger) {
+    renderReminderCalendar(paymentState.ledger);
+  }
+}
+
+async function loadStudentLedger() {
+  const payload = await requestJson("/api/my/payment-ledger");
+  paymentState.ledger = asObject(payload);
+  paymentState.ledger.items = asArray(paymentState.ledger.items);
+  paymentState.ledger.timeline = asArray(paymentState.ledger.timeline);
+  paymentState.ledger.summary = asObject(paymentState.ledger.summary);
+  renderLedger(paymentState.ledger);
+  renderReminderCalendar(paymentState.ledger);
+  renderPaymentTimeline(paymentState.ledger);
+  syncPaystackCheckoutStatusFromLedger(paymentState.ledger);
+  syncPostPaystackReferenceInputFromLatest();
+  startPaystackLedgerPollingIfNeeded();
+}
+
+async function loadStudentPaystackReferenceRequests() {
+  const payload = await requestJson("/api/my/payments/paystack/reference-requests");
+  paymentState.myPaystackReferenceRequests = Array.isArray(payload?.items) ? payload.items : [];
+  renderMyPaystackReferenceRequests(paymentState.myPaystackReferenceRequests);
+}
+
+async function loadPaystackReferenceRequests() {
+  if (!paymentState.me || (paymentState.me.role !== "teacher" && paymentState.me.role !== "admin")) {
+    return;
+  }
+  const endpoint =
+    paymentState.me.role === "admin"
+      ? "/api/admin/paystack-reference-requests"
+      : "/api/lecturer/paystack-reference-requests";
+  const payload = await requestJson(endpoint);
+  paymentState.paystackReferenceRequests = Array.isArray(payload?.items) ? payload.items : [];
+  const validIds = new Set(asArray(paymentState.paystackReferenceRequests).map((row) => Number(row.id || 0)));
+  paymentState.selectedPaystackReferenceRequestIds = new Set(
+    [...paymentState.selectedPaystackReferenceRequestIds].filter((id) => validIds.has(id))
+  );
+  renderPaystackReferenceRequests(paymentState.paystackReferenceRequests);
+}
+
+function applyPaystackCallbackStatusFromQuery() {
+  const params = new URLSearchParams(window.location.search || "");
+  const paystackStatus = String(params.get("paystack_status") || "").trim().toLowerCase();
+  const paystackReference = String(params.get("paystack_reference") || "").trim();
+  if (!paystackStatus) {
+    return;
+  }
+  persistLatestPaystackStatus(paystackStatus, paystackReference);
+  const message = formatPaystackCheckoutStatusMessage(paystackStatus, paystackReference);
+  setPaymentStatus("paystackCheckoutStatus", message.text, message.isError);
+  syncPostPaystackReferenceInputFromLatest();
+  startPaystackLedgerPollingIfNeeded();
+  if (window.showToast) {
+    window.showToast(message.text, { type: message.toastType });
+  }
+  params.delete("paystack_status");
+  params.delete("paystack_reference");
+  const next = params.toString();
+  window.history.replaceState({}, "", `${window.location.pathname}${next ? `?${next}` : ""}`);
+}
+
+function bindPaystackCheckoutActions() {
+  const tableBody = document.getElementById("paymentReminderRows");
+  if (!tableBody) {
+    return;
+  }
+  tableBody.addEventListener("click", async (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) {
+      return;
+    }
+    const button = target.closest("button[data-action='paystack-checkout']");
+    if (!(button instanceof HTMLButtonElement)) {
+      return;
+    }
+    const obligationId = Number.parseInt(button.dataset.obligationId || "", 10);
+    const outstanding = Number.parseFloat(button.dataset.outstanding || "");
+    if (!Number.isFinite(obligationId) || obligationId <= 0 || !Number.isFinite(outstanding) || outstanding <= 0) {
+      setPaymentStatus("paystackCheckoutStatus", "Unable to start checkout for this obligation.", true);
+      return;
+    }
+    setButtonBusy(button, true, "Initializing...");
+    setPaymentStatus("paystackCheckoutStatus", "Initializing Paystack checkout...", false);
+    const loadingToast = window.showToast
+      ? window.showToast("Initializing Paystack checkout...", { type: "loading", sticky: true })
+      : null;
+    try {
+      const payload = await requestJson("/api/payments/paystack/initialize", {
+        method: "POST",
+        payload: {
+          obligationId,
+          amount: outstanding.toFixed(2),
+        },
+      });
+      if (!payload?.authorization_url) {
+        throw new Error("Paystack checkout URL was not returned.");
+      }
+      setPaymentStatus("paystackCheckoutStatus", "Redirecting to Paystack...", false);
+      window.location.assign(payload.authorization_url);
+    } catch (err) {
+      setPaymentStatus("paystackCheckoutStatus", err.message || "Could not initialize Paystack checkout.", true);
+      if (window.showToast) {
+        window.showToast(err.message || "Could not initialize Paystack checkout.", { type: "error" });
+      }
+    } finally {
+      setButtonBusy(button, false, "");
+      if (loadingToast) {
+        loadingToast.close();
+      }
+    }
+  });
+}
+
+async function loadQueue() {
+  const endpoint =
+    paymentState.me.role === "admin"
+      ? "/api/admin/reconciliation/exceptions"
+      : "/api/lecturer/reconciliation/exceptions";
+  const params = new URLSearchParams();
+  const student = document.getElementById("queueStudent")?.value || "";
+  const reference = document.getElementById("queueReference")?.value || "";
+  const dateFrom = document.getElementById("queueDateFrom")?.value || "";
+  const dateTo = document.getElementById("queueDateTo")?.value || "";
+  const paymentItemId = document.getElementById("queuePaymentItem")?.value || "";
+  if (student) params.set("student", student);
+  if (reference) params.set("reference", reference);
+  if (dateFrom) params.set("dateFrom", dateFrom);
+  if (dateTo) params.set("dateTo", dateTo);
+  if (paymentItemId) params.set("paymentItemId", paymentItemId);
+  params.set("page", String(paymentState.queuePagination.page || 1));
+  params.set("pageSize", String(paymentState.queuePagination.pageSize || 50));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const payload = await requestJson(`${endpoint}${suffix}`);
+  if (Array.isArray(payload)) {
+    paymentState.queueRows = payload;
+    paymentState.queuePagination = {
+      page: 1,
+      pageSize: payload.length || 50,
+      total: payload.length,
+      totalPages: 1,
+    };
+  } else {
+    paymentState.queueRows = Array.isArray(payload.items) ? payload.items : [];
+    paymentState.queuePagination = {
+      page: Number(payload?.pagination?.page || 1),
+      pageSize: Number(payload?.pagination?.pageSize || 50),
+      total: Number(payload?.pagination?.total || paymentState.queueRows.length || 0),
+      totalPages: Number(payload?.pagination?.totalPages || 1),
+    };
+  }
+  renderQueue(paymentState.queueRows);
+  renderQueuePagination();
+}
+
+function renderReconciliationSummary() {
+  const summary = paymentState.reconciliationSummary || {};
+  const mapping = [
+    ["reconAutoApproved", String(Number(summary.auto_approved || 0))],
+    ["reconExceptions", String(Number(summary.exceptions || 0))],
+    ["reconUnresolved", String(Number(summary.unresolved_obligations || 0))],
+    ["reconDuplicates", String(Number(summary.duplicates || 0))],
+  ];
+  mapping.forEach(([id, value]) => {
+    const node = document.getElementById(id);
+    if (node) {
+      node.textContent = value;
+    }
+  });
+}
+
+async function loadReconciliationSummary() {
+  const endpoint =
+    paymentState.me.role === "admin"
+      ? "/api/admin/reconciliation/summary"
+      : "/api/lecturer/reconciliation/summary";
+  paymentState.reconciliationSummary = asObject(await requestJson(endpoint));
+  renderReconciliationSummary();
+}
+
+function bindPostPaystackReferenceForm() {
+  const form = document.getElementById("postPaystackReferenceForm");
+  const referenceInput = document.getElementById("postPaystackReferenceInput");
+  const noteInput = document.getElementById("postPaystackReferenceNote");
+  if (!form || !(referenceInput instanceof HTMLInputElement)) {
+    return;
+  }
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const reference = String(referenceInput.value || "").trim();
+    if (!reference) {
+      setPaymentStatus("postPaystackReferenceStatus", "Enter a Paystack reference first.", true);
+      return;
+    }
+
+    const payload = {
+      reference,
+      note: noteInput instanceof HTMLTextAreaElement ? String(noteInput.value || "").trim() : "",
+    };
+    const ledgerItems = asArray(paymentState?.ledger?.items);
+    const matchedItem = ledgerItems.find(
+      (item) => String(item?.paystack_reference || "").trim().toLowerCase() === reference.toLowerCase()
+    );
+    if (matchedItem?.obligation_id) {
+      payload.obligationId = matchedItem.obligation_id;
+    }
+
+    const submitButton = form.querySelector('button[type="submit"]');
+    setButtonBusy(submitButton, true, "Posting...");
+    setPaymentStatus("postPaystackReferenceStatus", `Posting ${reference} to lecturer queue...`, false);
+    const loadingToast = window.showToast
+      ? window.showToast("Posting Paystack reference to lecturer queue...", { type: "loading", sticky: true })
+      : null;
+    try {
+      const response = await requestJson("/api/payments/paystack/reference-requests", {
+        method: "POST",
+        payload,
+      });
+      const postedRequest = response?.request || null;
+      const duplicate = !!response?.duplicate;
+      const statusText = duplicate
+        ? `Reference ${reference} is already pending in lecturer queue.`
+        : `Reference ${reference} was posted to lecturer queue.`;
+      setPaymentStatus("postPaystackReferenceStatus", statusText, false);
+      if (window.showToast) {
+        window.showToast(statusText, { type: duplicate ? "warning" : "success" });
+      }
+      if (!duplicate && noteInput instanceof HTMLTextAreaElement) {
+        noteInput.value = "";
+      }
+      if (postedRequest?.reference) {
+        referenceInput.value = postedRequest.reference;
+      }
+      await loadStudentPaystackReferenceRequests();
+    } catch (err) {
+      setPaymentStatus("postPaystackReferenceStatus", err.message || "Could not post Paystack reference.", true);
+      if (window.showToast) {
+        window.showToast(err.message || "Could not post Paystack reference.", { type: "error" });
+      }
+    } finally {
+      setButtonBusy(submitButton, false, "");
+      if (loadingToast) {
+        loadingToast.close();
+      }
+    }
+  });
+}
+
+function bindPaystackReferenceVerify() {
+  const form = document.getElementById("verifyPaystackForm");
+  const referenceInput = document.getElementById("verifyPaystackReference");
+  if (!form || !referenceInput) {
+    return;
+  }
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const reference = String(referenceInput.value || "").trim();
+    if (!reference) {
+      setPaymentStatus("verifyPaystackStatus", "Enter a Paystack reference first.", true);
+      return;
+    }
+
+    const submitButton = form.querySelector('button[type="submit"]');
+    setButtonBusy(submitButton, true, "Verifying...");
+    setPaymentStatus("verifyPaystackStatus", `Verifying ${reference}...`, false);
+    const loadingToast = window.showToast
+      ? window.showToast("Verifying Paystack reference...", { type: "loading", sticky: true })
+      : null;
+
+    try {
+      const payload = await requestJson("/api/payments/paystack/verify", {
+        method: "POST",
+        payload: { reference },
+      });
+      const status = String(payload?.status || "unknown");
+      const transactionId = Number(payload?.transaction_id || 0);
+      const summary = transactionId > 0 ? `Transaction #${transactionId}` : "Transaction";
+      setPaymentStatus("verifyPaystackStatus", `${summary} status: ${status}.`, false);
+      if (window.showToast) {
+        window.showToast("Paystack reference verified.", { type: "success" });
+      }
+      await Promise.all([loadQueue(), loadReconciliationSummary(), loadPaystackReferenceRequests()]);
+    } catch (err) {
+      setPaymentStatus("verifyPaystackStatus", err.message || "Could not verify Paystack reference.", true);
+      if (window.showToast) {
+        window.showToast(err.message || "Could not verify Paystack reference.", { type: "error" });
+      }
+    } finally {
+      setButtonBusy(submitButton, false, "");
+      if (loadingToast) {
+        loadingToast.close();
+      }
+    }
+  });
+}
+
+function bindPaymentItemsManagement() {
+  const form = document.getElementById("paymentItemForm");
+  const rows = document.getElementById("paymentItemRows");
+  if (form) {
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const submitButton = form.querySelector('button[type="submit"]');
+      setButtonBusy(submitButton, true, "Saving...");
+      const loadingToast = window.showToast
+        ? window.showToast("Saving payment item...", { type: "loading", sticky: true })
+        : null;
+      setPaymentStatus("paymentItemStatus", "Saving payment item...", false);
+      try {
+        await requestJson("/api/payment-items", {
+          method: "POST",
+          payload: {
+            title: document.getElementById("paymentItemTitle").value.trim(),
+            description: document.getElementById("paymentItemDescription").value.trim(),
+            expectedAmount: document.getElementById("paymentItemAmount").value,
+            currency: document.getElementById("paymentItemCurrency").value.trim().toUpperCase(),
+            dueDate: document.getElementById("paymentItemDueDate").value,
+            availabilityDays: document.getElementById("paymentItemAvailabilityDays").value,
+          },
+        });
+        form.reset();
+        document.getElementById("paymentItemCurrency").value = "NGN";
+        setPaymentStatus("paymentItemStatus", "Payment item saved.", false);
+        if (window.showToast) {
+          window.showToast("Payment item saved.", { type: "success" });
+        }
+        await loadPaymentItems();
+      } catch (err) {
+        setPaymentStatus("paymentItemStatus", err.message, true);
+        if (window.showToast) {
+          window.showToast(err.message || "Could not save payment item.", { type: "error" });
+        }
+      } finally {
+        setButtonBusy(submitButton, false, "");
+        if (loadingToast) {
+          loadingToast.close();
+        }
+      }
+    });
+  }
+
+  if (rows) {
+    rows.addEventListener("click", async (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) {
+        return;
+      }
+      const button = target.closest("button[data-action]");
+      if (!button) {
+        return;
+      }
+      const action = button.dataset.action;
+      const id = Number.parseInt(button.dataset.id || "", 10);
+      const item = asArray(paymentState.paymentItems).find((entry) => entry.id === id);
+      if (!item) {
+        return;
+      }
+      if (action === "edit-item") {
+        const title = window.prompt("Title", item.title || "");
+        if (title === null) return;
+        const description = window.prompt("Description", item.description || "");
+        if (description === null) return;
+        const expectedAmount = window.prompt("Expected amount", String(item.expected_amount || ""));
+        if (expectedAmount === null) return;
+        const currency = window.prompt("Currency (3 letters)", item.currency || "NGN");
+        if (currency === null) return;
+        const dueDate = window.prompt("Due date (YYYY-MM-DD, optional)", item.due_date || "");
+        if (dueDate === null) return;
+        const availabilityDays = window.prompt(
+          "Available for how many days? (optional)",
+          item.availability_days ? String(item.availability_days) : ""
+        );
+        if (availabilityDays === null) return;
+        const loadingToast = window.showToast
+          ? window.showToast("Updating payment item...", { type: "loading", sticky: true })
+          : null;
+        try {
+          await requestJson(`/api/payment-items/${id}`, {
+            method: "PUT",
+            payload: {
+              title: title.trim(),
+              description: description.trim(),
+              expectedAmount: expectedAmount.trim(),
+              currency: currency.trim().toUpperCase(),
+              dueDate: dueDate.trim(),
+              availabilityDays: availabilityDays.trim(),
+            },
+          });
+          if (window.showToast) {
+            window.showToast("Payment item updated.", { type: "success" });
+          }
+          await loadPaymentItems();
+        } catch (err) {
+          if (window.showToast) {
+            window.showToast(err.message || "Could not update payment item.", { type: "error" });
+          }
+        } finally {
+          if (loadingToast) {
+            loadingToast.close();
+          }
+        }
+      }
+      if (action === "delete-item") {
+        if (!window.confirm("Delete this payment item?")) {
+          return;
+        }
+        const loadingToast = window.showToast
+          ? window.showToast("Deleting payment item...", { type: "loading", sticky: true })
+          : null;
+        try {
+          await requestJson(`/api/payment-items/${id}`, { method: "DELETE" });
+          if (window.showToast) {
+            window.showToast("Payment item deleted.", { type: "success" });
+          }
+          await loadPaymentItems();
+        } catch (err) {
+          if (window.showToast) {
+            window.showToast(err.message || "Could not delete payment item.", { type: "error" });
+          }
+        } finally {
+          if (loadingToast) {
+            loadingToast.close();
+          }
+        }
+      }
+    });
+  }
+}
+
+function getSelectedPaystackReferenceRequestIds() {
+  return asArray(paymentState.paystackReferenceRequests)
+    .filter((row) => paymentState.selectedPaystackReferenceRequestIds.has(Number(row.id || 0)))
+    .map((row) => Number(row.id || 0))
+    .filter((id) => Number.isFinite(id) && id > 0);
+}
+
+function bindPaystackReferenceRequestActions() {
+  const tableBody = document.getElementById("paystackReferenceRequestRows");
+  const selectAllNode = document.getElementById("paystackReferenceRequestsSelectAll");
+  const verifyButton = document.getElementById("verifySelectedPaystackRequestsButton");
+  const refreshButton = document.getElementById("refreshPaystackRequestsButton");
+
+  if (selectAllNode) {
+    selectAllNode.addEventListener("change", () => {
+      if (selectAllNode.checked) {
+        paymentState.paystackReferenceRequests.forEach((row) => {
+          const id = Number(row.id || 0);
+          if (id > 0) {
+            paymentState.selectedPaystackReferenceRequestIds.add(id);
+          }
+        });
+      } else {
+        paymentState.selectedPaystackReferenceRequestIds.clear();
+      }
+      renderPaystackReferenceRequests(paymentState.paystackReferenceRequests);
+    });
+  }
+
+  if (tableBody) {
+    tableBody.addEventListener("change", (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLInputElement) || !target.classList.contains("paystack-ref-request-select-row")) {
+        return;
+      }
+      const id = Number.parseInt(target.dataset.id || "", 10);
+      if (!Number.isFinite(id) || id <= 0) {
+        return;
+      }
+      if (target.checked) {
+        paymentState.selectedPaystackReferenceRequestIds.add(id);
+      } else {
+        paymentState.selectedPaystackReferenceRequestIds.delete(id);
+      }
+      renderPaystackReferenceRequests(paymentState.paystackReferenceRequests);
+    });
+  }
+
+  if (refreshButton) {
+    refreshButton.addEventListener("click", async () => {
+      setButtonBusy(refreshButton, true, "Refreshing...");
+      try {
+        await loadPaystackReferenceRequests();
+        setPaymentStatus("paystackReferenceRequestsStatus", "Paystack reference requests refreshed.", false);
+      } catch (err) {
+        setPaymentStatus("paystackReferenceRequestsStatus", err.message || "Could not refresh requests.", true);
+        if (window.showToast) {
+          window.showToast(err.message || "Could not refresh requests.", { type: "error" });
+        }
+      } finally {
+        setButtonBusy(refreshButton, false, "");
+      }
+    });
+  }
+
+  if (verifyButton) {
+    verifyButton.addEventListener("click", async () => {
+      const selectedIds = getSelectedPaystackReferenceRequestIds();
+      if (!selectedIds.length) {
+        setPaymentStatus("paystackReferenceRequestsStatus", "Select at least one request first.", true);
+        return;
+      }
+      setButtonBusy(verifyButton, true, "Verifying...");
+      setPaymentStatus(
+        "paystackReferenceRequestsStatus",
+        `Bulk verifying ${selectedIds.length} Paystack reference request(s)...`,
+        false
+      );
+      const loadingToast = window.showToast
+        ? window.showToast("Bulk verifying Paystack references...", { type: "loading", sticky: true })
+        : null;
+      try {
+        const result = await requestJson("/api/payments/paystack/reference-requests/bulk-verify", {
+          method: "POST",
+          payload: {
+            requestIds: selectedIds,
+          },
+        });
+        const failureCount = Number(result?.failureCount || 0);
+        const successCount = Number(result?.successCount || 0);
+        setPaymentStatus(
+          "paystackReferenceRequestsStatus",
+          `Bulk verify complete. Success: ${successCount}, Failed: ${failureCount}.`,
+          failureCount > 0
+        );
+        if (window.showToast) {
+          window.showToast(`Bulk verify complete. Success: ${successCount}, Failed: ${failureCount}.`, {
+            type: failureCount > 0 ? "warning" : "success",
+          });
+        }
+        paymentState.selectedPaystackReferenceRequestIds.clear();
+        await Promise.all([loadPaystackReferenceRequests(), loadQueue(), loadReconciliationSummary()]);
+      } catch (err) {
+        setPaymentStatus("paystackReferenceRequestsStatus", err.message || "Could not bulk verify references.", true);
+        if (window.showToast) {
+          window.showToast(err.message || "Could not bulk verify references.", { type: "error" });
+        }
+      } finally {
+        setButtonBusy(verifyButton, false, "");
+        if (loadingToast) {
+          loadingToast.close();
+        }
+      }
+    });
+  }
+}
+
+function bindQueueActions() {
+  const filterForm = document.getElementById("queueFilterForm");
+  const prevPageButton = document.getElementById("queuePrevPage");
+  const nextPageButton = document.getElementById("queueNextPage");
+
+  if (filterForm) {
+    filterForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      paymentState.queuePagination.page = 1;
+      const toast = window.showToast
+        ? window.showToast("Applying approved transaction filters...", { type: "loading", sticky: true })
+        : null;
+      try {
+        await Promise.all([loadQueue(), loadReconciliationSummary()]);
+      } catch (err) {
+        if (window.showToast) {
+          window.showToast(err.message || "Could not load approved transactions.", { type: "error" });
+        }
+      } finally {
+        if (toast) toast.close();
+      }
+    });
+  }
+
+  if (prevPageButton) {
+    prevPageButton.addEventListener("click", async () => {
+      if (paymentState.queuePagination.page <= 1) {
+        return;
+      }
+      paymentState.queuePagination.page -= 1;
+      await loadQueue();
+    });
+  }
+
+  if (nextPageButton) {
+    nextPageButton.addEventListener("click", async () => {
+      if (paymentState.queuePagination.page >= paymentState.queuePagination.totalPages) {
+        return;
+      }
+      paymentState.queuePagination.page += 1;
+      await loadQueue();
+    });
+  }
+
+}
+
+async function initPaymentsPage() {
+  const page = document.body?.dataset?.page;
+  if (page !== "payments") {
+    return;
+  }
+  const root = document.querySelector("main.container");
+  if (root instanceof HTMLElement) {
+    if (root.dataset.paymentsInitialized === "1") {
+      return;
+    }
+    root.dataset.paymentsInitialized = "1";
+  }
+  try {
+    paymentState.me = asObject(await requestJson("/api/me"));
+    if (!paymentState.me.role) {
+      throw new Error("Could not load your payment access profile.");
+    }
+    await loadPaymentItems();
+
+    const studentSection = document.getElementById("studentPaymentsSection");
+    const reviewSection = document.getElementById("reviewPaymentsSection");
+    const queueSection = document.getElementById("receiptQueueSection");
+
+    if (paymentState.me.role === "student") {
+      if (studentSection) studentSection.hidden = false;
+      if (reviewSection) reviewSection.remove();
+      if (queueSection) queueSection.remove();
+      bindPaystackCheckoutActions();
+      bindPostPaystackReferenceForm();
+      await Promise.all([loadStudentReceipts(), loadStudentLedger(), loadStudentPaystackReferenceRequests()]);
+      applyPaystackCallbackStatusFromQuery();
+      if (paymentState.ledger && paymentState.ledger.summary && window.showToast) {
+        const overdueCount = Number(paymentState.ledger.summary.overdueCount || 0);
+        const dueSoonCount = Number(paymentState.ledger.summary.dueSoonCount || 0);
+        if (overdueCount > 0) {
+          window.showToast(`You have ${overdueCount} overdue payment reminder(s).`, { type: "error" });
+        } else if (dueSoonCount > 0) {
+          window.showToast(`You have ${dueSoonCount} payment(s) due soon.`, { type: "warning" });
+        }
+      }
+      return;
+    }
+
+    if (studentSection) studentSection.remove();
+    if (reviewSection) reviewSection.hidden = false;
+    if (queueSection) queueSection.hidden = false;
+    bindPaystackReferenceVerify();
+    bindPaystackReferenceRequestActions();
+    bindPaymentItemsManagement();
+    bindQueueActions();
+    await Promise.all([loadQueue(), loadReconciliationSummary(), loadPaystackReferenceRequests()]);
+  } catch (err) {
+    if (root instanceof HTMLElement) {
+      delete root.dataset.paymentsInitialized;
+    }
+    const errorNode = document.getElementById("paymentsError");
+    if (errorNode) {
+      errorNode.textContent = err.message || "Could not load payments page.";
+      errorNode.hidden = false;
+    }
+    if (window.showToast) {
+      window.showToast(err.message || "Could not load payments page.", { type: "error" });
+    }
+  }
+}
+
+window.initPaymentsPage = initPaymentsPage;
+initPaymentsPage();

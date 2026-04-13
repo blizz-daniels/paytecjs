@@ -9,6 +9,7 @@ const express = require("express");
 const multer = require("multer");
 const session = require("express-session");
 const { openDatabaseClient } = require("../services/database-client");
+const { resolveDatabaseRuntime } = require("../services/runtime-database");
 const { createPaystackClient } = require("../services/paystack");
 const { createPaystackTransferClient } = require("../services/paystack-transfers");
 const { registerMessageRoutes } = require("./routes/messages.routes");
@@ -58,7 +59,13 @@ const isProduction = process.env.NODE_ENV === "production";
 const defaultDataDir = isProduction ? "/tmp/paytec" : path.join(PROJECT_ROOT, "data");
 const dataDir = path.resolve(process.env.DATA_DIR || defaultDataDir);
 const dbPath = path.join(dataDir, "paytec.sqlite");
-const DATABASE_URL = String(process.env.DATABASE_URL || "").trim();
+const databaseRuntime = resolveDatabaseRuntime({
+  nodeEnv: process.env.NODE_ENV,
+  databaseUrl: process.env.DATABASE_URL,
+  sqlitePath: dbPath,
+  dataDir,
+});
+const DATABASE_URL = databaseRuntime.databaseUrl;
 const ADMIN_USERNAME = String(process.env.ADMIN_USERNAME || "admin").trim().toLowerCase();
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 const STUDENT_ROSTER_PATH = path.resolve(process.env.STUDENT_ROSTER_PATH || path.join(PROJECT_ROOT, "data", "students.csv"));
@@ -75,9 +82,6 @@ const ROSTER_PASSWORD_HASH_ROUNDS = (() => {
 
 if (isProduction && !process.env.SESSION_SECRET) {
   throw new Error("SESSION_SECRET is required when NODE_ENV=production");
-}
-if (isProduction && !DATABASE_URL) {
-  throw new Error("DATABASE_URL is required when NODE_ENV=production");
 }
 if (isProduction && !ADMIN_PASSWORD) {
   throw new Error("ADMIN_PASSWORD is required when NODE_ENV=production");
@@ -327,10 +331,13 @@ const {
   sharedFilesUploadDir,
 });
 const databaseClient = openDatabaseClient({
-  sqlitePath: dbPath,
-  databaseUrl: DATABASE_URL,
+  driver: databaseRuntime.driver,
+  sqlitePath: databaseRuntime.sqlitePath || undefined,
+  databaseUrl: databaseRuntime.databaseUrl || undefined,
+  isProduction: databaseRuntime.isProduction,
 });
 const db = databaseClient;
+const isPostgresDatabase = databaseRuntime.driver === "postgres";
 
 function toMemoryMegabytes(value) {
   const bytes = Number(value || 0);
@@ -2435,6 +2442,17 @@ async function initDatabase() {
     )
   `);
 
+  if (isPostgresDatabase) {
+    await run(`
+      CREATE TABLE IF NOT EXISTS sessions (
+        sid TEXT PRIMARY KEY,
+        sess JSON NOT NULL,
+        expire TIMESTAMPTZ NOT NULL
+      )
+    `);
+    await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_sessions_expire ON sessions(expire)");
+  }
+
   await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_payment_receipts_student ON payment_receipts(student_username)");
   await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_payment_receipts_status ON payment_receipts(status)");
   await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_payment_receipts_item ON payment_receipts(payment_item_id)");
@@ -2765,12 +2783,12 @@ app.use(
 );
 
 let sessionStore;
-if (DATABASE_URL) {
+if (isPostgresDatabase) {
   const PgSessionStore = require("connect-pg-simple")(session);
   sessionStore = new PgSessionStore({
     conString: DATABASE_URL,
     tableName: "sessions",
-    createTableIfMissing: true,
+    createTableIfMissing: false,
   });
 } else {
   const SQLiteStore = require("connect-sqlite3")(session);

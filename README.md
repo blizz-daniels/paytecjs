@@ -42,6 +42,54 @@ The payment system runs in strict Paystack mode:
   - `smtp` (default) using `SMTP_*`
   - `resend` (HTTPS API) using `RESEND_API_KEY` + `PASSWORD_RESET_EMAIL_FROM`
 
+## Dual-Stack Migration
+
+The repository now includes a Next.js App Router skeleton alongside the existing Express app.
+
+- Legacy Express remains the source of truth for the current production pages and APIs.
+- Next.js currently owns the new `/login` and `/forgot-password` experience, plus role-group shell pages under `app/`.
+- The App Router pages are intentionally partial. They mirror the legacy layout and navigation, but they do not fully replace every page yet.
+- The Next.js API routes proxy auth requests back to the legacy backend during migration, so both stacks can stay in sync.
+
+### Local Run Order
+
+Use two terminals during migration:
+
+1. Start the legacy app on a separate port, for example:
+   - `PORT=3001 npm run start`
+2. Start the Next.js app and point it at the legacy backend:
+   - `LEGACY_APP_URL=http://127.0.0.1:3001 npm run dev:next`
+
+If you want to build the Next.js shell for production testing:
+
+- `npm run build:next`
+- `npm run start:next`
+
+### Next.js Scope In This Phase
+
+- Ported now: `/login`, `/forgot-password`
+- Added now: role-aware shell layouts for student, teacher, and admin areas
+- Still legacy-only: most interactive student, teacher, admin, payments, messaging, analytics, and profile data flows
+
+## Database Runtime Policy (Phase 3)
+
+Production database behavior is now explicit and locked down:
+
+- `NODE_ENV=production` requires `DATABASE_URL`.
+- Production only allows Supabase Postgres hosts (`.supabase.co` or `.supabase.com`).
+- SQLite is blocked in production.
+- Session persistence in production uses Postgres `sessions` table.
+
+Development/test behavior:
+
+- If `DATABASE_URL` is set, the app uses Postgres.
+- If `DATABASE_URL` is not set, the app uses local SQLite (`data/paytec.sqlite` by default).
+- You can override the dev SQLite file path with `SQLITE_DEV_PATH`.
+
+Optional flags:
+
+- `ENFORCE_SUPABASE_IN_PRODUCTION=true` (default) keeps strict Supabase host checks enabled.
+
 ## Core APIs
 
 ### Payment Items + Obligations

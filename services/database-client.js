@@ -480,7 +480,26 @@ function createPgClient(databaseUrl) {
 }
 
 function openDatabaseClient(options = {}) {
+  const explicitDriver = String(options.driver || "").trim().toLowerCase();
   const databaseUrl = String(options.databaseUrl || process.env.DATABASE_URL || "").trim();
+  if (explicitDriver === "postgres") {
+    if (!databaseUrl) {
+      throw new Error("databaseUrl is required when driver is set to postgres.");
+    }
+    return createPgClient(databaseUrl);
+  }
+
+  if (explicitDriver === "sqlite") {
+    if (options.isProduction) {
+      throw new Error("SQLite is not allowed in production.");
+    }
+    const sqlitePathFromDriver = String(options.sqlitePath || "").trim();
+    if (!sqlitePathFromDriver) {
+      throw new Error("sqlitePath is required when driver is set to sqlite.");
+    }
+    return createSqliteClient(sqlitePathFromDriver);
+  }
+
   if (databaseUrl) {
     return createPgClient(databaseUrl);
   }
