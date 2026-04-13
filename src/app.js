@@ -12,6 +12,7 @@ const { openDatabaseClient } = require("../services/database-client");
 const { createPaystackClient } = require("../services/paystack");
 const { createPaystackTransferClient } = require("../services/paystack-transfers");
 const { registerMessageRoutes } = require("./routes/messages.routes");
+const { registerNotificationRoutes } = require("./routes/notifications.routes");
 const { registerPageRoutes } = require("./routes/page.routes");
 const { registerSharedFileRoutes } = require("./routes/shared-files.routes");
 const { registerHandoutRoutes } = require("./routes/handouts.routes");
@@ -20,8 +21,29 @@ const { createUploadHandlers } = require("./config/upload-config");
 const { createPaymentNormalizationHelpers } = require("./lib/payment-normalization");
 const { createAnalyticsHelpers } = require("./lib/analytics-helpers");
 const {
+  isAuthenticated,
+  requireAuth,
+  requireAdmin,
+  requireTeacher,
+  requireTeacherOnly,
+  requireNonAdmin,
+  requireStudent,
+  isAdminSession,
+} = require("../lib/server/auth/session-guards");
+const { createContentStorage } = require("../lib/server/content/storage");
+const { isValidHttpUrl, parseResourceId, parseBooleanEnv } = require("../lib/server/http/request-utils");
+const {
   generateApprovedStudentReceipts,
 } = require("../services/approved-receipt-generator");
+const { createAuthDomain } = require("../lib/server/auth");
+const { createMessageService } = require("../lib/server/messages");
+const { createNotificationService } = require("../lib/server/notifications");
+const { createHandoutService } = require("../lib/server/handouts");
+const { createAdminImportService } = require("../lib/server/admin");
+const { createPayoutDomain } = require("../lib/server/payouts");
+const { createPaymentDomain } = require("../lib/server/payments");
+const { createReceiptService } = require("../lib/server/receipts");
+const { createContentAccessService } = require("../lib/server/storage");
 let xlsx = null;
 try {
   xlsx = require("xlsx");
@@ -81,6 +103,19 @@ const handoutsFilesDir = path.join(contentFilesDir, "handouts");
 fs.mkdirSync(handoutsFilesDir, { recursive: true });
 const sharedFilesUploadDir = path.join(contentFilesDir, "shared");
 fs.mkdirSync(sharedFilesUploadDir, { recursive: true });
+const {
+  resolveStoredContentPath,
+  isPathInsideDirectory,
+  isLikelyLegacyPlainReceipt,
+  removeStoredContentFile,
+  isValidLocalContentUrl,
+  parseReactionDetails,
+} = createContentStorage({
+  fs,
+  path,
+  contentFilesDir,
+  legacyPlainReceiptMaxBytes: RECEIPT_LEGACY_FALLBACK_MAX_BYTES,
+});
 
 const allowedNotificationReactions = new Set(["like", "love", "haha", "wow", "sad"]);
 const CSRF_SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
@@ -162,10 +197,6 @@ const PASSWORD_RESET_RATE_LIMIT_WINDOW_MS = PASSWORD_RESET_RATE_LIMIT_WINDOW_SEC
 const PASSWORD_RESET_RATE_LIMIT_BLOCK_MS = PASSWORD_RESET_RATE_LIMIT_BLOCK_SECONDS * 1000;
 const LOGIN_RATE_LIMIT_RECORD_TTL_MS = LOGIN_RATE_LIMIT_WINDOW_MS + LOGIN_RATE_LIMIT_BLOCK_MS;
 const PASSWORD_RESET_RATE_LIMIT_RECORD_TTL_MS = PASSWORD_RESET_RATE_LIMIT_WINDOW_MS + PASSWORD_RESET_RATE_LIMIT_BLOCK_MS;
-let departmentGroupsCache = {
-  mtimeMs: -1,
-  groups: new Map(),
-};
 let smtpTransport = null;
 let smtpTransportInitialized = false;
 let contentStreamClientSequence = 0;
@@ -420,68 +451,6 @@ if (PAYOUT_WORKER_INTERVAL_MS > 0) {
   }
 }
 
-function resolveStoredContentPath(relativeUrl) {
-  if (!relativeUrl || typeof relativeUrl !== "string") {
-    return null;
-  }
-  const normalized = relativeUrl.replace(/\\/g, "/");
-  if (!normalized.startsWith("/content-files/")) {
-    return null;
-  }
-  const relativePath = normalized.slice("/content-files/".length);
-  const absolute = path.resolve(contentFilesDir, relativePath);
-  const relativeCheck = path.relative(contentFilesDir, absolute);
-  if (!relativeCheck || relativeCheck.startsWith("..") || path.isAbsolute(relativeCheck)) {
-    return null;
-  }
-  return absolute;
-}
-
-function isPathInsideDirectory(baseDir, candidatePath) {
-  const resolvedBase = path.resolve(baseDir);
-  const resolvedCandidate = path.resolve(String(candidatePath || ""));
-  const relativeCheck = path.relative(resolvedBase, resolvedCandidate);
-  return relativeCheck === "" || (!relativeCheck.startsWith("..") && !path.isAbsolute(relativeCheck));
-}
-
-function isLikelyLegacyPlainReceipt(filePath) {
-  try {
-    const stat = fs.statSync(filePath);
-    const threshold = Number.isFinite(RECEIPT_LEGACY_FALLBACK_MAX_BYTES)
-      ? Math.max(400, RECEIPT_LEGACY_FALLBACK_MAX_BYTES)
-      : 1500;
-    return stat.isFile() && stat.size > 0 && stat.size <= threshold;
-  } catch (_err) {
-    return false;
-  }
-}
-
-function removeStoredContentFile(relativeUrl) {
-  const absolutePath = resolveStoredContentPath(relativeUrl);
-  if (!absolutePath) {
-    return;
-  }
-  fs.unlink(absolutePath, () => {});
-}
-
-function parseReactionDetails(detailsString) {
-  if (!detailsString) {
-    return [];
-  }
-  return String(detailsString)
-    .split(",")
-    .map((entry) => String(entry || "").trim())
-    .filter(Boolean)
-    .map((entry) => {
-      const [username, reaction] = entry.split("|");
-      return {
-        username: String(username || "").trim(),
-        reaction: String(reaction || "").trim(),
-      };
-    })
-    .filter((item) => item.username && item.reaction);
-}
-
 function run(sql, params = []) {
   return databaseClient.run(sql, params);
 }
@@ -541,317 +510,214 @@ function parseCsvLine(line) {
   return values;
 }
 
-function normalizeIdentifier(value) {
-  return String(value || "").trim().toLowerCase();
-}
+const {
+  normalizeIdentifier,
+  normalizeSurnamePassword,
+  isValidIdentifier,
+  isValidSurnamePassword,
+  normalizeDisplayName,
+  normalizeDepartment,
+  isValidDepartment,
+  formatDepartmentLabel,
+  expandDepartmentScope,
+  departmentScopeMatchesStudent,
+  doesDepartmentScopeOverlap,
+  normalizeProfileEmail,
+  isValidProfileEmail,
+  resolvePaystackCheckoutEmail,
+  validateCustomPasswordStrength,
+  normalizeOtpCode,
+  generateNumericOtp,
+  isPasswordResetOtpExpired,
+  hasPasswordResetOtpResendCooldown,
+  maskEmailAddress,
+  sendPasswordRecoveryOtp,
+  resetPasswordRecovery,
+  buildMePayload,
+  updateProfileEmailAddress,
+  updateProfilePassword,
+  getChecklistPayload,
+  toggleChecklistItem,
+} = createAuthDomain({
+  fs,
+  crypto,
+  bcrypt,
+  get,
+  run,
+  all,
+  withSqlTransaction,
+  getPasswordOverride,
+  getUserProfile,
+  findProfileEmailOwner,
+  upsertProfileEmail,
+  upsertPasswordOverride,
+  getLatestPasswordResetOtp,
+  invalidateActivePasswordResetOtps,
+  createPasswordResetOtp,
+  markPasswordResetOtpConsumed,
+  incrementPasswordResetOtpAttempt,
+  sendPasswordResetOtpEmail,
+  logPasswordResetAuditEvent,
+  takePasswordResetRateLimitAttempt,
+  getSessionUserDepartment,
+  deriveDisplayNameFromIdentifier,
+  departmentGroupsPath: DEPARTMENT_GROUPS_PATH,
+  customPasswordMinLength: CUSTOM_PASSWORD_MIN_LENGTH,
+  customPasswordMaxLength: CUSTOM_PASSWORD_MAX_LENGTH,
+  passwordResetOtpLength: PASSWORD_RESET_OTP_LENGTH,
+  passwordResetOtpResendCooldownSeconds: PASSWORD_RESET_OTP_RESEND_COOLDOWN_SECONDS,
+  passwordResetOtpTtlMinutes: PASSWORD_RESET_OTP_TTL_MINUTES,
+  passwordResetOtpMaxAttempts: PASSWORD_RESET_OTP_MAX_ATTEMPTS,
+  isTestEnvironment,
+});
 
-function normalizeSurnamePassword(value) {
-  return String(value || "").trim().toLowerCase();
-}
+const contentAccessService = createContentAccessService({
+  all,
+  get,
+  normalizeIdentifier,
+  normalizeDepartment,
+  isValidDepartment,
+  departmentScopeMatchesStudent,
+});
 
-function isValidIdentifier(value) {
-  return /^[a-z0-9/_-]{3,40}$/.test(value);
-}
+const messageService = createMessageService({
+  all,
+  get,
+  run,
+  withSqlTransaction,
+  normalizeIdentifier,
+  isValidIdentifier,
+  normalizeDepartment,
+  departmentScopeMatchesStudent,
+  formatDepartmentLabel,
+});
 
-function isValidSurnamePassword(value) {
-  return /^[a-z][a-z' -]{1,39}$/.test(value);
-}
+const notificationService = createNotificationService({
+  all,
+  get,
+  run,
+  parseReactionDetails,
+  normalizeIdentifier,
+  normalizeDepartment,
+  departmentScopeMatchesStudent,
+  listStudentDepartmentRows: (...args) => contentAccessService.listStudentDepartmentRows(...args),
+  ensureCanManageContent: (...args) => contentAccessService.ensureCanManageContent(...args),
+  assertStudentContentAccess: (...args) => contentAccessService.assertStudentContentAccess(...args),
+  logAuditEvent,
+  broadcastContentUpdate,
+  allowedReactions: allowedNotificationReactions,
+});
 
-function normalizeDisplayName(value) {
-  return String(value || "").trim();
-}
+const handoutService = createHandoutService({
+  all,
+  get,
+  run,
+  parseReactionDetails,
+  departmentScopeMatchesStudent,
+  isValidHttpUrl,
+  isValidLocalContentUrl,
+  ensureCanManageContent: (...args) => contentAccessService.ensureCanManageContent(...args),
+  assertStudentContentAccess: (...args) => contentAccessService.assertStudentContentAccess(...args),
+  logAuditEvent,
+  broadcastContentUpdate,
+  removeStoredContentFile,
+  allowedReactions: allowedNotificationReactions,
+});
 
-function normalizeDepartment(value) {
-  return String(value || "")
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, " ");
-}
+const adminImportService = createAdminImportService({
+  all,
+  run,
+  withSqlTransaction,
+  hashPassword: (value, rounds) => bcrypt.hash(value, rounds),
+  hashRounds: ROSTER_PASSWORD_HASH_ROUNDS,
+  upsertProfileDisplayName,
+  normalizeIdentifier,
+  normalizeSurnamePassword,
+  isValidIdentifier,
+  isValidSurnamePassword,
+  normalizeDisplayName,
+  normalizeDepartment,
+  isValidDepartment,
+});
 
-function isValidDepartment(value) {
-  const normalized = normalizeDepartment(value);
-  if (!normalized || normalized.length > 80) {
-    return false;
-  }
-  return /^[a-z0-9][a-z0-9 &'()/-]{1,79}$/.test(normalized);
-}
+const paymentDomain = createPaymentDomain({
+  all,
+  get,
+  run,
+  isValidIsoLikeDate,
+  parseMoneyValue,
+  parseCurrency,
+  parseAvailabilityDays,
+  computeAvailableUntil,
+  toDateOnly,
+  sanitizeTransactionRef,
+  normalizeReference,
+  normalizeWhitespace,
+  normalizeStatementName,
+  normalizeIdentifier,
+  resolveContentTargetDepartment,
+  ensureCanManageContent,
+  ensurePaymentObligationsForStudent,
+  ensurePaymentObligationsForPaymentItem,
+  rowMatchesStudentDepartmentScope,
+  syncPaymentItemNotification,
+  logAuditEvent,
+  parseResourceId,
+  buildTransactionChecksum,
+});
 
-function formatDepartmentLabel(value) {
-  const normalized = normalizeDepartment(value);
-  if (!normalized) {
-    return "";
-  }
-  return normalized
-    .split(" ")
-    .map((word) => (word ? `${word.charAt(0).toUpperCase()}${word.slice(1)}` : ""))
-    .join(" ");
-}
+const payoutDomain = createPayoutDomain({
+  crypto,
+  get,
+  run,
+  all,
+  withSqlTransaction,
+  normalizeIdentifier,
+  sanitizeTransactionRef,
+  toKoboFromAmount,
+  toAmountFromKobo,
+  parseResourceId,
+  getLecturerPayoutSummary,
+  getLecturerPayoutAccount,
+  updateLecturerPayoutAccount,
+  getLecturerPayoutTransfers,
+  getLecturerPayoutLedgerRows,
+  reserveLecturerPayoutBatch,
+  queueLecturerPayoutDispatch,
+  dispatchQueuedLecturerPayoutTransfer,
+  getLecturerPayoutTransferById,
+  logLecturerPayoutEvent,
+});
 
-function withGeneralDepartmentAliases(groups) {
-  const next = new Map();
-  for (const [key, values] of groups.entries()) {
-    const normalizedKey = normalizeDepartment(key);
-    if (!normalizedKey) {
-      continue;
-    }
-    const normalizedValues = new Set(Array.from(values || []).map((value) => normalizeDepartment(value)).filter(Boolean));
-    normalizedValues.add(normalizedKey);
-    next.set(normalizedKey, normalizedValues);
-
-    if (!normalizedKey.startsWith("general ")) {
-      const alias = normalizeDepartment(`general ${normalizedKey}`);
-      if (!next.has(alias)) {
-        const aliasValues = new Set(normalizedValues);
-        aliasValues.add(alias);
-        next.set(alias, aliasValues);
-      }
-    }
-  }
-  return next;
-}
-
-function getDefaultDepartmentGroups() {
-  const defaults = new Map();
-  defaults.set("science", new Set(["science", "computer science", "chemistry", "physics", "biology", "mathematics"]));
-  defaults.set("art", new Set(["art", "creative art", "fine art", "music", "theatre art"]));
-  defaults.set("business", new Set(["business", "accounting", "economics", "marketing", "management"]));
-  return withGeneralDepartmentAliases(defaults);
-}
-
-function parseDepartmentGroupsCsv(csvText) {
-  const text = String(csvText || "");
-  const lines = text
-    .split(/\r?\n/)
-    .map((line) => String(line || "").trim())
-    .filter(Boolean);
-  if (!lines.length) {
-    return getDefaultDepartmentGroups();
-  }
-
-  const headers = parseCsvLine(lines[0]).map((header) => normalizeDepartment(header));
-  const groups = new Map();
-  headers.forEach((header) => {
-    if (!header) {
-      return;
-    }
-    if (!groups.has(header)) {
-      groups.set(header, new Set([header]));
-    }
-  });
-
-  for (let i = 1; i < lines.length; i += 1) {
-    const row = parseCsvLine(lines[i]);
-    headers.forEach((header, index) => {
-      if (!header) {
-        return;
-      }
-      const value = normalizeDepartment(row[index] || "");
-      if (!value) {
-        return;
-      }
-      if (!groups.has(header)) {
-        groups.set(header, new Set([header]));
-      }
-      groups.get(header).add(value);
-    });
-  }
-
-  if (!groups.size) {
-    return getDefaultDepartmentGroups();
-  }
-  return withGeneralDepartmentAliases(groups);
-}
-
-function getDepartmentGroups() {
-  try {
-    const stat = fs.statSync(DEPARTMENT_GROUPS_PATH);
-    const mtimeMs = Number(stat.mtimeMs || 0);
-    if (departmentGroupsCache.groups.size && departmentGroupsCache.mtimeMs === mtimeMs) {
-      return departmentGroupsCache.groups;
-    }
-    const raw = fs.readFileSync(DEPARTMENT_GROUPS_PATH, "utf8");
-    const parsed = parseDepartmentGroupsCsv(raw);
-    departmentGroupsCache = {
-      mtimeMs,
-      groups: parsed,
-    };
-    return parsed;
-  } catch (_err) {
-    if (!departmentGroupsCache.groups.size) {
-      departmentGroupsCache = {
-        mtimeMs: -1,
-        groups: getDefaultDepartmentGroups(),
-      };
-    }
-    return departmentGroupsCache.groups;
-  }
-}
-
-function expandDepartmentScope(departmentValue) {
-  const normalized = normalizeDepartment(departmentValue);
-  if (!normalized || normalized === "all") {
-    return null;
-  }
-  const groups = getDepartmentGroups();
-  const scope = new Set([normalized]);
-  if (groups.has(normalized)) {
-    groups.get(normalized).forEach((value) => scope.add(normalizeDepartment(value)));
-  }
-  return scope;
-}
-
-function departmentScopeMatchesStudent(targetDepartment, studentDepartment) {
-  const target = normalizeDepartment(targetDepartment);
-  if (!target || target === "all") {
-    return true;
-  }
-  const student = normalizeDepartment(studentDepartment);
-  if (!student) {
-    return false;
-  }
-  if (target === student) {
-    return true;
-  }
-  const scope = expandDepartmentScope(target);
-  return !!(scope && scope.has(student));
-}
-
-function doesDepartmentScopeOverlap(targetDepartment, actorDepartment) {
-  const target = normalizeDepartment(targetDepartment);
-  const actor = normalizeDepartment(actorDepartment);
-  if (!target || target === "all" || !actor || actor === "all") {
-    return true;
-  }
-  const targetScope = expandDepartmentScope(target) || new Set([target]);
-  const actorScope = expandDepartmentScope(actor) || new Set([actor]);
-  for (const candidate of targetScope) {
-    if (actorScope.has(candidate)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function normalizeProfileEmail(value) {
-  return String(value || "").trim().toLowerCase();
-}
-
-function isValidProfileEmail(value) {
-  const normalized = normalizeProfileEmail(value);
-  if (!normalized || normalized.length > 254) {
-    return false;
-  }
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(normalized)) {
-    return false;
-  }
-  const domain = String(normalized.split("@")[1] || "");
-  if (!domain || domain === "localhost" || domain.endsWith(".local")) {
-    return false;
-  }
-  return true;
-}
-
-function resolvePaystackCheckoutEmail(username, profileEmail) {
-  const candidates = [profileEmail, username];
-  for (const candidate of candidates) {
-    const normalized = normalizeProfileEmail(candidate);
-    if (isValidProfileEmail(normalized)) {
-      return normalized;
-    }
-  }
-  return "";
-}
-
-function validateCustomPasswordStrength(password, username) {
-  const raw = String(password || "");
-  const normalizedUsername = normalizeIdentifier(username || "");
-  if (raw.length < CUSTOM_PASSWORD_MIN_LENGTH) {
-    return `Use at least ${CUSTOM_PASSWORD_MIN_LENGTH} characters.`;
-  }
-  if (raw.length > CUSTOM_PASSWORD_MAX_LENGTH) {
-    return `Use at most ${CUSTOM_PASSWORD_MAX_LENGTH} characters.`;
-  }
-  if (/\s/.test(raw)) {
-    return "Do not include spaces in the password.";
-  }
-  if (!/[a-z]/.test(raw)) {
-    return "Include at least one lowercase letter.";
-  }
-  if (!/[A-Z]/.test(raw)) {
-    return "Include at least one uppercase letter.";
-  }
-  if (!/\d/.test(raw)) {
-    return "Include at least one number.";
-  }
-  if (!/[^A-Za-z0-9]/.test(raw)) {
-    return "Include at least one symbol.";
-  }
-  if (normalizedUsername && normalizedUsername.length >= 3) {
-    const loweredPassword = raw.toLowerCase();
-    if (loweredPassword.includes(normalizedUsername)) {
-      return "Password cannot include your username.";
-    }
-  }
-  return "";
-}
-
-function normalizeOtpCode(value) {
-  return String(value || "")
-    .replace(/\D/g, "")
-    .trim();
-}
-
-function generateNumericOtp(length = PASSWORD_RESET_OTP_LENGTH) {
-  const size = Number.isFinite(length) ? Math.max(4, Math.min(8, length)) : PASSWORD_RESET_OTP_LENGTH;
-  let value = "";
-  while (value.length < size) {
-    value += crypto.randomInt(0, 10).toString();
-  }
-  return value;
-}
-
-function parseTimestampMs(rawValue) {
-  const raw = String(rawValue || "").trim();
-  if (!raw) {
-    return 0;
-  }
-  const normalized = raw.includes("T") ? raw : raw.replace(" ", "T");
-  const hasTimezone = /Z$|[+-]\d{2}:\d{2}$/.test(normalized);
-  const candidate = hasTimezone ? normalized : `${normalized}Z`;
-  const parsed = Date.parse(candidate);
-  return Number.isFinite(parsed) ? parsed : 0;
-}
-
-function isPasswordResetOtpExpired(row, nowMs = Date.now()) {
-  const expiresAtMs = parseTimestampMs(row?.expires_at);
-  if (!expiresAtMs) {
-    return true;
-  }
-  return nowMs >= expiresAtMs;
-}
-
-function hasPasswordResetOtpResendCooldown(row, nowMs = Date.now()) {
-  const createdAtMs = parseTimestampMs(row?.created_at);
-  if (!createdAtMs) {
-    return false;
-  }
-  return nowMs - createdAtMs < PASSWORD_RESET_OTP_RESEND_COOLDOWN_SECONDS * 1000;
-}
-
-function maskEmailAddress(value) {
-  const normalized = normalizeProfileEmail(value);
-  if (!isValidProfileEmail(normalized)) {
-    return "";
-  }
-  const [localPart, domainPart] = normalized.split("@");
-  if (!localPart || !domainPart) {
-    return "";
-  }
-  if (localPart.length <= 2) {
-    return `${localPart.charAt(0)}***@${domainPart}`;
-  }
-  return `${localPart.slice(0, 2)}***@${domainPart}`;
-}
+const receiptService = createReceiptService({
+  fs,
+  path,
+  crypto,
+  get,
+  run,
+  all,
+  parseBooleanEnv,
+  parseResourceId,
+  normalizeIdentifier,
+  sanitizeTransactionRef,
+  isValidIsoLikeDate,
+  parseJsonObject,
+  queueApprovedReceiptDispatch,
+  generateApprovedStudentReceipts,
+  logReceiptEvent,
+  createSystemActorRequest,
+  projectRoot: PROJECT_ROOT,
+  dataDir,
+  receiptsDir,
+  approvedReceiptsDir,
+  rowMatchesStudentDepartmentScope,
+  ensurePaymentObligationsForStudent,
+  getDaysUntilDue,
+  getReminderMetadata,
+  isPathInsideDirectory,
+  isLikelyLegacyPlainReceipt,
+  logger: console,
+});
 
 let payoutEncryptionKeyBuffer = null;
 
@@ -2052,86 +1918,30 @@ async function incrementPasswordResetOtpAttempt(otpId) {
 }
 
 async function getRosterUserDepartment(username, role) {
-  const normalizedUsername = normalizeIdentifier(username);
-  const normalizedRole = String(role || "")
-    .trim()
-    .toLowerCase();
-  if (!normalizedUsername) {
-    return "";
-  }
-  const rolesToTry = [];
-  if (normalizedRole === "student" || normalizedRole === "teacher") {
-    rolesToTry.push(normalizedRole);
-  }
-  if (!rolesToTry.length) {
-    rolesToTry.push("student", "teacher");
-  }
-  for (const candidateRole of rolesToTry) {
-    const row = await get(
-      `
-        SELECT department
-        FROM auth_roster
-        WHERE auth_id = ?
-          AND role = ?
-        LIMIT 1
-      `,
-      [normalizedUsername, candidateRole]
-    );
-    if (row && row.department) {
-      return normalizeDepartment(row.department);
-    }
-  }
-  return "";
+  return contentAccessService.getRosterUserDepartment(username, role);
 }
 
 async function getSessionUserDepartment(req) {
-  const username = normalizeIdentifier(req?.session?.user?.username || "");
-  const role = String(req?.session?.user?.role || "")
-    .trim()
-    .toLowerCase();
-  if (!username || role === "admin") {
-    return "";
-  }
-  return getRosterUserDepartment(username, role);
+  return contentAccessService.getSessionUserDepartment({
+    actorUsername: req?.session?.user?.username || "",
+    actorRole: req?.session?.user?.role || "",
+  });
 }
 
 async function resolveContentTargetDepartment(req, providedDepartment) {
-  const role = String(req?.session?.user?.role || "")
-    .trim()
-    .toLowerCase();
-  const normalizedProvided = normalizeDepartment(providedDepartment);
-  if (role === "admin") {
-    if (!normalizedProvided || normalizedProvided === "all") {
-      return "all";
-    }
-    if (!isValidDepartment(normalizedProvided)) {
-      throw { status: 400, error: "Department scope is invalid." };
-    }
-    return normalizedProvided;
-  }
-  const actorDepartment = await getSessionUserDepartment(req);
-  if (!actorDepartment) {
-    return "all";
-  }
-  return actorDepartment;
+  return contentAccessService.resolveContentTargetDepartment({
+    actorRole: req?.session?.user?.role || "",
+    actorDepartment: await getSessionUserDepartment(req),
+    providedDepartment,
+  });
 }
 
 async function listStudentDepartmentRows() {
-  return all(
-    `
-      SELECT auth_id, department
-      FROM auth_roster
-      WHERE role = 'student'
-      ORDER BY auth_id ASC
-    `
-  );
+  return contentAccessService.listStudentDepartmentRows();
 }
 
 function rowMatchesStudentDepartmentScope(row, studentDepartment) {
-  if (!row || typeof row !== "object") {
-    return false;
-  }
-  return departmentScopeMatchesStudent(String(row.target_department || ""), studentDepartment);
+  return contentAccessService.rowMatchesStudentDepartmentScope(row, studentDepartment);
 }
 
 async function initDatabase() {
@@ -3013,92 +2823,6 @@ app.get("/content-files/:folder/:filename", requireAuth, (req, res) => {
   }
   return res.sendFile(absolutePath);
 });
-
-function isAuthenticated(req) {
-  return !!(req.session && req.session.user);
-}
-
-function isValidHttpUrl(value) {
-  return /^https?:\/\/\S+$/i.test(value);
-}
-
-function isValidLocalContentUrl(value) {
-  return /^\/content-files\/(handouts|shared)\/[a-z0-9._-]+$/i.test(String(value || ""));
-}
-
-function requireAuth(req, res, next) {
-  if (isAuthenticated(req)) {
-    return next();
-  }
-  return res.redirect("/login");
-}
-
-function requireAdmin(req, res, next) {
-  if (isAuthenticated(req) && req.session.user && req.session.user.role === "admin") {
-    return next();
-  }
-  return res.status(403).redirect("/");
-}
-
-function requireTeacher(req, res, next) {
-  if (!isAuthenticated(req) || !req.session.user) {
-    return res.status(401).redirect("/login");
-  }
-  if (req.session.user.role === "teacher" || req.session.user.role === "admin") {
-    return next();
-  }
-  return res.status(403).redirect("/");
-}
-
-function requireTeacherOnly(req, res, next) {
-  if (!isAuthenticated(req) || !req.session.user) {
-    return res.status(401).redirect("/login");
-  }
-  if (req.session.user.role === "teacher") {
-    return next();
-  }
-  return res.redirect(req.session.user.role === "admin" ? "/admin" : "/");
-}
-
-function requireNonAdmin(req, res, next) {
-  if (!isAuthenticated(req) || !req.session.user) {
-    return res.status(401).redirect("/login");
-  }
-  if (req.session.user.role !== "admin") {
-    return next();
-  }
-  return res.redirect("/admin");
-}
-
-function requireStudent(req, res, next) {
-  if (!isAuthenticated(req) || !req.session.user) {
-    return res.status(401).json({ error: "Authentication required." });
-  }
-  if (req.session.user.role === "student") {
-    return next();
-  }
-  return res.status(403).json({ error: "Only students can perform this action." });
-}
-
-function isAdminSession(req) {
-  return !!(req.session && req.session.user && req.session.user.role === "admin");
-}
-
-function parseResourceId(rawValue) {
-  const value = Number.parseInt(rawValue, 10);
-  if (!Number.isFinite(value) || value <= 0) {
-    return null;
-  }
-  return value;
-}
-
-function parseBooleanEnv(rawValue, defaultValue = false) {
-  if (rawValue === undefined || rawValue === null || String(rawValue).trim() === "") {
-    return defaultValue;
-  }
-  const normalized = String(rawValue).trim().toLowerCase();
-  return ["1", "true", "yes", "y", "on"].includes(normalized);
-}
 
 function createSystemActorRequest(username = "system-reconciliation", role = "system-reconciliation") {
   const actorUsername = normalizeIdentifier(username) || "system-reconciliation";
@@ -4074,14 +3798,12 @@ async function getStudentNameVariants(username) {
 }
 
 async function ensureCanManageContent(req, table, id) {
-  const row = await get(`SELECT * FROM ${table} WHERE id = ? LIMIT 1`, [id]);
-  if (!row) {
-    return { error: "not_found" };
-  }
-  if (isAdminSession(req) || row.created_by === req.session.user.username) {
-    return { row };
-  }
-  return { error: "forbidden" };
+  return contentAccessService.ensureCanManageContent({
+    table,
+    id,
+    actorUsername: req?.session?.user?.username || "",
+    isAdmin: isAdminSession(req),
+  });
 }
 
 function sanitizeMessageSubject(value) {
@@ -8128,202 +7850,40 @@ app.post("/login", async (req, res) => {
 });
 
 app.post("/api/auth/password-recovery/send-otp", async (req, res) => {
-  const identifier = normalizeIdentifier(req.body?.username || "");
-  const auditSend = async (outcome, details = "") =>
-    logPasswordResetAuditEvent(req, "password_reset_otp_send", identifier, outcome, details);
-  if (!isValidIdentifier(identifier)) {
-    await auditSend("invalid_input", "reason=invalid_username");
-    return res.status(400).json({ error: "Enter a valid username." });
-  }
-
-  const sendRateLimit = takePasswordResetRateLimitAttempt(req, "send", identifier);
-  if (sendRateLimit.limited) {
-    res.set("Retry-After", String(sendRateLimit.retryAfterSeconds));
-    await auditSend("rate_limited", `retry_after_seconds=${sendRateLimit.retryAfterSeconds}`);
-    return res.status(429).json({ error: "Too many OTP requests. Please try again later." });
-  }
-
   try {
-    const [rosterUser, passwordOverride, profile, latestOtp] = await Promise.all([
-      get("SELECT auth_id, role FROM auth_roster WHERE auth_id = ? LIMIT 1", [identifier]),
-      getPasswordOverride(identifier),
-      getUserProfile(identifier),
-      getLatestPasswordResetOtp(identifier),
-    ]);
-
-    if (!rosterUser || String(rosterUser.role || "").trim().toLowerCase() !== "student") {
-      await auditSend("account_unavailable", "reason=not_student_or_missing_roster");
-      return res.status(400).json({ error: "Password reset is not available for this account." });
-    }
-    if (!passwordOverride || !passwordOverride.password_hash) {
-      await auditSend("account_unavailable", "reason=no_custom_password");
-      return res.status(400).json({ error: "Password reset is not available for this account." });
-    }
-
-    const email = profile && isValidProfileEmail(profile.email) ? normalizeProfileEmail(profile.email) : "";
-    if (!email) {
-      await auditSend("email_missing", "reason=missing_or_invalid_profile_email");
-      return res.status(400).json({ error: "No valid email is linked to this account." });
-    }
-
-    if (
-      latestOtp &&
-      !latestOtp.consumed_at &&
-      !isPasswordResetOtpExpired(latestOtp) &&
-      hasPasswordResetOtpResendCooldown(latestOtp)
-    ) {
-      await auditSend("cooldown_active", `cooldown_seconds=${PASSWORD_RESET_OTP_RESEND_COOLDOWN_SECONDS}`);
-      return res.status(429).json({
-        error: `Please wait ${PASSWORD_RESET_OTP_RESEND_COOLDOWN_SECONDS} seconds before requesting another OTP.`,
-      });
-    }
-
-    const otpCode = generateNumericOtp(PASSWORD_RESET_OTP_LENGTH);
-    const otpHash = await bcrypt.hash(normalizeOtpCode(otpCode), 12);
-    const expiresAt = new Date(Date.now() + PASSWORD_RESET_OTP_TTL_MINUTES * 60 * 1000).toISOString();
-
-    let otpId = 0;
-    await withSqlTransaction(async () => {
-      await invalidateActivePasswordResetOtps(identifier);
-      otpId = await createPasswordResetOtp({
-        username: identifier,
-        email,
-        otpHash,
-        expiresAt,
-        maxAttempts: PASSWORD_RESET_OTP_MAX_ATTEMPTS,
-      });
+    const payload = await sendPasswordRecoveryOtp({
+      req,
+      username: req.body?.username || "",
     });
-
-    try {
-      await sendPasswordResetOtpEmail({
-        username: identifier,
-        toEmail: email,
-        otpCode,
-        expiresInMinutes: PASSWORD_RESET_OTP_TTL_MINUTES,
-      });
-    } catch (sendErr) {
-      await markPasswordResetOtpConsumed(otpId);
-      const sendMessage = String(sendErr?.message || "");
-      await auditSend("delivery_failed", sendMessage ? `reason=${sendMessage}` : "reason=unknown");
-      if (sendMessage) {
-        return res.status(503).json({ error: sendMessage });
-      }
-      return res.status(503).json({ error: "Could not deliver OTP email." });
-    }
-
-    const payload = {
-      ok: true,
-      expiresInMinutes: PASSWORD_RESET_OTP_TTL_MINUTES,
-      sentToMaskedEmail: maskEmailAddress(email),
-    };
-    if (isTestEnvironment) {
-      payload.otpCode = otpCode;
-    }
-    await auditSend("success", `sent_to=${maskEmailAddress(email)}; expires_in_minutes=${PASSWORD_RESET_OTP_TTL_MINUTES}`);
-
     return res.json(payload);
   } catch (err) {
-    await auditSend("server_error", `reason=${String(err?.message || "unknown")}`);
+    if (err && err.headers) {
+      Object.entries(err.headers).forEach(([key, value]) => res.set(key, value));
+    }
+    if (err && err.status && err.error) {
+      return res.status(err.status).json({ error: err.error });
+    }
     return res.status(500).json({ error: "Could not send OTP." });
   }
 });
 
 app.post("/api/auth/password-recovery/reset", async (req, res) => {
-  const identifier = normalizeIdentifier(req.body?.username || "");
-  const otpCode = normalizeOtpCode(req.body?.otpCode || "");
-  const newPassword = String(req.body?.newPassword || "");
-  const confirmPassword = String(req.body?.confirmPassword || "");
-  const auditReset = async (outcome, details = "") =>
-    logPasswordResetAuditEvent(req, "password_reset_otp_reset", identifier, outcome, details);
-  if (!isValidIdentifier(identifier)) {
-    await auditReset("invalid_input", "reason=invalid_username");
-    return res.status(400).json({ error: "Enter a valid username." });
-  }
-  if (!otpCode || otpCode.length !== PASSWORD_RESET_OTP_LENGTH) {
-    await auditReset("invalid_input", "reason=invalid_otp_format");
-    return res.status(400).json({ error: `Enter the ${PASSWORD_RESET_OTP_LENGTH}-digit OTP sent to your email.` });
-  }
-  if (!newPassword) {
-    await auditReset("invalid_input", "reason=missing_new_password");
-    return res.status(400).json({ error: "New password is required." });
-  }
-  if (newPassword !== confirmPassword) {
-    await auditReset("invalid_input", "reason=password_mismatch");
-    return res.status(400).json({ error: "New password and confirmation do not match." });
-  }
-  const passwordStrengthError = validateCustomPasswordStrength(newPassword, identifier);
-  if (passwordStrengthError) {
-    await auditReset("invalid_input", "reason=password_strength");
-    return res.status(400).json({ error: passwordStrengthError });
-  }
-
-  const resetRateLimit = takePasswordResetRateLimitAttempt(req, "reset", identifier);
-  if (resetRateLimit.limited) {
-    res.set("Retry-After", String(resetRateLimit.retryAfterSeconds));
-    await auditReset("rate_limited", `retry_after_seconds=${resetRateLimit.retryAfterSeconds}`);
-    return res.status(429).json({ error: "Too many failed attempts. Please try again later." });
-  }
-
   try {
-    const [rosterUser, passwordOverride, latestOtp] = await Promise.all([
-      get("SELECT auth_id, role FROM auth_roster WHERE auth_id = ? LIMIT 1", [identifier]),
-      getPasswordOverride(identifier),
-      getLatestPasswordResetOtp(identifier),
-    ]);
-
-    if (!rosterUser || String(rosterUser.role || "").trim().toLowerCase() !== "student") {
-      await auditReset("account_unavailable", "reason=not_student_or_missing_roster");
-      return res.status(400).json({ error: "Password reset is not available for this account." });
-    }
-    if (!passwordOverride || !passwordOverride.password_hash) {
-      await auditReset("account_unavailable", "reason=no_custom_password");
-      return res.status(400).json({ error: "Password reset is not available for this account." });
-    }
-    if (!latestOtp || latestOtp.consumed_at) {
-      await auditReset("otp_missing", "reason=no_active_otp");
-      return res.status(400).json({ error: "Request a new OTP before resetting your password." });
-    }
-    if (isPasswordResetOtpExpired(latestOtp)) {
-      await markPasswordResetOtpConsumed(latestOtp.id);
-      await auditReset("otp_expired", "reason=expired");
-      return res.status(400).json({ error: "OTP has expired. Request a new one." });
-    }
-    const attemptsUsed = Number(latestOtp.attempts_used || 0);
-    const maxAttempts = Number(latestOtp.max_attempts || PASSWORD_RESET_OTP_MAX_ATTEMPTS);
-    if (attemptsUsed >= maxAttempts) {
-      await markPasswordResetOtpConsumed(latestOtp.id);
-      await auditReset("otp_locked", `attempts_used=${attemptsUsed}; max_attempts=${maxAttempts}`);
-      return res.status(403).json({ error: "OTP verification failed. Request a new OTP." });
-    }
-
-    const isOtpMatch = await bcrypt.compare(otpCode, latestOtp.otp_hash);
-    if (!isOtpMatch) {
-      await incrementPasswordResetOtpAttempt(latestOtp.id);
-      const refreshedOtp = await getLatestPasswordResetOtp(identifier);
-      const refreshedAttempts = Number(refreshedOtp?.attempts_used || attemptsUsed + 1);
-      if (refreshedOtp && refreshedAttempts >= Number(refreshedOtp.max_attempts || maxAttempts)) {
-        await markPasswordResetOtpConsumed(refreshedOtp.id);
-      }
-      await auditReset("otp_mismatch", `attempts_used=${refreshedAttempts}; max_attempts=${maxAttempts}`);
-      return res.status(403).json({ error: "OTP verification failed. Check the code and try again." });
-    }
-
-    const isSameAsCurrent = await bcrypt.compare(newPassword, passwordOverride.password_hash);
-    if (isSameAsCurrent) {
-      await auditReset("invalid_input", "reason=password_reuse");
-      return res.status(400).json({ error: "New password must be different from your current password." });
-    }
-
-    const passwordHash = await bcrypt.hash(newPassword, 12);
-    await withSqlTransaction(async () => {
-      await upsertPasswordOverride(identifier, passwordHash);
-      await markPasswordResetOtpConsumed(latestOtp.id);
+    const payload = await resetPasswordRecovery({
+      req,
+      username: req.body?.username || "",
+      otpCode: req.body?.otpCode || "",
+      newPassword: req.body?.newPassword || "",
+      confirmPassword: req.body?.confirmPassword || "",
     });
-    await auditReset("success", "password_reset_completed");
-
-    return res.json({ ok: true });
+    return res.json(payload);
   } catch (err) {
-    await auditReset("server_error", `reason=${String(err?.message || "unknown")}`);
+    if (err && err.headers) {
+      Object.entries(err.headers).forEach(([key, value]) => res.set(key, value));
+    }
+    if (err && err.status && err.error) {
+      return res.status(err.status).json({ error: err.error });
+    }
     return res.status(500).json({ error: "Could not reset password." });
   }
 });
@@ -8347,33 +7907,13 @@ app.get("/health", (_req, res) => {
 
 app.get("/api/me", requireAuth, async (req, res) => {
   try {
-    const [profile, department, passwordOverride] = await Promise.all([
-      getUserProfile(req.session.user.username),
-      getSessionUserDepartment(req),
-      getPasswordOverride(req.session.user.username),
-    ]);
-    const departmentScope = expandDepartmentScope(department);
-    const displayName =
-      profile && profile.display_name
-        ? profile.display_name
-        : deriveDisplayNameFromIdentifier(req.session.user.username);
-    const email = profile && isValidProfileEmail(profile.email) ? normalizeProfileEmail(profile.email) : null;
-    return res.json({
-      username: req.session.user.username,
-      role: req.session.user.role,
-      displayName,
-      profileImageUrl: profile ? profile.profile_image_url : null,
-      email,
-      emailVerified: !!email,
-      customPasswordEnabled: !!(passwordOverride && passwordOverride.password_hash),
-      canSetOneTimeStrongPassword: req.session.user.role === "student" && !(passwordOverride && passwordOverride.password_hash),
-      department,
-      departmentLabel: formatDepartmentLabel(department),
-      departmentsCovered:
-        req.session.user.role === "teacher"
-          ? Array.from(departmentScope || []).filter(Boolean).sort((a, b) => a.localeCompare(b))
-          : [],
-    });
+    return res.json(
+      await buildMePayload({
+        req,
+        username: req.session.user.username,
+        role: req.session.user.role,
+      })
+    );
   } catch (_err) {
     return res.status(500).json({ error: "Could not load profile." });
   }
@@ -8444,103 +7984,36 @@ app.post("/api/profile", requireAuth, async (req, res) => {
 });
 
 app.post("/api/profile/email", requireAuth, async (req, res) => {
-  const email = normalizeProfileEmail(req.body?.email || "");
-  if (!email) {
-    return res.status(400).json({ error: "Email address cannot be empty." });
-  }
-  if (!isValidProfileEmail(email)) {
-    return res.status(400).json({ error: "Enter a valid email address." });
-  }
-
   try {
-    const existingOwner = await findProfileEmailOwner(email, req.session.user.username);
-    if (existingOwner && normalizeIdentifier(existingOwner.username) !== normalizeIdentifier(req.session.user.username)) {
-      return res.status(409).json({ error: "This email address is already in use by another account." });
-    }
-    await upsertProfileEmail(req.session.user.username, email);
-    return res.json({ ok: true, email, verified: true, requiresVerification: false });
+    return res.json(
+      await updateProfileEmailAddress({
+        username: req.session.user.username,
+        email: req.body?.email || "",
+      })
+    );
   } catch (_err) {
+    if (_err && _err.status && _err.error) {
+      return res.status(_err.status).json({ error: _err.error });
+    }
     return res.status(500).json({ error: "Could not update email address." });
   }
 });
 
 app.post("/api/profile/password", requireAuth, async (req, res) => {
-  const actorRole = String(req.session?.user?.role || "")
-    .trim()
-    .toLowerCase();
-  if (actorRole !== "student" && actorRole !== "teacher") {
-    return res.status(403).json({ error: "Only students and lecturers can change passwords here." });
-  }
-
-  const currentPassword = String(req.body?.currentPassword || "");
-  const newPassword = String(req.body?.newPassword || "");
-  const confirmPassword = String(req.body?.confirmPassword || "");
-
-  if (!currentPassword) {
-    return res.status(400).json({ error: "Current password is required." });
-  }
-  if (!newPassword) {
-    return res.status(400).json({ error: "New password is required." });
-  }
-  if (newPassword !== confirmPassword) {
-    return res.status(400).json({ error: "New password and confirmation do not match." });
-  }
-  const passwordStrengthError = validateCustomPasswordStrength(newPassword, req.session.user.username);
-  if (passwordStrengthError) {
-    return res.status(400).json({ error: passwordStrengthError });
-  }
-
   try {
-    const rosterUser = await get(
-      "SELECT auth_id, role, password_hash FROM auth_roster WHERE auth_id = ? LIMIT 1",
-      [req.session.user.username]
+    return res.json(
+      await updateProfilePassword({
+        actorRole: req.session?.user?.role || "",
+        username: req.session.user.username,
+        currentPassword: req.body?.currentPassword || "",
+        newPassword: req.body?.newPassword || "",
+        confirmPassword: req.body?.confirmPassword || "",
+      })
     );
-    if (!rosterUser) {
-      return res.status(404).json({ error: "User was not found in the login roster." });
-    }
-
-    const passwordOverride = await getPasswordOverride(req.session.user.username);
-    const isStudentOneTimeSetup = actorRole === "student";
-    if (isStudentOneTimeSetup && passwordOverride && passwordOverride.password_hash) {
-      return res.status(403).json({
-        error: "You can only create a stronger password once. Use Forgot Password on the login page to reset it.",
-      });
-    }
-
-    let isCurrentPasswordValid = false;
-    if (passwordOverride && passwordOverride.password_hash) {
-      isCurrentPasswordValid = await bcrypt.compare(currentPassword, passwordOverride.password_hash);
-      if (isCurrentPasswordValid) {
-        const isSameAsExistingOverride = await bcrypt.compare(newPassword, passwordOverride.password_hash);
-        if (isSameAsExistingOverride) {
-          return res.status(400).json({ error: "New password must be different from your current password." });
-        }
-      }
-    } else {
-      const normalizedCurrentSurname = normalizeSurnamePassword(currentPassword);
-      if (!isValidSurnamePassword(normalizedCurrentSurname)) {
-        return res.status(400).json({ error: "Current password is incorrect." });
-      }
-      isCurrentPasswordValid = await bcrypt.compare(normalizedCurrentSurname, rosterUser.password_hash);
-      if (isCurrentPasswordValid) {
-        const normalizedNewSurname = normalizeSurnamePassword(newPassword);
-        if (
-          isValidSurnamePassword(normalizedNewSurname) &&
-          (await bcrypt.compare(normalizedNewSurname, rosterUser.password_hash))
-        ) {
-          return res.status(400).json({ error: "New password must be different from your current password." });
-        }
-      }
-    }
-
-    if (!isCurrentPasswordValid) {
-      return res.status(400).json({ error: "Current password is incorrect." });
-    }
-
-    const passwordHash = await bcrypt.hash(newPassword, 12);
-    await upsertPasswordOverride(req.session.user.username, passwordHash);
-    return res.json({ ok: true });
   } catch (_err) {
+    if (_err && _err.status && _err.error) {
+      return res.status(_err.status).json({ error: _err.error });
+    }
     return res.status(500).json({ error: "Could not update password." });
   }
 });
@@ -8573,133 +8046,62 @@ app.post("/api/profile/avatar", requireAuth, (req, res) => {
 
 app.get("/api/profile/checklist", requireAuth, async (req, res) => {
   try {
-    const actorRole = String(req.session?.user?.role || "")
-      .trim()
-      .toLowerCase();
-    const actorDepartment = await getSessionUserDepartment(req);
-    const rows = await all(
-      `
-        SELECT
-          dc.id,
-          dc.department,
-          dc.item_text,
-          dc.item_order,
-          dc.created_at,
-          COALESCE(scp.completed, 0) AS completed,
-          scp.completed_at
-        FROM department_checklists dc
-        LEFT JOIN student_checklist_progress scp
-          ON scp.checklist_id = dc.id
-         AND scp.username = ?
-        ORDER BY dc.department ASC, dc.item_order ASC, dc.id ASC
-      `,
-      [req.session.user.username]
+    return res.json(
+      await getChecklistPayload({
+        req,
+        username: req.session.user.username,
+        actorRole: req.session?.user?.role || "",
+      })
     );
-
-    let scopedRows = rows;
-    if (actorRole === "student") {
-      scopedRows = rows.filter((row) => departmentScopeMatchesStudent(row.department, actorDepartment));
-    } else if (actorRole === "teacher") {
-      scopedRows = rows.filter((row) => doesDepartmentScopeOverlap(row.department, actorDepartment));
-    }
-
-    return res.json({
-      department: actorDepartment || "",
-      departmentLabel: formatDepartmentLabel(actorDepartment || ""),
-      items: scopedRows.map((row) => ({
-        id: Number(row.id || 0),
-        department: String(row.department || ""),
-        departmentLabel: formatDepartmentLabel(row.department || ""),
-        item_text: String(row.item_text || ""),
-        item_order: Number(row.item_order || 0),
-        completed: Number(row.completed || 0) === 1,
-        completed_at: row.completed_at || null,
-        created_at: row.created_at || "",
-      })),
-    });
   } catch (_err) {
     return res.status(500).json({ error: "Could not load checklist." });
   }
 });
 
 app.post("/api/profile/checklist/:id/toggle", requireAuth, async (req, res) => {
-  if (req.session.user.role !== "student") {
-    return res.status(403).json({ error: "Only students can update checklist progress." });
-  }
-  const checklistId = parseResourceId(req.params.id);
-  if (!checklistId) {
-    return res.status(400).json({ error: "Invalid checklist item ID." });
-  }
-  const completedRaw = req.body?.completed;
-  const completed = (() => {
-    if (typeof completedRaw === "boolean") {
-      return completedRaw;
-    }
-    const normalized = String(completedRaw || "")
-      .trim()
-      .toLowerCase();
-    return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
-  })();
-
   try {
-    const item = await get(
-      `
-        SELECT id, department
-        FROM department_checklists
-        WHERE id = ?
-        LIMIT 1
-      `,
-      [checklistId]
+    return res.json(
+      await toggleChecklistItem({
+        req,
+        actorRole: req.session.user.role,
+        username: req.session.user.username,
+        checklistId: parseResourceId(req.params.id),
+        completed: req.body?.completed,
+      })
     );
-    if (!item) {
-      return res.status(404).json({ error: "Checklist item not found." });
-    }
-    const studentDepartment = await getSessionUserDepartment(req);
-    if (!departmentScopeMatchesStudent(item.department, studentDepartment)) {
-      return res.status(403).json({ error: "You do not have access to this checklist item." });
-    }
-
-    await run(
-      `
-        INSERT INTO student_checklist_progress (checklist_id, username, completed, completed_at, updated_at)
-        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(checklist_id, username) DO UPDATE SET
-          completed = excluded.completed,
-          completed_at = excluded.completed_at,
-          updated_at = CURRENT_TIMESTAMP
-      `,
-      [checklistId, req.session.user.username, completed ? 1 : 0, completed ? new Date().toISOString() : null]
-    );
-
-    return res.json({
-      ok: true,
-      checklistId,
-      completed,
-    });
   } catch (_err) {
+    if (_err && _err.status && _err.error) {
+      return res.status(_err.status).json({ error: _err.error });
+    }
     return res.status(500).json({ error: "Could not update checklist progress." });
   }
 });
 
 registerMessageRoutes(app, {
   requireAuth,
-  normalizeIdentifier,
-  isValidIdentifier,
   parseResourceId,
-  canCreateMessageThreads,
-  validateMessageSubjectOrThrow,
-  validateMessageBodyOrThrow,
-  validateMessageRecipients,
-  listMessageThreadSummariesForUser,
-  getMessageUnreadCounts,
-  getMessageThreadPayloadForUser,
-  withSqlTransaction,
-  run,
-  get,
-  getMessageThreadAccess,
-  markMessageThreadReadForUser,
-  listMessageStudentDirectory,
   getSessionUserDepartment,
+  messageService,
+});
+
+registerNotificationRoutes(app, {
+  requireAuth,
+  requireTeacher,
+  notificationService,
+  parseResourceId,
+  getSessionUserDepartment,
+  resolveContentTargetDepartment,
+});
+
+registerHandoutRoutes(app, {
+  fs,
+  parseResourceId,
+  requireAuth,
+  requireTeacher,
+  handoutUpload,
+  getSessionUserDepartment,
+  resolveContentTargetDepartment,
+  handoutService,
 });
 
 app.get("/admin", requireAdmin, (_req, res) => {
@@ -8799,133 +8201,33 @@ app.get("/api/admin/audit-logs", requireAdmin, async (_req, res) => {
 
 app.get("/api/payment-items", requireAuth, async (_req, res) => {
   try {
-    const isStudent = _req.session?.user?.role === "student";
-    const studentDepartment = isStudent ? await getSessionUserDepartment(_req) : "";
-    let rows = [];
-    if (isStudent) {
-      const student = normalizeIdentifier(_req.session.user.username);
-      await ensurePaymentObligationsForStudent(student);
-      rows = await all(
-        `
-          SELECT
-            pi.id,
-            pi.title,
-            pi.description,
-            pi.expected_amount,
-            pi.currency,
-            pi.due_date,
-            pi.available_until,
-            pi.availability_days,
-            pi.target_department,
-            pi.created_by,
-            pi.created_at,
-            po.payment_reference AS my_reference,
-            po.status AS obligation_status,
-            COALESCE(po.amount_paid_total, 0) AS amount_paid_total
-          FROM payment_items pi
-          LEFT JOIN payment_obligations po
-            ON po.payment_item_id = pi.id
-           AND po.student_username = ?
-          WHERE (pi.available_until IS NULL OR CAST(pi.available_until AS timestamp) > CURRENT_TIMESTAMP)
-          ORDER BY pi.created_at DESC, pi.id DESC
-        `,
-        [student]
-      );
-      rows = rows.filter((row) => rowMatchesStudentDepartmentScope(row, studentDepartment));
-    } else {
-      rows = await all(
-        `
-          SELECT
-            pi.id,
-            pi.title,
-            pi.description,
-            pi.expected_amount,
-            pi.currency,
-            pi.due_date,
-            pi.available_until,
-            pi.availability_days,
-            pi.target_department,
-            pi.created_by,
-            pi.created_at
-          FROM payment_items pi
-          ORDER BY pi.created_at DESC, pi.id DESC
-        `
-      );
-    }
-    return res.json(rows);
+    return res.json(
+      await paymentDomain.listPaymentItems({
+        actorRole: _req.session?.user?.role || "",
+        actorUsername: _req.session?.user?.username || "",
+        actorDepartment: _req.session?.user?.role === "student" ? await getSessionUserDepartment(_req) : "",
+      })
+    );
   } catch (_err) {
     return res.status(500).json({ error: "Could not load payment items." });
   }
 });
 
 app.post("/api/payment-items", requireTeacher, async (req, res) => {
-  const title = String(req.body.title || "").trim();
-  const description = String(req.body.description || "").trim();
-  const expectedAmount = parseMoneyValue(req.body.expectedAmount);
-  const currency = parseCurrency(req.body.currency || "NGN");
-  const dueDateRaw = String(req.body.dueDate || "").trim();
-  const dueDate = dueDateRaw || null;
-  const hasAvailabilityDays = String(req.body.availabilityDays ?? "").trim() !== "";
-  const availabilityDays = parseAvailabilityDays(req.body.availabilityDays);
-  const availableUntil = hasAvailabilityDays ? computeAvailableUntil(availabilityDays) : null;
-
-  if (!title || title.length > 120) {
-    return res.status(400).json({ error: "Title is required and must be 120 characters or less." });
-  }
-  if (!Number.isFinite(expectedAmount) || expectedAmount <= 0) {
-    return res.status(400).json({ error: "Expected amount must be greater than zero." });
-  }
-  if (!currency) {
-    return res.status(400).json({ error: "Currency must be a 3-letter code (e.g. NGN)." });
-  }
-  if (dueDate && !isValidIsoLikeDate(dueDate)) {
-    return res.status(400).json({ error: "Due date format is invalid." });
-  }
-  if (hasAvailabilityDays && !availabilityDays) {
-    return res.status(400).json({ error: "Availability days must be a whole number between 1 and 3650." });
-  }
-
   try {
-    const targetDepartment = await resolveContentTargetDepartment(req, req.body?.targetDepartment || "");
-    const result = await run(
-      `
-        INSERT INTO payment_items (
-          title,
-          description,
-          expected_amount,
-          currency,
-          due_date,
-          available_until,
-          availability_days,
-          target_department,
-          created_by
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `,
-      [
-        title,
-        description,
-        expectedAmount,
-        currency,
-        dueDate,
-        availableUntil,
-        availabilityDays,
-        targetDepartment,
-        req.session.user.username,
-      ]
+    return res.status(201).json(
+      await paymentDomain.createPaymentItem({
+        req,
+        actorUsername: req.session.user.username,
+        title: req.body.title,
+        description: req.body.description,
+        expectedAmount: req.body.expectedAmount,
+        currency: req.body.currency,
+        dueDate: req.body.dueDate,
+        availabilityDays: req.body.availabilityDays,
+        targetDepartment: req.body?.targetDepartment || "",
+      })
     );
-    const inserted = await get("SELECT * FROM payment_items WHERE id = ? LIMIT 1", [result.lastID]);
-    await syncPaymentItemNotification(req, inserted);
-    await ensurePaymentObligationsForPaymentItem(result.lastID);
-    await logAuditEvent(
-      req,
-      "create",
-      "payment_item",
-      result.lastID,
-      req.session.user.username,
-      `Created payment item "${title.slice(0, 80)}" (${currency} ${expectedAmount})`
-    );
-    return res.status(201).json({ ok: true, id: result.lastID });
   } catch (err) {
     if (err && err.status && err.error) {
       return res.status(err.status).json({ error: err.error });
@@ -8935,76 +8237,20 @@ app.post("/api/payment-items", requireTeacher, async (req, res) => {
 });
 
 app.put("/api/payment-items/:id", requireTeacher, async (req, res) => {
-  const id = parseResourceId(req.params.id);
-  const title = String(req.body.title || "").trim();
-  const description = String(req.body.description || "").trim();
-  const expectedAmount = parseMoneyValue(req.body.expectedAmount);
-  const currency = parseCurrency(req.body.currency || "NGN");
-  const dueDateRaw = String(req.body.dueDate || "").trim();
-  const dueDate = dueDateRaw || null;
-  const hasAvailabilityDays = String(req.body.availabilityDays ?? "").trim() !== "";
-  const availabilityDays = parseAvailabilityDays(req.body.availabilityDays);
-  const availableUntil = hasAvailabilityDays ? computeAvailableUntil(availabilityDays) : null;
-
-  if (!id) {
-    return res.status(400).json({ error: "Invalid payment item ID." });
-  }
-  if (!title || title.length > 120) {
-    return res.status(400).json({ error: "Title is required and must be 120 characters or less." });
-  }
-  if (!Number.isFinite(expectedAmount) || expectedAmount <= 0) {
-    return res.status(400).json({ error: "Expected amount must be greater than zero." });
-  }
-  if (!currency) {
-    return res.status(400).json({ error: "Currency must be a 3-letter code (e.g. NGN)." });
-  }
-  if (dueDate && !isValidIsoLikeDate(dueDate)) {
-    return res.status(400).json({ error: "Due date format is invalid." });
-  }
-  if (hasAvailabilityDays && !availabilityDays) {
-    return res.status(400).json({ error: "Availability days must be a whole number between 1 and 3650." });
-  }
-
   try {
-    const access = await ensureCanManageContent(req, "payment_items", id);
-    if (access.error === "not_found") {
-      return res.status(404).json({ error: "Payment item not found." });
-    }
-    if (access.error === "forbidden") {
-      return res.status(403).json({ error: "You can only edit your own payment item." });
-    }
-    const targetDepartment = await resolveContentTargetDepartment(
-      req,
-      req.body?.targetDepartment || access.row.target_department || ""
+    return res.json(
+      await paymentDomain.updatePaymentItem({
+        req,
+        id: req.params.id,
+        title: req.body.title,
+        description: req.body.description,
+        expectedAmount: req.body.expectedAmount,
+        currency: req.body.currency,
+        dueDate: req.body.dueDate,
+        availabilityDays: req.body.availabilityDays,
+        targetDepartment: req.body?.targetDepartment || "",
+      })
     );
-
-    await run(
-      `
-        UPDATE payment_items
-        SET title = ?,
-            description = ?,
-            expected_amount = ?,
-            currency = ?,
-            due_date = ?,
-            available_until = ?,
-            availability_days = ?,
-            target_department = ?
-        WHERE id = ?
-      `,
-      [title, description, expectedAmount, currency, dueDate, availableUntil, availabilityDays, targetDepartment, id]
-    );
-    const updated = await get("SELECT * FROM payment_items WHERE id = ? LIMIT 1", [id]);
-    await syncPaymentItemNotification(req, updated);
-    await ensurePaymentObligationsForPaymentItem(id);
-    await logAuditEvent(
-      req,
-      "edit",
-      "payment_item",
-      id,
-      access.row.created_by,
-      `Edited payment item "${title.slice(0, 80)}" (${currency} ${expectedAmount})`
-    );
-    return res.json({ ok: true });
   } catch (err) {
     if (err && err.status && err.error) {
       return res.status(err.status).json({ error: err.error });
@@ -9014,50 +8260,17 @@ app.put("/api/payment-items/:id", requireTeacher, async (req, res) => {
 });
 
 app.delete("/api/payment-items/:id", requireTeacher, async (req, res) => {
-  const id = parseResourceId(req.params.id);
-  if (!id) {
-    return res.status(400).json({ error: "Invalid payment item ID." });
-  }
-
   try {
-    const access = await ensureCanManageContent(req, "payment_items", id);
-    if (access.error === "not_found") {
-      return res.status(404).json({ error: "Payment item not found." });
-    }
-    if (access.error === "forbidden") {
-      return res.status(403).json({ error: "You can only delete your own payment item." });
-    }
-
-    const receiptCount = await get("SELECT COUNT(*) AS total FROM payment_receipts WHERE payment_item_id = ?", [id]);
-    if (Number(receiptCount?.total || 0) > 0) {
-      return res.status(409).json({ error: "Cannot delete a payment item that already has receipts." });
-    }
-    const reconciledCount = await get(
-      `
-        SELECT COUNT(*) AS total
-        FROM payment_transactions pt
-        JOIN payment_obligations po ON po.id = pt.matched_obligation_id
-        WHERE po.payment_item_id = ?
-      `,
-      [id]
+    return res.json(
+      await paymentDomain.deletePaymentItem({
+        req,
+        id: req.params.id,
+      })
     );
-    if (Number(reconciledCount?.total || 0) > 0) {
-      return res.status(409).json({ error: "Cannot delete a payment item that already has reconciled transactions." });
-    }
-
-    await run("DELETE FROM payment_obligations WHERE payment_item_id = ?", [id]);
-    await run("DELETE FROM payment_items WHERE id = ?", [id]);
-    await run("DELETE FROM notifications WHERE related_payment_item_id = ? AND auto_generated = 1", [id]);
-    await logAuditEvent(
-      req,
-      "delete",
-      "payment_item",
-      id,
-      access.row.created_by,
-      `Deleted payment item "${String(access.row.title || "").slice(0, 80)}"`
-    );
-    return res.json({ ok: true });
   } catch (_err) {
+    if (_err && _err.status && _err.error) {
+      return res.status(_err.status).json({ error: _err.error });
+    }
     return res.status(500).json({ error: "Could not delete payment item." });
   }
 });
@@ -9825,8 +9038,7 @@ app.post("/api/payments/webhook", async (req, res) => {
 
 app.get(["/api/lecturer/payout-summary", "/api/teacher/payout-summary"], requireTeacher, async (req, res) => {
   try {
-    const payout = await getLecturerPayoutSummary(req.session.user.username);
-    return res.json(payout);
+    return res.json(await payoutDomain.getPayoutSummaryForLecturer(req.session.user.username));
   } catch (_err) {
     return res.status(500).json({
       error: "Could not load payout summary.",
@@ -9837,10 +9049,7 @@ app.get(["/api/lecturer/payout-summary", "/api/teacher/payout-summary"], require
 
 app.get(["/api/lecturer/payout-account", "/api/teacher/payout-account"], requireTeacher, async (req, res) => {
   try {
-    const account = await getLecturerPayoutAccount(req.session.user.username);
-    return res.json({
-      account: summarizePayoutAccountRow(account),
-    });
+    return res.json(await payoutDomain.getPayoutAccountForLecturer(req.session.user.username));
   } catch (_err) {
     return res.status(500).json({
       error: "Could not load payout account.",
@@ -9851,11 +9060,13 @@ app.get(["/api/lecturer/payout-account", "/api/teacher/payout-account"], require
 
 app.post(["/api/lecturer/payout-account", "/api/teacher/payout-account"], requireTeacher, async (req, res) => {
   try {
-    const account = await updateLecturerPayoutAccount(req.session.user.username, req.body || {}, { req });
-    return res.status(200).json({
-      ok: true,
-      account,
-    });
+    return res.status(200).json(
+      await payoutDomain.savePayoutAccount({
+        lecturerUsername: req.session.user.username,
+        body: req.body || {},
+        req,
+      })
+    );
   } catch (err) {
     if (err && err.status && err.error) {
       return res.status(err.status).json({
@@ -9872,11 +9083,13 @@ app.post(["/api/lecturer/payout-account", "/api/teacher/payout-account"], requir
 
 app.put(["/api/lecturer/payout-account", "/api/teacher/payout-account"], requireTeacher, async (req, res) => {
   try {
-    const account = await updateLecturerPayoutAccount(req.session.user.username, req.body || {}, { req });
-    return res.status(200).json({
-      ok: true,
-      account,
-    });
+    return res.status(200).json(
+      await payoutDomain.savePayoutAccount({
+        lecturerUsername: req.session.user.username,
+        body: req.body || {},
+        req,
+      })
+    );
   } catch (err) {
     if (err && err.status && err.error) {
       return res.status(err.status).json({
@@ -9893,30 +9106,14 @@ app.put(["/api/lecturer/payout-account", "/api/teacher/payout-account"], require
 
 app.get(["/api/lecturer/payout-history", "/api/teacher/payout-history"], requireTeacher, async (req, res) => {
   try {
-    const limit = Number.isFinite(Number(req.query?.limit)) ? Number(req.query.limit) : 25;
-    const offset = Number.isFinite(Number(req.query?.offset)) ? Number(req.query.offset) : 0;
-    const status = String(req.query?.status || "").trim().toLowerCase();
-    const [payout, transfers, ledger] = await Promise.all([
-      getLecturerPayoutSummary(req.session.user.username),
-      getLecturerPayoutTransfers({
+    return res.json(
+      await payoutDomain.getPayoutHistory({
         lecturerUsername: req.session.user.username,
-        status,
-        limit,
-        offset,
-      }),
-      getLecturerPayoutLedgerRows({
-        lecturerUsername: req.session.user.username,
-        status,
-        limit,
-        offset,
-      }),
-    ]);
-    return res.json({
-      account: payout.account,
-      summary: payout.summary,
-      transfers,
-      ledger: ledger.map(summarizePayoutLedgerRow),
-    });
+        limit: req.query?.limit,
+        offset: req.query?.offset,
+        status: req.query?.status,
+      })
+    );
   } catch (_err) {
     return res.status(500).json({
       error: "Could not load payout history.",
@@ -9927,23 +9124,13 @@ app.get(["/api/lecturer/payout-history", "/api/teacher/payout-history"], require
 
 app.post(["/api/lecturer/payout-request", "/api/teacher/payout-request"], requireTeacher, async (req, res) => {
   try {
-    const requestedAmount = req.body?.amount;
-    const batch = await reserveLecturerPayoutBatch(req.session.user.username, {
-      amount: requestedAmount,
-      triggerSource: "manual",
-      requestedBy: req.session.user.username,
-      req,
-    });
-    if (batch?.activeTransfer?.id) {
-      await queueLecturerPayoutDispatch(`transfer-${batch.activeTransfer.id}`, async () =>
-        dispatchQueuedLecturerPayoutTransfer(batch.activeTransfer.id, { req })
-      );
-    }
-    return res.status(200).json({
-      ok: true,
-      ...batch,
-      payout: await getLecturerPayoutSummary(req.session.user.username),
-    });
+    return res.status(200).json(
+      await payoutDomain.requestPayout({
+        lecturerUsername: req.session.user.username,
+        amount: req.body?.amount,
+        req,
+      })
+    );
   } catch (err) {
     if (err && err.status && err.error) {
       return res.status(err.status).json({
@@ -9960,23 +9147,14 @@ app.post(["/api/lecturer/payout-request", "/api/teacher/payout-request"], requir
 
 app.get("/api/admin/lecturer/payout-transfers", requireAdmin, async (req, res) => {
   try {
-    const lecturerUsername = normalizeIdentifier(req.query?.lecturerUsername || "");
-    const limit = Number.isFinite(Number(req.query?.limit)) ? Number(req.query.limit) : 50;
-    const offset = Number.isFinite(Number(req.query?.offset)) ? Number(req.query.offset) : 0;
-    const status = String(req.query?.status || "").trim().toLowerCase();
-    const [transfers, payout] = await Promise.all([
-      getLecturerPayoutTransfers({
-        lecturerUsername,
-        status,
-        limit,
-        offset,
-      }),
-      lecturerUsername ? getLecturerPayoutSummary(lecturerUsername) : Promise.resolve(null),
-    ]);
-    return res.json({
-      payout: payout || null,
-      transfers,
-    });
+    return res.json(
+      await payoutDomain.listAdminPayoutTransfers({
+        lecturerUsername: req.query?.lecturerUsername || "",
+        limit: req.query?.limit,
+        offset: req.query?.offset,
+        status: req.query?.status,
+      })
+    );
   } catch (_err) {
     return res.status(500).json({
       error: "Could not load payout transfers.",
@@ -9986,64 +9164,22 @@ app.get("/api/admin/lecturer/payout-transfers", requireAdmin, async (req, res) =
 });
 
 app.post("/api/admin/lecturer/payout-transfers/:id/review", requireAdmin, async (req, res) => {
-  const transferId = parseResourceId(req.params.id);
-  if (!transferId) {
-    return res.status(400).json({
-      error: "A payout transfer id is required.",
-      code: "payout_transfer_review_invalid_id",
-    });
-  }
-
   try {
-    const transfer = await getLecturerPayoutTransferById(transferId);
-    if (!transfer) {
-      return res.status(404).json({
-        error: "Payout transfer not found.",
-        code: "payout_transfer_not_found",
+    return res.json(
+      await payoutDomain.markTransferForReview({
+        transferId: req.params.id,
+        note: req.body?.note || req.body?.reason || "",
+        actorUsername: req.session.user.username || "admin",
+        req,
+      })
+    );
+  } catch (_err) {
+    if (_err && _err.status && _err.error) {
+      return res.status(_err.status).json({
+        error: _err.error,
+        code: _err.code || "payout_transfer_review_failed",
       });
     }
-    const note = String(req.body?.note || req.body?.reason || "manual_review").trim().slice(0, 500) || "manual_review";
-    await withSqlTransaction(async () => {
-      await run(
-        `
-          UPDATE lecturer_payout_transfers
-          SET status = 'review',
-              review_state = 'required',
-              reviewed_by = ?,
-              reviewed_at = CURRENT_TIMESTAMP,
-              failure_reason = ?,
-              updated_at = CURRENT_TIMESTAMP
-          WHERE id = ?
-        `,
-        [req.session.user.username || "admin", note, transfer.id]
-      );
-      await run(
-        `
-          UPDATE lecturer_payout_ledger
-          SET status = 'review',
-              review_reason = ?,
-              updated_at = CURRENT_TIMESTAMP
-          WHERE payout_transfer_id = ?
-        `,
-        [note, transfer.id]
-      );
-    });
-    await logLecturerPayoutEvent({
-      transferId: transfer.id,
-      req,
-      eventType: "payout_transfer_reviewed",
-      note: `Admin marked payout transfer ${transfer.transfer_reference} for review.`,
-      payload: {
-        lecturer_username: transfer.lecturer_username,
-        transfer_reference: transfer.transfer_reference,
-        reason: note,
-      },
-    });
-    return res.json({
-      ok: true,
-      transfer: await getLecturerPayoutTransferById(transferId),
-    });
-  } catch (_err) {
     return res.status(500).json({
       error: "Could not mark payout transfer for review.",
       code: "payout_transfer_review_failed",
@@ -10052,70 +9188,20 @@ app.post("/api/admin/lecturer/payout-transfers/:id/review", requireAdmin, async 
 });
 
 app.post("/api/admin/lecturer/payout-transfers/:id/retry", requireAdmin, async (req, res) => {
-  const transferId = parseResourceId(req.params.id);
-  if (!transferId) {
-    return res.status(400).json({
-      error: "A payout transfer id is required.",
-      code: "payout_transfer_retry_invalid_id",
-    });
-  }
-
   try {
-    const transfer = await getLecturerPayoutTransferById(transferId);
-    if (!transfer) {
-      return res.status(404).json({
-        error: "Payout transfer not found.",
-        code: "payout_transfer_not_found",
-      });
-    }
-    const currentStatus = String(transfer.status || "").trim().toLowerCase();
-    if (currentStatus === "success") {
-      return res.status(409).json({
-        error: "Completed payout transfers cannot be retried.",
-        code: "payout_transfer_retry_conflict",
-      });
-    }
-    await run(
-      `
-        UPDATE lecturer_payout_transfers
-        SET status = 'queued',
-            review_state = 'not_required',
-            failure_reason = NULL,
-            reviewed_by = NULL,
-            reviewed_at = NULL,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-      `,
-      [transfer.id]
+    return res.json(
+      await payoutDomain.retryTransfer({
+        transferId: req.params.id,
+        req,
+      })
     );
-    await run(
-      `
-        UPDATE lecturer_payout_ledger
-        SET status = 'available',
-            review_reason = NULL,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE payout_transfer_id = ?
-      `,
-      [transfer.id]
-    );
-    await logLecturerPayoutEvent({
-      transferId: transfer.id,
-      req,
-      eventType: "payout_transfer_retry_requested",
-      note: `Admin retried payout transfer ${transfer.transfer_reference}.`,
-      payload: {
-        lecturer_username: transfer.lecturer_username,
-        transfer_reference: transfer.transfer_reference,
-      },
-    });
-    await queueLecturerPayoutDispatch(`transfer-${transfer.id}`, async () =>
-      dispatchQueuedLecturerPayoutTransfer(transfer.id, { req })
-    );
-    return res.json({
-      ok: true,
-      transfer: await getLecturerPayoutTransferById(transferId),
-    });
   } catch (_err) {
+    if (_err && _err.status && _err.error) {
+      return res.status(_err.status).json({
+        error: _err.error,
+        code: _err.code || "payout_transfer_retry_failed",
+      });
+    }
     return res.status(500).json({
       error: "Could not retry payout transfer.",
       code: "payout_transfer_retry_failed",
@@ -10380,63 +9466,13 @@ app.get("/api/my/payment-receipts", requireAuth, async (req, res) => {
     return res.status(403).json({ error: "Only students can view this resource." });
   }
   try {
-    const studentDepartment = await getSessionUserDepartment(req);
-    const rowsSql = `
-        SELECT
-          pr.id,
-          pr.payment_item_id,
-          pr.amount_paid,
-          pr.paid_at,
-          pr.transaction_ref,
-          pr.status,
-          pr.submitted_at,
-          pr.reviewed_by,
-          pr.reviewed_at,
-          pr.rejection_reason,
-          pr.verification_notes,
-          COALESCE(ard.receipt_sent, 0) AS approved_receipt_sent,
-          ard.receipt_generated_at AS approved_receipt_generated_at,
-          ard.receipt_sent_at AS approved_receipt_sent_at,
-          CASE
-            WHEN COALESCE(ard.receipt_file_path, '') != '' THEN 1
-            ELSE 0
-          END AS approved_receipt_available,
-          pi.title AS payment_item_title,
-          pi.expected_amount,
-          pi.currency,
-          pi.due_date,
-          pi.target_department
-        FROM payment_receipts pr
-        JOIN payment_items pi ON pi.id = pr.payment_item_id
-        LEFT JOIN approved_receipt_dispatches ard ON ard.payment_receipt_id = pr.id
-        WHERE pr.student_username = ?
-          AND pr.status = 'approved'
-        ORDER BY COALESCE(pr.reviewed_at, pr.submitted_at) DESC, pr.id DESC
-      `;
-    const queryRows = () => all(rowsSql, [req.session.user.username]);
-    let rows = (await queryRows()).filter((row) => rowMatchesStudentDepartmentScope(row, studentDepartment));
-    const pendingApprovedReceiptIds = rows
-      .filter((row) => String(row.status || "").toLowerCase() === "approved" && Number(row.approved_receipt_available || 0) !== 1)
-      .map((row) => parseResourceId(row.id))
-      .filter((receiptId) => !!receiptId)
-      .slice(0, 3);
-    if (pendingApprovedReceiptIds.length) {
-      for (const paymentReceiptId of pendingApprovedReceiptIds) {
-        const delivery = await triggerApprovedReceiptDispatchForReceipt(paymentReceiptId, {
-          actorUsername: req.session.user.username || "system-student",
-          forceEnabled: true,
-        });
-        if (delivery && (delivery.error || Number(delivery.failed || 0) > 0)) {
-          console.error(
-            `[approved-receipts] student receipt list backfill failed payment_receipt_id=${paymentReceiptId} reason=${
-              delivery.error || "unknown"
-            }`
-          );
-        }
-      }
-      rows = (await queryRows()).filter((row) => rowMatchesStudentDepartmentScope(row, studentDepartment));
-    }
-    return res.json(rows);
+    return res.json(
+      await receiptService.listApprovedReceiptsForStudent({
+        studentUsername: req.session.user.username,
+        studentDepartment: await getSessionUserDepartment(req),
+        actorUsername: req.session.user.username,
+      })
+    );
   } catch (_err) {
     return res.status(500).json({ error: "Could not load your approved receipts." });
   }
@@ -10444,222 +9480,12 @@ app.get("/api/my/payment-receipts", requireAuth, async (req, res) => {
 
 app.get("/api/my/payment-ledger", requireStudent, async (req, res) => {
   try {
-    const studentDepartment = await getSessionUserDepartment(req);
-    await ensurePaymentObligationsForStudent(req.session.user.username);
-    const rows = await all(
-      `
-        SELECT
-          pi.id,
-          pi.title,
-          pi.description,
-          pi.expected_amount,
-          pi.currency,
-          pi.due_date,
-          pi.available_until,
-          pi.availability_days,
-          pi.target_department,
-          pi.created_by,
-          po.id AS obligation_id,
-          COALESCE(po.amount_paid_total, 0) AS approved_paid,
-          (
-            COALESCE(
-              (
-                SELECT SUM(pt.amount)
-                FROM payment_transactions pt
-                WHERE pt.matched_obligation_id = po.id
-                  AND pt.status IN ('needs_review', 'needs_student_confirmation', 'unmatched')
-              ),
-              0
-            )
-          ) AS pending_paid,
-          po.payment_reference AS my_reference,
-          po.status AS obligation_status,
-          (
-            SELECT ps.status
-            FROM paystack_sessions ps
-            WHERE ps.obligation_id = po.id
-              AND ps.student_id = ?
-            ORDER BY ps.updated_at DESC, ps.id DESC
-            LIMIT 1
-          ) AS paystack_state,
-          (
-            SELECT ps.gateway_reference
-            FROM paystack_sessions ps
-            WHERE ps.obligation_id = po.id
-              AND ps.student_id = ?
-            ORDER BY ps.updated_at DESC, ps.id DESC
-            LIMIT 1
-          ) AS paystack_reference,
-          (
-            SELECT pr2.id
-            FROM payment_receipts pr2
-            JOIN approved_receipt_dispatches ard2 ON ard2.payment_receipt_id = pr2.id
-            WHERE pr2.payment_item_id = pi.id
-              AND pr2.student_username = ?
-              AND pr2.status = 'approved'
-              AND COALESCE(ard2.receipt_file_path, '') != ''
-            ORDER BY COALESCE(pr2.reviewed_at, pr2.submitted_at) DESC, pr2.id DESC
-            LIMIT 1
-          ) AS approved_receipt_id,
-          (
-            SELECT pr3.id
-            FROM payment_receipts pr3
-            WHERE pr3.payment_item_id = pi.id
-              AND pr3.student_username = ?
-              AND pr3.status = 'approved'
-            ORDER BY COALESCE(pr3.reviewed_at, pr3.submitted_at) DESC, pr3.id DESC
-            LIMIT 1
-          ) AS approved_receipt_candidate_id
-        FROM payment_items pi
-        LEFT JOIN payment_obligations po
-          ON po.payment_item_id = pi.id
-         AND po.student_username = ?
-        WHERE (pi.available_until IS NULL OR CAST(pi.available_until AS timestamp) > CURRENT_TIMESTAMP)
-        ORDER BY
-          CASE WHEN pi.due_date IS NULL OR pi.due_date = '' THEN 1 ELSE 0 END ASC,
-          pi.due_date ASC,
-          pi.id ASC
-      `,
-      [
-        req.session.user.username,
-        req.session.user.username,
-        req.session.user.username,
-        req.session.user.username,
-        req.session.user.username,
-      ]
+    return res.json(
+      await receiptService.buildStudentLedgerPayload({
+        studentUsername: req.session.user.username,
+        studentDepartment: await getSessionUserDepartment(req),
+      })
     );
-
-    const scopedRows = rows.filter((row) => rowMatchesStudentDepartmentScope(row, studentDepartment));
-
-    for (const row of scopedRows) {
-      const paymentItemId = parseResourceId(row.id);
-      const obligationId = parseResourceId(row.obligation_id);
-      const expectedAmount = Number(row.expected_amount || 0);
-      const approvedPaid = Number(row.approved_paid || 0);
-      const isSettled = Number.isFinite(expectedAmount) && approvedPaid >= expectedAmount - 0.01;
-      const hasDownloadableApprovedReceipt = !!parseResourceId(row.approved_receipt_id);
-      if (!paymentItemId || !obligationId || !isSettled || hasDownloadableApprovedReceipt) {
-        continue;
-      }
-      const candidateReceiptId = parseResourceId(row.approved_receipt_candidate_id);
-      if (candidateReceiptId) {
-        const delivery = await triggerApprovedReceiptDispatchForReceipt(candidateReceiptId, {
-          actorUsername: "system-ledger",
-          forceEnabled: true,
-        });
-        if (delivery && (delivery.error || Number(delivery.failed || 0) > 0)) {
-          console.error(
-            `[approved-receipts] ledger candidate backfill failed payment_receipt_id=${candidateReceiptId} reason=${
-              delivery.error || "unknown"
-            }`
-          );
-        }
-        const dispatch = await getApprovedReceiptDispatchByReceiptId(candidateReceiptId);
-        if (dispatch && dispatch.receipt_file_path) {
-          row.approved_receipt_id = candidateReceiptId;
-          continue;
-        }
-      }
-      const latestApprovedTransaction = await get(
-        `
-          SELECT id
-          FROM payment_transactions
-          WHERE matched_obligation_id = ?
-            AND status = 'approved'
-          ORDER BY COALESCE(reviewed_at, created_at) DESC, id DESC
-          LIMIT 1
-        `,
-        [obligationId]
-      );
-      const approvedTransactionId = parseResourceId(latestApprovedTransaction?.id);
-      if (!approvedTransactionId) {
-        continue;
-      }
-      const receiptGeneration = await ensureApprovedReceiptGeneratedForTransaction(approvedTransactionId, {
-        actorReq: createSystemActorRequest("system-ledger", "system-reconciliation"),
-        reason: "student_ledger_backfill",
-      });
-      if (receiptGeneration && receiptGeneration.ok && receiptGeneration.receiptId) {
-        row.approved_receipt_id = receiptGeneration.receiptId;
-      }
-    }
-
-    const items = scopedRows.map((row) => {
-      const expectedAmount = Number(row.expected_amount || 0);
-      const approvedPaid = Number(row.approved_paid || 0);
-      const pendingPaid = Number(row.pending_paid || 0);
-      const outstanding = Math.max(0, expectedAmount - approvedPaid);
-      const daysUntilDue = getDaysUntilDue(row.due_date);
-      const reminder = getReminderMetadata(daysUntilDue, outstanding);
-      const { approved_receipt_candidate_id: _approvedReceiptCandidateId, ...rowWithoutCandidate } = row;
-      return {
-        ...rowWithoutCandidate,
-        expected_amount: expectedAmount,
-        approved_paid: approvedPaid,
-        pending_paid: pendingPaid,
-        approved_receipt_id: parseResourceId(row.approved_receipt_id),
-        outstanding,
-        days_until_due: daysUntilDue,
-        reminder_level: reminder.level,
-        reminder_text: reminder.text,
-      };
-    });
-
-    const summary = items.reduce(
-      (acc, item) => {
-        acc.totalDue += Number(item.expected_amount || 0);
-        acc.totalApprovedPaid += Number(item.approved_paid || 0);
-        acc.totalPendingPaid += Number(item.pending_paid || 0);
-        acc.totalOutstanding += Number(item.outstanding || 0);
-        if (item.reminder_level === "overdue") {
-          acc.overdueCount += 1;
-        }
-        if (item.reminder_level === "urgent" || item.reminder_level === "today") {
-          acc.dueSoonCount += 1;
-        }
-        return acc;
-      },
-      {
-        totalDue: 0,
-        totalApprovedPaid: 0,
-        totalPendingPaid: 0,
-        totalOutstanding: 0,
-        overdueCount: 0,
-        dueSoonCount: 0,
-      }
-    );
-
-    const nextDueItem =
-      items.find((item) => Number(item.outstanding || 0) > 0 && Number.isFinite(item.days_until_due) && item.days_until_due >= 0) ||
-      null;
-
-    const timeline = await all(
-      `
-        SELECT
-          re.id,
-          re.action,
-          re.note,
-          re.created_at,
-          pi.title AS payment_item_title,
-          pi.target_department
-        FROM reconciliation_events re
-        JOIN payment_obligations po ON po.id = re.obligation_id
-        LEFT JOIN payment_items pi ON pi.id = po.payment_item_id
-        WHERE po.student_username = ?
-        ORDER BY re.created_at DESC, re.id DESC
-        LIMIT 25
-      `,
-      [req.session.user.username]
-    );
-    const scopedTimeline = timeline.filter((row) => rowMatchesStudentDepartmentScope(row, studentDepartment));
-
-    return res.json({
-      summary,
-      nextDueItem,
-      items,
-      timeline: scopedTimeline,
-      generatedAt: new Date().toISOString(),
-    });
   } catch (_err) {
     return res.status(500).json({ error: "Could not load student payment ledger." });
   }
@@ -10990,10 +9816,6 @@ app.post("/api/payment-receipts/:id/reject", requireTeacher, async (req, res) =>
 });
 
 app.get("/api/payment-receipts/:id/file", requireAuth, async (req, res) => {
-  const id = parseResourceId(req.params.id);
-  if (!id) {
-    return res.status(400).json({ error: "Invalid receipt ID." });
-  }
   const requestedVariant = String(req.query.variant || "approved")
     .trim()
     .toLowerCase();
@@ -11008,110 +9830,21 @@ app.get("/api/payment-receipts/:id/file", requireAuth, async (req, res) => {
   }
   const wantsApprovedVariant = true;
   try {
-    const row = await get(
-      `
-        SELECT
-          pr.id,
-          pr.student_username,
-          pr.receipt_file_path,
-          ard.receipt_file_path AS approved_receipt_file_path
-        FROM payment_receipts pr
-        LEFT JOIN approved_receipt_dispatches ard ON ard.payment_receipt_id = pr.id
-        WHERE pr.id = ?
-        LIMIT 1
-      `,
-      [id]
-    );
-    if (!row) {
-      return res.status(404).json({ error: "Receipt not found." });
+    if (!wantsApprovedVariant) {
+      return res.status(400).json({ error: "Invalid receipt variant." });
     }
-    const canAccess =
-      req.session.user.role === "admin" ||
-      req.session.user.role === "teacher" ||
-      req.session.user.username === row.student_username;
-    if (!canAccess) {
-      return res.status(403).json({ error: "You do not have permission to view this receipt file." });
-    }
-    if (wantsApprovedVariant && refreshRequested) {
-      const forcedDelivery = await triggerApprovedReceiptDispatchForReceipt(id, {
-        actorUsername: req.session?.user?.username || "system-download",
-        forceEnabled: true,
-        forceRegenerate: true,
-      });
-      if (forcedDelivery && (forcedDelivery.error || Number(forcedDelivery.failed || 0) > 0)) {
-        console.error(
-          `[approved-receipts] forced regeneration failed payment_receipt_id=${id} reason=${
-            forcedDelivery.error || "unknown"
-          }`
-        );
-      }
-    }
-    let approvedReceiptPath = String(row.approved_receipt_file_path || "").trim();
-    if (wantsApprovedVariant && !approvedReceiptPath) {
-      const delivery = await triggerApprovedReceiptDispatchForReceipt(id, {
-        actorUsername: req.session?.user?.username || "system-download",
-        forceEnabled: true,
-      });
-      if (delivery && (delivery.error || Number(delivery.failed || 0) > 0)) {
-        console.error(
-          `[approved-receipts] on-demand download generation failed payment_receipt_id=${id} reason=${
-            delivery.error || "unknown"
-          }`
-        );
-      }
-      const dispatch = await getApprovedReceiptDispatchByReceiptId(id);
-      approvedReceiptPath = String(dispatch?.receipt_file_path || "").trim();
-    }
-    if (wantsApprovedVariant && !approvedReceiptPath) {
-      return res.status(404).json({ error: "Approved receipt is not available yet. Please refresh and try again." });
-    }
-
-    const allowedBaseDir = approvedReceiptsDir;
-    let selectedPath = approvedReceiptPath;
-    if (wantsApprovedVariant && selectedPath) {
-      const absoluteApprovedPath = path.resolve(selectedPath);
-      const approvedPathValid = isPathInsideDirectory(allowedBaseDir, absoluteApprovedPath) && fs.existsSync(absoluteApprovedPath);
-      if (!approvedPathValid) {
-        const delivery = await triggerApprovedReceiptDispatchForReceipt(id, {
-          actorUsername: req.session?.user?.username || "system-download",
-          forceEnabled: true,
-        });
-        if (delivery && (delivery.error || Number(delivery.failed || 0) > 0)) {
-          console.error(
-            `[approved-receipts] on-demand regeneration failed payment_receipt_id=${id} reason=${
-              delivery.error || "unknown"
-            }`
-          );
-        }
-        const dispatch = await getApprovedReceiptDispatchByReceiptId(id);
-        selectedPath = String(dispatch?.receipt_file_path || "").trim();
-      } else if (!refreshRequested && isLikelyLegacyPlainReceipt(absoluteApprovedPath)) {
-        const delivery = await triggerApprovedReceiptDispatchForReceipt(id, {
-          actorUsername: req.session?.user?.username || "system-download",
-          forceEnabled: true,
-          forceRegenerate: true,
-        });
-        if (delivery && (delivery.error || Number(delivery.failed || 0) > 0)) {
-          console.error(
-            `[approved-receipts] auto-upgrade regeneration failed payment_receipt_id=${id} reason=${
-              delivery.error || "unknown"
-            }`
-          );
-        }
-        const dispatch = await getApprovedReceiptDispatchByReceiptId(id);
-        selectedPath = String(dispatch?.receipt_file_path || "").trim();
-      }
-    }
-    if (!selectedPath) {
-      return res.status(404).json({ error: "Approved receipt file is missing." });
-    }
-
-    const absolutePath = path.resolve(selectedPath);
-    if (!isPathInsideDirectory(allowedBaseDir, absolutePath) || !fs.existsSync(absolutePath)) {
-      return res.status(404).json({ error: "Approved receipt file is missing." });
-    }
+    const absolutePath = await receiptService.resolveApprovedReceiptFileAccess({
+      paymentReceiptId: req.params.id,
+      actorUsername: req.session?.user?.username || "",
+      isAdmin: req.session.user.role === "admin",
+      isTeacher: req.session.user.role === "teacher",
+      refreshRequested,
+    });
     return res.sendFile(absolutePath);
   } catch (_err) {
+    if (_err && _err.status && _err.error) {
+      return res.status(_err.status).json({ error: _err.error });
+    }
     return res.status(500).json({ error: "Could not open receipt file." });
   }
 });
@@ -11593,30 +10326,10 @@ app.delete("/api/notifications/:id", requireTeacher, async (req, res) => {
   }
 });
 
-registerHandoutRoutes(app, {
-  fs,
-  all,
-  run,
-  parseReactionDetails,
-  parseResourceId,
-  requireAuth,
-  requireTeacher,
-  ensureCanManageContent,
-  logAuditEvent,
-  handoutUpload,
-  broadcastContentUpdate,
-  removeStoredContentFile,
-  isValidHttpUrl,
-  isValidLocalContentUrl,
-  getSessionUserDepartment,
-  departmentScopeMatchesStudent,
-  resolveContentTargetDepartment,
-});
-
 registerAdminImportRoutes(app, {
   requireAdmin,
-  processRosterCsv,
-  processDepartmentChecklistCsv,
+  processRosterCsv: (...args) => adminImportService.processRosterCsv(...args),
+  processDepartmentChecklistCsv: (...args) => adminImportService.processDepartmentChecklistCsv(...args),
 });
 
 registerSharedFileRoutes(app, {
