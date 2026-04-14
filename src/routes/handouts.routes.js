@@ -1,6 +1,5 @@
 function registerHandoutRoutes(app, deps) {
   const {
-    fs,
     parseResourceId,
     requireAuth,
     requireTeacher,
@@ -8,6 +7,7 @@ function registerHandoutRoutes(app, deps) {
     getSessionUserDepartment,
     resolveContentTargetDepartment,
     handoutService,
+    storeUploadedContentFile,
   } = deps;
 
   app.get("/api/handouts", requireAuth, async (req, res) => {
@@ -39,15 +39,9 @@ function registerHandoutRoutes(app, deps) {
       const title = String(req.body.title || "").trim();
       const description = String(req.body.description || "").trim();
       if (!title || !description) {
-        if (req.file?.path) {
-          fs.unlink(req.file.path, () => {});
-        }
         return res.status(400).json({ error: "Title and description are required." });
       }
       if (title.length > 120 || description.length > 2000) {
-        if (req.file?.path) {
-          fs.unlink(req.file.path, () => {});
-        }
         return res.status(400).json({ error: "Handout field length is invalid." });
       }
       if (!req.file) {
@@ -56,19 +50,23 @@ function registerHandoutRoutes(app, deps) {
 
       try {
         const targetDepartment = await resolveContentTargetDepartment(req, req.body?.targetDepartment || "");
+        const uploaded = await storeUploadedContentFile({
+          req,
+          category: "handouts",
+          actorUsername: req.session.user.username,
+          actorRole: req.session.user.role,
+          file: req.file,
+        });
         const payload = await handoutService.createHandout({
           req,
           actorUsername: req.session.user.username,
           title,
           description,
-          fileUrl: `/content-files/handouts/${req.file.filename}`,
+          fileUrl: uploaded.legacyUrl,
           targetDepartment,
         });
         return res.status(201).json(payload);
       } catch (innerErr) {
-        if (req.file?.path) {
-          fs.unlink(req.file.path, () => {});
-        }
         if (innerErr && innerErr.status && innerErr.error) {
           return res.status(innerErr.status).json({ error: innerErr.error });
         }

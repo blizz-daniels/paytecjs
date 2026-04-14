@@ -71,6 +71,21 @@ If you want to build the Next.js shell for production testing:
 - Added now: role-aware shell layouts for student, teacher, and admin areas
 - Still legacy-only: most interactive student, teacher, admin, payments, messaging, analytics, and profile data flows
 
+### Next Auth + Session Migration (Phase 5)
+
+- Next.js Route Handlers now support native auth/session flows:
+  - `POST /api/auth/login`
+  - `POST /api/auth/logout`
+  - `GET /api/auth/session`
+  - `GET /api/me`
+  - `POST /api/auth/password-recovery/send-otp`
+  - `POST /api/auth/password-recovery/reset`
+  - `GET /api/csrf-token`
+- Sessions are stored in database table `next_auth_sessions`.
+- Production requires Postgres for Next sessions (SQLite session storage is blocked in production).
+- Role is re-resolved from database on each authenticated request (`users` for admin, `auth_roster` for student/teacher).
+- CSRF is enforced for unsafe auth routes using a token endpoint plus header/hidden-field verification.
+
 ## Database Runtime Policy (Phase 3)
 
 Production database behavior is now explicit and locked down:
@@ -235,8 +250,7 @@ Automated workflow included in this repo:
 2. Skips already-processed rows unless `--force`.
 3. Fills HTML/CSS template placeholders.
 4. Inserts profile picture (`user_profiles.profile_image_url`) into passport slot; falls back to a placeholder image if missing.
-5. Creates image-based PDF (300 DPI) at:
-   - `outputs/receipts/{application_id}_{yyyy-mm-dd}.pdf`
+5. Creates image-based PDF (300 DPI) in a temporary output path, then stores durable output in object storage when configured (`FILE_STORAGE_PROVIDER=supabase`).
 6. Marks the approved receipt as ready for in-app download.
 7. Tracks generation state in `approved_receipt_dispatches`:
    - `receipt_generated_at`
@@ -318,6 +332,18 @@ Runtime notes:
 See `.env.example`, including:
 
 - `DATABASE_URL`
+- `NEXT_SESSION_COOKIE_NAME`
+- `NEXT_CSRF_COOKIE_NAME`
+- `NEXT_SESSION_TTL_HOURS`
+- `FILE_STORAGE_PROVIDER` (`supabase` in production, `local` for local dev fallback)
+- `SUPABASE_URL`
+- `SUPABASE_SERVICE_ROLE_KEY`
+- `SUPABASE_STORAGE_BUCKET_AVATARS`
+- `SUPABASE_STORAGE_BUCKET_STATEMENTS`
+- `SUPABASE_STORAGE_BUCKET_HANDOUTS`
+- `SUPABASE_STORAGE_BUCKET_SHARED`
+- `SUPABASE_STORAGE_BUCKET_APPROVED_RECEIPTS`
+- `SUPABASE_STORAGE_BUCKET_EXPORTS`
 - `PAYMENT_REFERENCE_PREFIX`
 - `PAYMENT_REFERENCE_TENANT_ID`
 - `AUTO_RECONCILE_CONFIDENCE`
@@ -334,12 +360,33 @@ See `.env.example`, including:
 - `EMAIL_PROVIDER`, `PASSWORD_RESET_EMAIL_FROM`, and either `SMTP_*` (SMTP mode) or `RESEND_API_KEY` (Resend API mode)
 - `PASSWORD_RESET_RATE_LIMIT_WINDOW_SECONDS`, `PASSWORD_RESET_SEND_RATE_LIMIT_MAX_ATTEMPTS`, `PASSWORD_RESET_RESET_RATE_LIMIT_MAX_ATTEMPTS`, `PASSWORD_RESET_RATE_LIMIT_BLOCK_SECONDS`
 
+## Supabase Storage (Phase 4)
+
+Durable file content now lives in object storage (Supabase Storage in production) with metadata in Postgres table `stored_files`.
+
+Required buckets:
+
+- `avatars`
+- `statements`
+- `handouts`
+- `shared`
+- `approved-receipts`
+- `exports`
+
+Runtime model:
+
+- Uploads write file bytes to Supabase Storage.
+- Database rows keep user-facing legacy URLs (`/users/...`, `/content-files/...`) for compatibility.
+- `stored_files` maps each legacy URL to bucket/object path, ownership, and access scope.
+- Downloads are served through protected app routes that resolve metadata and stream bytes from object storage.
+- Approved receipt generation writes temp files only for render steps, uploads final PDFs to object storage, then serves from storage.
+
 ## Lecturer Payout Setup
 
 - Configure `PAYOUT_ENCRYPTION_KEY` before enabling payouts. Bank account numbers are encrypted at rest with this key.
 - Keep `PAYSTACK_SECRET_KEY` and `PAYSTACK_WEBHOOK_SECRET` set so transfer creation and transfer webhooks can both be verified.
 - Use PostgreSQL for production data. `DATABASE_URL` must point to your live database before startup in production.
-- Keep `DATA_DIR` on persistent storage for receipts, uploads, and generated files. The default `DATA_DIR=/tmp/paytec` is fine for local dev only.
+- `DATA_DIR` is now primarily runtime temp/fallback storage. Durable uploads/approved receipts are stored in Supabase Storage when `FILE_STORAGE_PROVIDER=supabase`.
 - The current `render.yaml` includes a managed Postgres resource plus a persistent disk for the web service. If you deploy on Render, keep the disk mounted at `/var/data` and ensure `DATABASE_URL` comes from the Postgres resource.
 - Store only masked bank details in API responses and UI; do not log raw account numbers or full recipient payloads.
 - The payout worker can run automatically via `PAYOUT_WORKER_INTERVAL_MS`, but manual payout requests still require a linked and active Paystack recipient.
@@ -354,7 +401,7 @@ For production, replace the SQLite file database with PostgreSQL:
 3. Keep `SESSION_SECRET` and all Paystack/payout secrets set.
 4. Run the app once so `initDatabase()` creates the schema in Postgres.
 5. Import any existing SQLite data before opening the site to users.
-6. Keep `DATA_DIR` on persistent storage for files that are still written to disk.
+6. `DATA_DIR` can remain ephemeral in production when `FILE_STORAGE_PROVIDER=supabase`; only temporary render/fallback files use local disk.
 
 The app will still run locally with SQLite if `DATABASE_URL` is not set, which keeps development and tests simple.
 If Postgres starts with an empty `auth_roster`, the app will bootstrap each missing roster once from `STUDENT_ROSTER_PATH` / `LECTURER_ROSTER_PATH` and then keep the database as the durable source of truth on later restarts.

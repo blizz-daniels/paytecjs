@@ -510,6 +510,14 @@ async function fileToDataUri(filePath) {
   return `data:${mime};base64,${bytes.toString("base64")}`;
 }
 
+function bytesToDataUri(bytes, mime = "application/octet-stream") {
+  if (!Buffer.isBuffer(bytes) || !bytes.length) {
+    return null;
+  }
+  const safeMime = String(mime || "application/octet-stream").trim().toLowerCase() || "application/octet-stream";
+  return `data:${safeMime};base64,${bytes.toString("base64")}`;
+}
+
 function parsePngDimensions(bytes) {
   if (!Buffer.isBuffer(bytes) || bytes.length < 24) {
     return null;
@@ -574,6 +582,20 @@ function getImageDimensionsFromBytes(bytes, mime) {
 }
 
 async function resolvePassportPhotoClass(row, options) {
+  if (typeof options.resolveProfileImageBytes === "function") {
+    try {
+      const resolved = await options.resolveProfileImageBytes(row);
+      if (resolved && Buffer.isBuffer(resolved.bytes) && resolved.bytes.length) {
+        const dimensions = getImageDimensionsFromBytes(resolved.bytes, resolved.mime || "application/octet-stream");
+        if (!dimensions || !Number.isFinite(dimensions.width) || !Number.isFinite(dimensions.height)) {
+          return "passport-photo";
+        }
+        return dimensions.width > dimensions.height ? "passport-photo passport-photo--rotated" : "passport-photo";
+      }
+    } catch (_err) {
+      // Continue with legacy file/url resolver.
+    }
+  }
   const dataDir = path.resolve(options.dataDir || path.join(__dirname, "..", "data"));
   const imagePathOrUrl = resolveProfileImageFile(row.profile_image_url, dataDir);
   if (!imagePathOrUrl || /^https?:\/\//i.test(imagePathOrUrl) || /^data:/i.test(imagePathOrUrl)) {
@@ -612,6 +634,17 @@ function resolveProfileImageFile(profileImageUrl, dataDir) {
 
 async function resolvePassportPhotoValue(row, options) {
   const logger = ensureLogger(options.logger);
+  if (typeof options.resolveProfileImageBytes === "function") {
+    try {
+      const resolved = await options.resolveProfileImageBytes(row);
+      const dataUri = bytesToDataUri(resolved?.bytes, resolved?.mime || "application/octet-stream");
+      if (dataUri) {
+        return dataUri;
+      }
+    } catch (_err) {
+      // Continue with legacy file/url resolver.
+    }
+  }
   const dataDir = path.resolve(options.dataDir || path.join(__dirname, "..", "data"));
   const imagePathOrUrl = resolveProfileImageFile(row.profile_image_url, dataDir);
   if (!imagePathOrUrl) {
@@ -1709,6 +1742,8 @@ async function generateApprovedStudentReceipts(options = {}) {
   const retryCount = Number.parseInt(String(options.retryCount || 3), 10) || 3;
   const retryDelayMs = Number.parseInt(String(options.retryDelayMs || 1500), 10) || 1500;
   const renderPdf = options.renderPdf || renderHtmlToImagePdf;
+  const objectStorage = options.objectStorage || null;
+  const fileMetadataService = options.fileMetadataService || null;
 
   await ensureDispatchTable(db);
   const tableRow = await db.get("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'payment_receipts'");
@@ -1789,14 +1824,29 @@ async function generateApprovedStudentReceipts(options = {}) {
 
     let placeholders;
     let outputPdfPath;
+    let outputPdfBuffer = null;
+    let storedReceiptPath = "";
+
+    const shouldCleanupTempOutput = Boolean(objectStorage);
+    const cleanupTempOutput = async () => {
+      if (!shouldCleanupTempOutput) {
+        return;
+      }
+      if (!outputPdfPath) {
+        return;
+      }
+      await fs.promises.unlink(outputPdfPath).catch(() => {});
+    };
 
     try {
       const passportPhoto = await resolvePassportPhotoValue(row, {
         dataDir: options.dataDir,
         logger,
+        resolveProfileImageBytes: options.resolveProfileImageBytes,
       });
       const passportPhotoClass = await resolvePassportPhotoClass(row, {
         dataDir: options.dataDir,
+        resolveProfileImageBytes: options.resolveProfileImageBytes,
       });
       placeholders = buildPlaceholderMap(row, {
         passport_photo: passportPhoto,
@@ -1816,16 +1866,50 @@ async function generateApprovedStudentReceipts(options = {}) {
         row,
         placeholders,
       });
-      await markGenerated(db, row.payment_receipt_id, toIsoDateTime(nowProvider()), outputPdfPath);
+      outputPdfBuffer = await fs.promises.readFile(outputPdfPath);
+      storedReceiptPath = outputPdfPath;
+      if (objectStorage) {
+        const storageFileName = path.basename(outputPdfPath) || `approved-receipt-${row.payment_receipt_id}.pdf`;
+        const uploaded = await objectStorage.uploadBuffer({
+          bucketKey: "approvedReceipts",
+          objectPath: objectStorage.buildObjectPath(
+            `approved-receipts/${sanitizeFileSegment(row.student_username || "student", "student")}`,
+            storageFileName
+          ),
+          contentType: "application/pdf",
+          buffer: outputPdfBuffer,
+          upsert: true,
+        });
+        storedReceiptPath = uploaded.objectRef;
+        if (fileMetadataService && typeof fileMetadataService.upsertFileRecord === "function") {
+          await fileMetadataService.upsertFileRecord({
+            legacyUrl: `/api/payment-receipts/${row.payment_receipt_id}/file?variant=approved`,
+            provider: uploaded.provider,
+            bucket: uploaded.bucket,
+            objectPath: uploaded.objectPath,
+            objectRef: uploaded.objectRef,
+            category: "approved_receipts",
+            ownerUsername: row.student_username || null,
+            ownerRole: "student",
+            accessScope: "owner_or_staff",
+            contentType: "application/pdf",
+            byteSize: Number(outputPdfBuffer.length || 0),
+            originalFilename: storageFileName,
+            linkedTable: "payment_receipts",
+            linkedId: Number(row.payment_receipt_id || 0) || null,
+          });
+        }
+      }
+      await markGenerated(db, row.payment_receipt_id, toIsoDateTime(nowProvider()), storedReceiptPath);
       emitLog(logger, "info", "generate_success", {
         ...logContext,
-        output_pdf_path: outputPdfPath,
+        output_pdf_path: storedReceiptPath,
         render_method: renderResult?.method || "unknown",
       });
       if (renderResult && renderResult.usedFallback) {
         emitLog(logger, "warn", "generate_fallback_used", {
           ...logContext,
-          output_pdf_path: outputPdfPath,
+          output_pdf_path: storedReceiptPath,
           reason: String(renderResult.warning || "Renderer fallback used."),
         });
       }
@@ -1839,6 +1923,7 @@ async function generateApprovedStudentReceipts(options = {}) {
         ...logContext,
         reason: message,
       });
+      await cleanupTempOutput();
       continue;
     }
 
@@ -1848,7 +1933,7 @@ async function generateApprovedStudentReceipts(options = {}) {
         summary.sent += 1;
         emitLog(logger, "info", "ready_success", {
           ...logContext,
-          output_pdf_path: outputPdfPath,
+          output_pdf_path: storedReceiptPath,
         });
       } catch (err) {
         summary.failed += 1;
@@ -1861,25 +1946,32 @@ async function generateApprovedStudentReceipts(options = {}) {
           reason: message,
         });
       }
+      await cleanupTempOutput();
       continue;
     }
 
     try {
       const subject = renderTemplate(options.emailSubject || DEFAULT_EMAIL_SUBJECT, placeholders);
       const textBody = renderTemplate(options.emailBody || DEFAULT_EMAIL_BODY, placeholders);
+      const attachmentFilename = path.basename(outputPdfPath || storedReceiptPath || `approved-receipt-${row.payment_receipt_id}.pdf`);
+      const attachment = outputPdfBuffer
+        ? {
+            filename: attachmentFilename,
+            content: outputPdfBuffer,
+            contentType: "application/pdf",
+          }
+        : {
+            filename: attachmentFilename,
+            path: outputPdfPath,
+            contentType: "application/pdf",
+          };
       await sendEmailWithRetry({
         sendEmail: options.sendEmail,
         payload: {
           to: row.email,
           subject,
           text: textBody,
-          attachments: [
-            {
-              filename: path.basename(outputPdfPath),
-              path: outputPdfPath,
-              contentType: "application/pdf",
-            },
-          ],
+          attachments: [attachment],
         },
         retryCount,
         retryDelayMs,
@@ -1890,7 +1982,7 @@ async function generateApprovedStudentReceipts(options = {}) {
       emitLog(logger, "info", "send_success", {
         ...logContext,
         email: row.email,
-        output_pdf_path: outputPdfPath,
+        output_pdf_path: storedReceiptPath,
       });
     } catch (err) {
       summary.failed += 1;
@@ -1904,6 +1996,7 @@ async function generateApprovedStudentReceipts(options = {}) {
         reason: message,
       });
     }
+    await cleanupTempOutput();
   }
 
   emitLog(logger, "info", "summary", {

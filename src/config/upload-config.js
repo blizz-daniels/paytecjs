@@ -1,18 +1,9 @@
 function createUploadHandlers(options = {}) {
   const multer = options.multer;
   const path = options.path;
-  const crypto = options.crypto;
-  const usersDir = options.usersDir;
-  const receiptsDir = options.receiptsDir;
-  const statementsDir = options.statementsDir;
-  const handoutsFilesDir = options.handoutsFilesDir;
-  const sharedFilesUploadDir = options.sharedFilesUploadDir;
 
-  if (!multer || !path || !crypto) {
-    throw new Error("createUploadHandlers requires multer, path, and crypto.");
-  }
-  if (!usersDir || !receiptsDir || !statementsDir || !handoutsFilesDir || !sharedFilesUploadDir) {
-    throw new Error("createUploadHandlers requires all upload directories.");
+  if (!multer || !path) {
+    throw new Error("createUploadHandlers requires multer and path.");
   }
 
   const allowedAvatarMimeTypes = new Set(["image/jpeg", "image/png", "image/webp"]);
@@ -72,15 +63,7 @@ function createUploadHandlers(options = {}) {
   const allowedSharedExtensions = new Set([".png", ".mp4", ".webm", ".mov"]);
 
   const avatarUpload = multer({
-    storage: multer.diskStorage({
-      destination: usersDir,
-      filename(req, file, cb) {
-        const username = String(req.session?.user?.username || "user").replace(/[^\w-]/g, "");
-        const ext = path.extname(file.originalname || "").toLowerCase() || ".png";
-        const safeExt = allowedAvatarExtensions.has(ext) ? ext : ".png";
-        cb(null, `${username}${safeExt}`);
-      },
-    }),
+    storage: multer.memoryStorage(),
     fileFilter(_req, file, cb) {
       if (allowedAvatarMimeTypes.has(file.mimetype)) {
         cb(null, true);
@@ -94,16 +77,7 @@ function createUploadHandlers(options = {}) {
   });
 
   const receiptUpload = multer({
-    storage: multer.diskStorage({
-      destination: receiptsDir,
-      filename(req, file, cb) {
-        const username = String(req.session?.user?.username || "user").replace(/[^\w-]/g, "").slice(0, 40) || "user";
-        const ext = path.extname(file.originalname || "").toLowerCase() || ".bin";
-        const safeExt = allowedReceiptExtensions.has(ext) ? ext : ".bin";
-        const suffix = `${Date.now()}-${crypto.randomBytes(6).toString("hex")}`;
-        cb(null, `${username}-${suffix}${safeExt}`);
-      },
-    }),
+    storage: multer.memoryStorage(),
     fileFilter(_req, file, cb) {
       if (allowedReceiptMimeTypes.has(file.mimetype)) {
         cb(null, true);
@@ -117,16 +91,7 @@ function createUploadHandlers(options = {}) {
   });
 
   const statementUpload = multer({
-    storage: multer.diskStorage({
-      destination: statementsDir,
-      filename(req, file, cb) {
-        const teacher = String(req.session?.user?.username || "teacher").replace(/[^\w-]/g, "").slice(0, 40) || "teacher";
-        const ext = path.extname(file.originalname || "").toLowerCase() || ".csv";
-        const safeExt = allowedStatementExtensions.has(ext) ? ext : ".csv";
-        const suffix = `${Date.now()}-${crypto.randomBytes(6).toString("hex")}`;
-        cb(null, `${teacher}-${suffix}${safeExt}`);
-      },
-    }),
+    storage: multer.memoryStorage(),
     fileFilter(_req, file, cb) {
       const ext = path.extname(file.originalname || "").toLowerCase();
       if (allowedStatementMimeTypes.has(file.mimetype) || allowedStatementExtensions.has(ext)) {
@@ -145,16 +110,7 @@ function createUploadHandlers(options = {}) {
   });
 
   const handoutUpload = multer({
-    storage: multer.diskStorage({
-      destination: handoutsFilesDir,
-      filename(req, file, cb) {
-        const teacher = String(req.session?.user?.username || "teacher").replace(/[^\w-]/g, "").slice(0, 40) || "teacher";
-        const ext = path.extname(file.originalname || "").toLowerCase() || ".bin";
-        const safeExt = allowedHandoutExtensions.has(ext) ? ext : ".bin";
-        const suffix = `${Date.now()}-${crypto.randomBytes(6).toString("hex")}`;
-        cb(null, `${teacher}-${suffix}${safeExt}`);
-      },
-    }),
+    storage: multer.memoryStorage(),
     fileFilter(_req, file, cb) {
       const ext = path.extname(file.originalname || "").toLowerCase();
       if (allowedHandoutMimeTypes.has(file.mimetype) || allowedHandoutExtensions.has(ext)) {
@@ -169,16 +125,7 @@ function createUploadHandlers(options = {}) {
   });
 
   const sharedFileUpload = multer({
-    storage: multer.diskStorage({
-      destination: sharedFilesUploadDir,
-      filename(req, file, cb) {
-        const teacher = String(req.session?.user?.username || "teacher").replace(/[^\w-]/g, "").slice(0, 40) || "teacher";
-        const ext = path.extname(file.originalname || "").toLowerCase() || ".bin";
-        const safeExt = allowedSharedExtensions.has(ext) ? ext : ".bin";
-        const suffix = `${Date.now()}-${crypto.randomBytes(6).toString("hex")}`;
-        cb(null, `${teacher}-${suffix}${safeExt}`);
-      },
-    }),
+    storage: multer.memoryStorage(),
     fileFilter(_req, file, cb) {
       const ext = path.extname(file.originalname || "").toLowerCase();
       if (allowedSharedMimeTypes.has(file.mimetype) || allowedSharedExtensions.has(ext)) {

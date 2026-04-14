@@ -1,6 +1,5 @@
 function registerSharedFileRoutes(app, deps) {
   const {
-    fs,
     all,
     run,
     parseReactionDetails,
@@ -17,6 +16,7 @@ function registerSharedFileRoutes(app, deps) {
     getSessionUserDepartment,
     departmentScopeMatchesStudent,
     resolveContentTargetDepartment,
+    storeUploadedContentFile,
   } = deps;
 
   app.get("/api/shared-files", requireAuth, async (req, res) => {
@@ -116,30 +116,30 @@ function registerSharedFileRoutes(app, deps) {
       const title = String(req.body.title || "").trim();
       const description = String(req.body.description || "").trim();
       if (!title || !description) {
-        if (req.file?.path) {
-          fs.unlink(req.file.path, () => {});
-        }
         return res.status(400).json({ error: "Title and description are required." });
       }
       if (title.length > 120 || description.length > 2000) {
-        if (req.file?.path) {
-          fs.unlink(req.file.path, () => {});
-        }
         return res.status(400).json({ error: "Shared file field length is invalid." });
       }
       if (!req.file) {
         return res.status(400).json({ error: "Please select a shared file to upload." });
       }
 
-      const relativeUrl = `/content-files/shared/${req.file.filename}`;
       try {
         const targetDepartment = await resolveContentTargetDepartment(req, req.body?.targetDepartment || "");
+        const uploaded = await storeUploadedContentFile({
+          req,
+          category: "shared",
+          actorUsername: req.session.user.username,
+          actorRole: req.session.user.role,
+          file: req.file,
+        });
         const result = await run(
           `
             INSERT INTO shared_files (title, description, file_url, target_department, created_by)
             VALUES (?, ?, ?, ?, ?)
           `,
-          [title, description, relativeUrl, targetDepartment, req.session.user.username]
+          [title, description, uploaded.legacyUrl, targetDepartment, req.session.user.username]
         );
         await logAuditEvent(
           req,
@@ -155,9 +155,6 @@ function registerSharedFileRoutes(app, deps) {
         });
         return res.status(201).json({ ok: true });
       } catch (innerErr) {
-        if (req.file?.path) {
-          fs.unlink(req.file.path, () => {});
-        }
         if (innerErr && innerErr.status && innerErr.error) {
           return res.status(innerErr.status).json({ error: innerErr.error });
         }
@@ -243,7 +240,7 @@ function registerSharedFileRoutes(app, deps) {
 
       await run("DELETE FROM shared_file_reactions WHERE shared_file_id = ?", [id]);
       await run("DELETE FROM shared_files WHERE id = ?", [id]);
-      removeStoredContentFile(access.row.file_url);
+      await Promise.resolve(removeStoredContentFile(access.row.file_url));
       await logAuditEvent(
         req,
         "delete",

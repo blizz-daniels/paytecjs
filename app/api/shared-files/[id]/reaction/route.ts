@@ -1,0 +1,38 @@
+import { NextResponse } from "next/server";
+
+import { getApiContext } from "@/lib/server/next/api-context";
+import { jsonError, toServiceErrorResponse } from "@/lib/server/next/handler-utils";
+
+type RouteParams = {
+  params: Promise<{ id: string }>;
+};
+
+export async function POST(request: Request, context: RouteParams) {
+  const ctx = await getApiContext();
+  const auth = await ctx.requireSession(request);
+  if (auth.error) {
+    return NextResponse.json(auth.error.body, { status: auth.error.status });
+  }
+
+  const { id: rawId } = await context.params;
+  const id = ctx.parseResourceId(rawId);
+  if (!id) {
+    return jsonError(400, "Invalid shared file ID.");
+  }
+
+  const body = await request.json().catch(() => ({}));
+  try {
+    const actorRole = String(auth.payload.session.role || "").trim().toLowerCase();
+    const payload = await ctx.sharedFileService.saveReaction({
+      id,
+      actorUsername: auth.payload.session.username,
+      actorRole,
+      actorDepartment: actorRole === "student" ? await ctx.getSessionUserDepartment(auth.payload) : "",
+      reaction: body?.reaction,
+      allowedReactions: ctx.allowedNotificationReactions,
+    });
+    return NextResponse.json(payload);
+  } catch (err) {
+    return toServiceErrorResponse(err, "Could not save reaction.");
+  }
+}

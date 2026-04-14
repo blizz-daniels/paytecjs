@@ -44,7 +44,11 @@ const { createAdminImportService } = require("../lib/server/admin");
 const { createPayoutDomain } = require("../lib/server/payouts");
 const { createPaymentDomain } = require("../lib/server/payments");
 const { createReceiptService } = require("../lib/server/receipts");
-const { createContentAccessService } = require("../lib/server/storage");
+const {
+  createContentAccessService,
+  createObjectStorageService,
+  createFileMetadataService,
+} = require("../lib/server/storage");
 let xlsx = null;
 try {
   xlsx = require("xlsx");
@@ -111,7 +115,7 @@ const {
   resolveStoredContentPath,
   isPathInsideDirectory,
   isLikelyLegacyPlainReceipt,
-  removeStoredContentFile,
+  removeStoredContentFile: removeStoredContentFileLegacy,
   isValidLocalContentUrl,
   parseReactionDetails,
 } = createContentStorage({
@@ -470,6 +474,175 @@ function all(sql, params = []) {
   return databaseClient.all(sql, params);
 }
 
+const objectStorage = createObjectStorageService({
+  fs,
+  crypto,
+  fetchImpl: typeof global.fetch === "function" ? global.fetch.bind(global) : undefined,
+  isProduction,
+  dataDir,
+});
+
+const fileMetadataService = createFileMetadataService({
+  get,
+  run,
+  all,
+});
+
+function sanitizeStorageSegment(value, fallback = "file") {
+  const cleaned = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^\w.-]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return cleaned || fallback;
+}
+
+function toLegacyFileToken(originalName = "", fallbackPrefix = "file") {
+  const ext = path.extname(String(originalName || "")).toLowerCase().slice(0, 12);
+  const stem = path.basename(String(originalName || ""), path.extname(String(originalName || "")));
+  const safeStem = sanitizeStorageSegment(stem, fallbackPrefix).slice(0, 48);
+  const nonce = `${Date.now()}-${crypto.randomBytes(3).toString("hex")}`;
+  return `${safeStem}-${nonce}${ext || ""}`;
+}
+
+function normalizeStoredContentCategory(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (!normalized) {
+    throw new Error("Storage category is required.");
+  }
+  if (!["avatars", "handouts", "shared", "statements", "approved_receipts", "exports"].includes(normalized)) {
+    throw new Error(`Unsupported storage category: ${normalized}`);
+  }
+  return normalized;
+}
+
+function buildLegacyUrlForCategory(category, token) {
+  const safeToken = sanitizeStorageSegment(token, "file");
+  if (category === "avatars") {
+    return `/users/${safeToken}`;
+  }
+  if (category === "handouts" || category === "shared") {
+    return `/content-files/${category}/${safeToken}`;
+  }
+  return `/files/${category}/${safeToken}`;
+}
+
+async function storeUploadedContentFile(input = {}) {
+  const category = normalizeStoredContentCategory(input.category);
+  const actorUsername = normalizeIdentifier(input.actorUsername || "");
+  const actorRole = String(input.actorRole || "").trim().toLowerCase() || "teacher";
+  const file = input.file;
+  if (!file || !Buffer.isBuffer(file.buffer) || !file.buffer.length) {
+    throw new Error("Uploaded file buffer is required.");
+  }
+  const contentType = String(file.mimetype || "application/octet-stream").trim() || "application/octet-stream";
+  const originalFilename = String(file.originalname || "").trim() || "upload.bin";
+  const token = toLegacyFileToken(originalFilename, category);
+  const legacyUrl = buildLegacyUrlForCategory(category, token);
+  const bucketKeyByCategory = {
+    avatars: "avatars",
+    handouts: "handouts",
+    shared: "shared",
+    statements: "statements",
+    approved_receipts: "approvedReceipts",
+    exports: "exports",
+  };
+  const bucketKey = bucketKeyByCategory[category] || category;
+  const objectPrefix = `${category}/${sanitizeStorageSegment(actorUsername || "system", "system")}`;
+  const objectPath = objectStorage.buildObjectPath(objectPrefix, `${token}`);
+  const uploaded = await objectStorage.uploadBuffer({
+    bucketKey,
+    objectPath,
+    contentType,
+    buffer: file.buffer,
+    upsert: true,
+  });
+  await fileMetadataService.upsertFileRecord({
+    legacyUrl,
+    provider: uploaded.provider,
+    bucket: uploaded.bucket,
+    objectPath: uploaded.objectPath,
+    objectRef: uploaded.objectRef,
+    category,
+    ownerUsername: actorUsername || null,
+    ownerRole: actorRole || null,
+    accessScope: category === "avatars" ? "authenticated" : "department_scoped",
+    contentType,
+    byteSize: Number(file.size || uploaded.size || file.buffer.length),
+    originalFilename,
+  });
+  return {
+    ...uploaded,
+    category,
+    legacyUrl,
+  };
+}
+
+async function resolveStoredFileByLegacyUrl(legacyUrl) {
+  const normalizedLegacyUrl = String(legacyUrl || "").trim();
+  if (!normalizedLegacyUrl) {
+    return null;
+  }
+  const record = await fileMetadataService.getFileRecordByLegacyUrl(normalizedLegacyUrl);
+  if (!record) {
+    return null;
+  }
+  const downloaded = await objectStorage.downloadObject({
+    bucket: record.bucket,
+    objectPath: record.object_path,
+  });
+  return {
+    record,
+    ...downloaded,
+  };
+}
+
+async function removeStoredContentFile(legacyUrl) {
+  const normalizedLegacyUrl = String(legacyUrl || "").trim();
+  if (!normalizedLegacyUrl) {
+    return;
+  }
+  const record = await fileMetadataService.getFileRecordByLegacyUrl(normalizedLegacyUrl);
+  if (!record) {
+    removeStoredContentFileLegacy(normalizedLegacyUrl);
+    return;
+  }
+  await objectStorage.removeObject({
+    bucket: record.bucket,
+    objectPath: record.object_path,
+  });
+  await fileMetadataService.softDeleteByLegacyUrl(normalizedLegacyUrl);
+}
+
+async function resolveProfileImageBytesForGenerator(row = {}) {
+  const profileImageUrl = String(row.profile_image_url || "").trim();
+  if (!profileImageUrl || /^https?:\/\//i.test(profileImageUrl) || /^data:/i.test(profileImageUrl)) {
+    return null;
+  }
+  const stored = await resolveStoredFileByLegacyUrl(profileImageUrl).catch(() => null);
+  if (stored && Buffer.isBuffer(stored.buffer) && stored.buffer.length) {
+    return {
+      bytes: stored.buffer,
+      mime: String(stored.contentType || "application/octet-stream"),
+    };
+  }
+  const normalized = profileImageUrl.replace(/\\/g, "/");
+  if (!normalized.startsWith("/users/")) {
+    return null;
+  }
+  const localPath = path.resolve(usersDir, path.basename(normalized));
+  const bytes = await fs.promises.readFile(localPath).catch(() => null);
+  if (!Buffer.isBuffer(bytes) || !bytes.length) {
+    return null;
+  }
+  return {
+    bytes,
+    mime: "image/png",
+  };
+}
+
 async function runMigrationSql(sql, params = []) {
   try {
     return await run(sql, params);
@@ -723,6 +896,9 @@ const receiptService = createReceiptService({
   getReminderMetadata,
   isPathInsideDirectory,
   isLikelyLegacyPlainReceipt,
+  objectStorage,
+  fileMetadataService,
+  resolveProfileImageBytes: resolveProfileImageBytesForGenerator,
   logger: console,
 });
 
@@ -2263,6 +2439,29 @@ async function initDatabase() {
   `);
 
   await run(`
+    CREATE TABLE IF NOT EXISTS stored_files (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      legacy_url TEXT NOT NULL UNIQUE,
+      storage_provider TEXT NOT NULL DEFAULT 'supabase',
+      bucket TEXT NOT NULL,
+      object_path TEXT NOT NULL,
+      object_ref TEXT,
+      category TEXT NOT NULL DEFAULT 'generic',
+      owner_username TEXT,
+      owner_role TEXT,
+      access_scope TEXT NOT NULL DEFAULT 'authenticated',
+      content_type TEXT,
+      byte_size INTEGER NOT NULL DEFAULT 0,
+      original_filename TEXT,
+      linked_table TEXT,
+      linked_id INTEGER,
+      deleted_at TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  await run(`
     CREATE TABLE IF NOT EXISTS payment_obligations (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       payment_item_id INTEGER NOT NULL,
@@ -2463,6 +2662,10 @@ async function initDatabase() {
   await runMigrationSql(
     "CREATE INDEX IF NOT EXISTS idx_approved_receipt_dispatches_receipt ON approved_receipt_dispatches(payment_receipt_id)"
   );
+  await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_stored_files_category ON stored_files(category)");
+  await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_stored_files_owner ON stored_files(owner_username)");
+  await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_stored_files_access ON stored_files(access_scope)");
+  await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_stored_files_linked ON stored_files(linked_table, linked_id)");
   await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_payment_obligations_student ON payment_obligations(student_username)");
   await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_payment_obligations_item ON payment_obligations(payment_item_id)");
   await runMigrationSql("CREATE INDEX IF NOT EXISTS idx_payment_obligations_status ON payment_obligations(status)");
@@ -2823,13 +3026,59 @@ app.get("/api/csrf-token", (req, res) => {
 app.use(requireCsrf);
 
 app.use("/assets", express.static(path.join(PROJECT_ROOT, "assets")));
-app.use("/users", express.static(usersDir));
 
-app.get("/content-files/:folder/:filename", requireAuth, (req, res) => {
+app.get("/users/:filename", requireAuth, async (req, res) => {
+  const filename = path.basename(String(req.params.filename || ""));
+  if (!filename) {
+    return res.status(400).json({ error: "Invalid file path." });
+  }
+  const legacyUrl = `/users/${filename}`;
+  try {
+    const stored = await resolveStoredFileByLegacyUrl(legacyUrl);
+    if (stored && Buffer.isBuffer(stored.buffer)) {
+      res.type(String(stored.contentType || "application/octet-stream"));
+      res.setHeader("Cache-Control", "private, max-age=300");
+      return res.send(stored.buffer);
+    }
+  } catch (_err) {
+    // fall through to legacy local fallback
+  }
+  const legacyLocalPath = path.resolve(usersDir, filename);
+  if (!fs.existsSync(legacyLocalPath)) {
+    return res.status(404).json({ error: "File not found." });
+  }
+  return res.sendFile(legacyLocalPath);
+});
+
+app.get("/content-files/:folder/:filename", requireAuth, async (req, res) => {
   const folder = String(req.params.folder || "").toLowerCase();
   const filename = path.basename(String(req.params.filename || ""));
   if (!folder || !filename || !["handouts", "shared"].includes(folder)) {
     return res.status(400).json({ error: "Invalid file path." });
+  }
+  const legacyUrl = `/content-files/${folder}/${filename}`;
+  if (req.session?.user?.role === "student") {
+    const contentRow =
+      folder === "handouts"
+        ? await get("SELECT target_department FROM handouts WHERE file_url = ? LIMIT 1", [legacyUrl])
+        : await get("SELECT target_department FROM shared_files WHERE file_url = ? LIMIT 1", [legacyUrl]);
+    if (!contentRow) {
+      return res.status(404).json({ error: "File not found." });
+    }
+    const studentDepartment = await getSessionUserDepartment(req);
+    if (!departmentScopeMatchesStudent(contentRow.target_department, studentDepartment)) {
+      return res.status(403).json({ error: "You do not have access to this file." });
+    }
+  }
+  try {
+    const stored = await resolveStoredFileByLegacyUrl(legacyUrl);
+    if (stored && Buffer.isBuffer(stored.buffer)) {
+      res.type(String(stored.contentType || "application/octet-stream"));
+      res.setHeader("Cache-Control", "private, max-age=300");
+      return res.send(stored.buffer);
+    }
+  } catch (_err) {
+    // fall through to legacy local fallback
   }
   const absolutePath = path.resolve(contentFilesDir, folder, filename);
   const relativeCheck = path.relative(contentFilesDir, absolutePath);
@@ -2994,18 +3243,7 @@ async function upsertApprovedReceiptFromTransaction(transactionId, options = {})
   }
 
   const paidAtIso = isValidIsoLikeDate(tx.paid_at) ? new Date(String(tx.paid_at)).toISOString() : new Date().toISOString();
-  const syntheticPath = path.join(receiptsDir, `auto-generated-transaction-${id}.txt`);
-  try {
-    if (!fs.existsSync(syntheticPath)) {
-      await fs.promises.writeFile(
-        syntheticPath,
-        `Auto-generated placeholder for approved transaction #${id}.\n`,
-        "utf8"
-      );
-    }
-  } catch (_err) {
-    // Keep going even if placeholder write fails.
-  }
+  const syntheticPath = `auto-generated://transaction/${id}`;
 
   const transactionRef = await resolveUniquePaymentReceiptReference(preferredRef, buildAutoReceiptRefBase({
     id,
@@ -6894,7 +7132,7 @@ async function syncPaymentMatchAndExceptionRecords(transactionId, req, decidedBy
   );
 
   if (status === "approved" && !options.skipApprovedReceiptGeneration) {
-    const receiptGeneration = await ensureApprovedReceiptGeneratedForTransaction(id, {
+    const receiptGeneration = await receiptService.ensureApprovedReceiptGeneratedForTransaction(id, {
       actorReq:
         req && req.session && req.session.user
           ? req
@@ -8052,10 +8290,16 @@ app.post("/api/profile/avatar", requireAuth, (req, res) => {
       return res.status(400).json({ error: "Please select an image to upload." });
     }
 
-    const relativeUrl = `/users/${req.file.filename}`;
     try {
-      await upsertProfileImage(req.session.user.username, relativeUrl);
-      return res.json({ ok: true, profileImageUrl: relativeUrl });
+      const uploaded = await storeUploadedContentFile({
+        req,
+        category: "avatars",
+        actorUsername: req.session.user.username,
+        actorRole: req.session.user.role,
+        file: req.file,
+      });
+      await upsertProfileImage(req.session.user.username, uploaded.legacyUrl);
+      return res.json({ ok: true, profileImageUrl: uploaded.legacyUrl });
     } catch (_imageErr) {
       return res.status(500).json({ error: "Could not save profile picture." });
     }
@@ -8112,7 +8356,6 @@ registerNotificationRoutes(app, {
 });
 
 registerHandoutRoutes(app, {
-  fs,
   parseResourceId,
   requireAuth,
   requireTeacher,
@@ -8120,6 +8363,7 @@ registerHandoutRoutes(app, {
   getSessionUserDepartment,
   resolveContentTargetDepartment,
   handoutService,
+  storeUploadedContentFile,
 });
 
 app.get("/admin", requireAdmin, (_req, res) => {
@@ -9768,7 +10012,7 @@ async function transitionPaymentReceiptStatus(req, res, nextStatus, actionName, 
     });
     let approvedReceiptDelivery = null;
     if (nextStatus === "approved" && options.triggerApprovedReceiptDispatch) {
-      approvedReceiptDelivery = await triggerApprovedReceiptDispatchForReceipt(id, {
+      approvedReceiptDelivery = await receiptService.triggerApprovedReceiptDispatchForReceipt(id, {
         actorUsername: req.session?.user?.username,
       });
       try {
@@ -9851,14 +10095,19 @@ app.get("/api/payment-receipts/:id/file", requireAuth, async (req, res) => {
     if (!wantsApprovedVariant) {
       return res.status(400).json({ error: "Invalid receipt variant." });
     }
-    const absolutePath = await receiptService.resolveApprovedReceiptFileAccess({
+    const fileAccess = await receiptService.resolveApprovedReceiptFileAccess({
       paymentReceiptId: req.params.id,
       actorUsername: req.session?.user?.username || "",
       isAdmin: req.session.user.role === "admin",
       isTeacher: req.session.user.role === "teacher",
       refreshRequested,
     });
-    return res.sendFile(absolutePath);
+    if (fileAccess.mode === "object_storage" && Buffer.isBuffer(fileAccess.buffer)) {
+      res.type(String(fileAccess.contentType || "application/pdf"));
+      res.setHeader("Content-Disposition", `inline; filename=\"${fileAccess.downloadName || `approved-receipt-${req.params.id}.pdf`}\"`);
+      return res.send(fileAccess.buffer);
+    }
+    return res.sendFile(fileAccess.absolutePath);
   } catch (_err) {
     if (_err && _err.status && _err.error) {
       return res.status(_err.status).json({ error: _err.error });
@@ -10351,7 +10600,6 @@ registerAdminImportRoutes(app, {
 });
 
 registerSharedFileRoutes(app, {
-  fs,
   all,
   run,
   parseReactionDetails,
@@ -10368,6 +10616,7 @@ registerSharedFileRoutes(app, {
   getSessionUserDepartment,
   departmentScopeMatchesStudent,
   resolveContentTargetDepartment,
+  storeUploadedContentFile,
 });
 
 registerPageRoutes(app, {
