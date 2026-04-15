@@ -22,6 +22,9 @@ export const metadata: Metadata = {
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="en">
+      <head>
+        <link rel="stylesheet" href="/assets/style.css" />
+      </head>
       <body>
         <Script src="/assets/csrf.js" strategy="afterInteractive" />
         {children}
