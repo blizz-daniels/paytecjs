@@ -8,6 +8,7 @@ This runbook prepares cutover of this repo to Vercel Hobby with Supabase Postgre
   - Next.js App Router shell pages for all requested UI families exist.
   - Native Next Route Handlers exist for auth/session, messages, notifications, handouts, shared files, Paystack webhook, and background job runner.
   - Durable DB-backed job queue exists (`background_jobs`) with idempotency support.
+  - Unsafe Next.js mutations (including legacy catch-all proxy requests) are CSRF-validated via `/api/csrf-token` + `X-CSRF-Token`/`_csrf`.
   - Production DB and storage runtime policy already enforces Supabase.
 - Not fully cut over yet:
   - Many business APIs still route through `app/api/[...legacy]/route.ts` to `LEGACY_APP_URL`.

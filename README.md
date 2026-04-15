@@ -49,7 +49,7 @@ The repository now includes a Next.js App Router skeleton alongside the existing
 - Legacy Express remains the source of truth for the current production pages and APIs.
 - Next.js currently owns the new `/login` and `/forgot-password` experience, plus role-group shell pages under `app/`.
 - The App Router pages are intentionally partial. They mirror the legacy layout and navigation, but they do not fully replace every page yet.
-- The Next.js API routes proxy auth requests back to the legacy backend during migration, so both stacks can stay in sync.
+- The Next.js API routes handle auth/session natively; non-migrated endpoints still pass through the legacy catch-all proxy during cutover.
 
 ### Local Run Order
 
@@ -84,7 +84,7 @@ If you want to build the Next.js shell for production testing:
 - Sessions are stored in database table `next_auth_sessions`.
 - Production requires Postgres for Next sessions (SQLite session storage is blocked in production).
 - Role is re-resolved from database on each authenticated request (`users` for admin, `auth_roster` for student/teacher).
-- CSRF is enforced for unsafe auth routes using a token endpoint plus header/hidden-field verification.
+- CSRF is enforced for unsafe Next.js route handlers (including the legacy catch-all proxy) using `/api/csrf-token` plus header/hidden-field verification.
 
 ## Database Runtime Policy (Phase 3)
 
@@ -351,7 +351,6 @@ See `.env.example`, including:
 - `PAYSTACK_SECRET_KEY`
 - `PAYSTACK_API_BASE_URL`
 - `PAYSTACK_WEBHOOK_SECRET`
-- `PAYSTACK_INTERNAL_VERIFY_SECRET`
 - `PAYOUT_ENCRYPTION_KEY`
 - `PAYOUT_DEFAULT_SHARE_BPS`
 - `PAYOUT_MINIMUM_AMOUNT`

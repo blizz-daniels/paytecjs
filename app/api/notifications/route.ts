@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 
 import { getApiContext } from "@/lib/server/next/api-context";
-import { jsonError, toServiceErrorResponse } from "@/lib/server/next/handler-utils";
+import { toServiceErrorResponse } from "@/lib/server/next/handler-utils";
 import { requireCsrfProtection } from "@/lib/server/next/csrf-protection";
 
 export async function GET(request: Request) {
