@@ -53,17 +53,22 @@ The repository now includes a Next.js App Router skeleton alongside the existing
 
 ### Local Run Order
 
-Use two terminals during migration:
+Use two terminals during migration when legacy-backed endpoints are needed:
 
 1. Start the legacy app on a separate port, for example:
-   - `PORT=3001 npm run start`
+   - `PORT=3001 npm run dev:legacy`
 2. Start the Next.js app and point it at the legacy backend:
    - `LEGACY_APP_URL=http://127.0.0.1:3001 npm run dev:next`
 
 If you want to build the Next.js shell for production testing:
 
-- `npm run build:next`
-- `npm run start:next`
+- `npm run build` (or `npm run build:next`)
+- `npm run start` (or `npm run start:next`)
+
+Legacy bridge note:
+
+- During current migration phase, non-migrated APIs still require `LEGACY_APP_URL`.
+- In production, missing `LEGACY_APP_URL` now fails fast for legacy-proxied endpoints and legacy-backed background jobs.
 
 ### Next.js Scope In This Phase
 

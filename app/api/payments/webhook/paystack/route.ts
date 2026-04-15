@@ -40,6 +40,17 @@ function buildIdempotencyKey(eventType: string, payload: any, rawBody: string) {
 }
 
 export async function POST(request: Request) {
+  const legacyBridgeUrl = String(process.env.LEGACY_APP_URL || "").trim();
+  if (!legacyBridgeUrl) {
+    return NextResponse.json(
+      {
+        error:
+          "LEGACY_APP_URL is required to process Paystack webhooks in the current migration phase. Configure it before enabling this endpoint.",
+        code: "paystack_webhook_legacy_bridge_missing",
+      },
+      { status: 503 }
+    );
+  }
   const rawBody = await request.text();
   const signature = String(request.headers.get("x-paystack-signature") || "").trim().toLowerCase();
   try {

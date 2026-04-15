@@ -1,7 +1,11 @@
-const DEFAULT_LEGACY_APP_URL = "http://127.0.0.1:3001";
-
 function getLegacyBaseUrl() {
-  return String(process.env.LEGACY_APP_URL || DEFAULT_LEGACY_APP_URL).replace(/\/$/, "");
+  const baseUrl = String(process.env.LEGACY_APP_URL || "")
+    .trim()
+    .replace(/\/$/, "");
+  if (!baseUrl) {
+    throw new Error("LEGACY_APP_URL is required for legacy-proxied endpoints.");
+  }
+  return baseUrl;
 }
 
 function getLegacyUrl(pathname: string) {
