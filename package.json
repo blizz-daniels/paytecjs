@@ -16,7 +16,7 @@
     "migrate:sqlite-to-postgres": "node scripts/migrate-sqlite-to-postgres.js"
   },
   "engines": {
-    "node": ">=20.9"
+    "node": "20.x"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
