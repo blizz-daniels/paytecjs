@@ -12,8 +12,8 @@ export const metadata: Metadata = {
   },
 };
 
-export default function ForgotPasswordPage() {
-  redirectAuthenticatedToRoleHome();
+export default async function ForgotPasswordPage() {
+  await redirectAuthenticatedToRoleHome();
   return (
     <AuthShell
       title="Reset Password"

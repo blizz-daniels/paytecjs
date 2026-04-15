@@ -13,8 +13,8 @@ export const metadata: Metadata = {
   },
 };
 
-export default function LoginPage() {
-  redirectAuthenticatedToRoleHome();
+export default async function LoginPage() {
+  await redirectAuthenticatedToRoleHome();
   return (
     <AuthShell
       title="Portal Login"

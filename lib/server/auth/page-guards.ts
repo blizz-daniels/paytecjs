@@ -3,8 +3,8 @@ import { redirect } from "next/navigation";
 
 import { loadAuthSession } from "@/lib/server/auth/next-auth";
 
-function toCookieHeader() {
-  const cookieStore = cookies();
+async function toCookieHeader() {
+  const cookieStore = await cookies();
   return cookieStore
     .getAll()
     .map((cookie) => `${cookie.name}=${cookie.value}`)
@@ -12,7 +12,7 @@ function toCookieHeader() {
 }
 
 async function readSession() {
-  const cookieHeader = toCookieHeader();
+  const cookieHeader = await toCookieHeader();
   const requestLike = {
     headers: {
       get(name: string) {

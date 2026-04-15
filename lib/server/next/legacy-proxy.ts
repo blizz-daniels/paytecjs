@@ -187,3 +187,21 @@ export async function proxyLegacyGetRequest(request: Request, pathname: string) 
   });
   return mirrorLegacyResponse(request, legacyResponse);
 }
+
+export async function proxyLegacyAnyRequest(request: Request, pathname: string) {
+  const method = String(request.method || "GET").toUpperCase();
+  const isSafeMethod = method === "GET" || method === "HEAD" || method === "OPTIONS";
+  const contentType = String(request.headers.get("content-type") || "").trim();
+  let body: BodyInit | null = null;
+  if (!isSafeMethod) {
+    body = await request.text();
+  }
+  const legacyResponse = await proxyLegacyRequest({
+    pathname,
+    request,
+    body,
+    contentType: contentType || undefined,
+    useCsrf: !isSafeMethod,
+  });
+  return mirrorLegacyResponse(request, legacyResponse);
+}
