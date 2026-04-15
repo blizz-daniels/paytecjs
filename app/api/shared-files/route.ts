@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 
 import { getApiContext } from "@/lib/server/next/api-context";
+import { requireCsrfProtection } from "@/lib/server/next/csrf-protection";
 import { jsonError, toServiceErrorResponse } from "@/lib/server/next/handler-utils";
 import { validateUploadFile } from "@/lib/server/next/upload-rules";
 
@@ -39,6 +40,12 @@ export async function POST(request: Request) {
     form = await request.formData();
   } catch (_err) {
     return jsonError(400, "Could not process shared file upload.");
+  }
+  const csrfError = await requireCsrfProtection(request, {
+    _csrf: String(form.get("_csrf") || "").trim(),
+  });
+  if (csrfError) {
+    return csrfError;
   }
 
   const title = String(form.get("title") || "").trim();

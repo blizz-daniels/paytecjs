@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 
 import { getApiContext } from "@/lib/server/next/api-context";
 import { jsonError, toServiceErrorResponse } from "@/lib/server/next/handler-utils";
+import { requireCsrfProtection } from "@/lib/server/next/csrf-protection";
 
 export async function GET(request: Request) {
   const ctx = await getApiContext();
@@ -32,6 +33,10 @@ export async function POST(request: Request) {
   }
 
   const body = await request.json().catch(() => ({}));
+  const csrfError = await requireCsrfProtection(request, body);
+  if (csrfError) {
+    return csrfError;
+  }
   try {
     const targetDepartment = await ctx.resolveContentTargetDepartment(auth.payload, body?.targetDepartment || "");
     const payload = await ctx.notificationService.createNotification({

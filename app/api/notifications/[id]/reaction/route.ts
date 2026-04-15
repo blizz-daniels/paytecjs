@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 
 import { getApiContext } from "@/lib/server/next/api-context";
+import { requireCsrfProtection } from "@/lib/server/next/csrf-protection";
 import { jsonError, toServiceErrorResponse } from "@/lib/server/next/handler-utils";
 
 type RouteParams = {
@@ -20,6 +21,10 @@ export async function POST(request: Request, context: RouteParams) {
     return jsonError(400, "Invalid notification ID.");
   }
   const body = await request.json().catch(() => ({}));
+  const csrfError = await requireCsrfProtection(request, body);
+  if (csrfError) {
+    return csrfError;
+  }
   try {
     const actorRole = String(auth.payload.session.role || "").trim().toLowerCase();
     const actorDepartment = actorRole === "student" ? await ctx.getSessionUserDepartment(auth.payload) : "";

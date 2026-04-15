@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 
 import { getApiContext } from "@/lib/server/next/api-context";
+import { requireCsrfProtection } from "@/lib/server/next/csrf-protection";
 import { jsonError, toServiceErrorResponse } from "@/lib/server/next/handler-utils";
 
 type RouteParams = {
@@ -12,6 +13,10 @@ export async function POST(request: Request, context: RouteParams) {
   const auth = await ctx.requireSession(request);
   if (auth.error) {
     return NextResponse.json(auth.error.body, { status: auth.error.status });
+  }
+  const csrfError = await requireCsrfProtection(request);
+  if (csrfError) {
+    return csrfError;
   }
 
   const { id: rawId } = await context.params;
