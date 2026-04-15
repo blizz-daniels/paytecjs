@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 
 import { AuthShell } from "@/components/auth-shell";
 import { LoginPageClient } from "@/components/login-page-client";
+import { redirectAuthenticatedToRoleHome } from "@/lib/server/auth/page-guards";
 
 export const metadata: Metadata = {
   title: "Portal Login",
@@ -13,6 +14,7 @@ export const metadata: Metadata = {
 };
 
 export default function LoginPage() {
+  redirectAuthenticatedToRoleHome();
   return (
     <AuthShell
       title="Portal Login"

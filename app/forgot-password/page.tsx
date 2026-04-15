@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 
 import { AuthShell } from "@/components/auth-shell";
 import { ForgotPasswordClient } from "@/components/forgot-password-client";
+import { redirectAuthenticatedToRoleHome } from "@/lib/server/auth/page-guards";
 
 export const metadata: Metadata = {
   title: "Reset Password",
@@ -12,6 +13,7 @@ export const metadata: Metadata = {
 };
 
 export default function ForgotPasswordPage() {
+  redirectAuthenticatedToRoleHome();
   return (
     <AuthShell
       title="Reset Password"
