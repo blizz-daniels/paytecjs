@@ -237,7 +237,12 @@ const PAYOUT_MINIMUM_AMOUNT = (() => {
   const value = Number.parseFloat(String(process.env.PAYOUT_MINIMUM_AMOUNT || "1000"));
   return Number.isFinite(value) && value >= 0 ? value : 1000;
 })();
+const JOB_RUNNER_SECRET = String(process.env.JOB_RUNNER_SECRET || "").trim();
+const ENABLE_INTERVAL_WORKERS = parseBooleanEnv(process.env.ENABLE_INTERVAL_WORKERS, false);
 const PAYOUT_WORKER_INTERVAL_MS = (() => {
+  if (!isTestEnvironment && !ENABLE_INTERVAL_WORKERS) {
+    return 0;
+  }
   const defaultValue = isTestEnvironment ? 0 : 60000;
   const value = Number.parseInt(String(process.env.PAYOUT_WORKER_INTERVAL_MS || String(defaultValue)), 10);
   return Number.isFinite(value) && value >= 10000 ? value : defaultValue;
@@ -1370,6 +1375,23 @@ function isTrustedPaystackInternalVerifyRequest(req) {
   return isSameToken(configuredSecret, providedSecret);
 }
 
+function isTrustedInternalJobRequest(req) {
+  const configuredSecret = String(
+    JOB_RUNNER_SECRET || process.env.CRON_SECRET || GATEWAY_WEBHOOK_SECRET || PAYSTACK_WEBHOOK_SECRET || ""
+  ).trim();
+  const providedSecret = String(
+    req.get("x-job-runner-secret") ||
+      req.get("x-paytec-webhook-secret") ||
+      req.get("x-webhook-secret") ||
+      req.get("authorization")?.replace(/^Bearer\s+/i, "") ||
+      ""
+  ).trim();
+  if (!configuredSecret || !providedSecret) {
+    return false;
+  }
+  return isSameToken(configuredSecret, providedSecret);
+}
+
 function rejectCsrf(req, res) {
   if (req.accepts("json")) {
     return res.status(403).json({ error: "Invalid CSRF token." });
@@ -1385,6 +1407,9 @@ function requireCsrf(req, res, next) {
     return next();
   }
   if (req.path === "/api/payments/paystack/verify" && isTrustedPaystackInternalVerifyRequest(req)) {
+    return next();
+  }
+  if (req.path.startsWith("/api/internal/ops/") && isTrustedInternalJobRequest(req)) {
     return next();
   }
   const expectedToken = req.session ? req.session.csrfToken : "";
@@ -9468,6 +9493,42 @@ app.post("/api/admin/lecturer/payout-transfers/:id/retry", requireAdmin, async (
       error: "Could not retry payout transfer.",
       code: "payout_transfer_retry_failed",
     });
+  }
+});
+
+app.post("/api/internal/ops/payout-queue/run", async (req, res) => {
+  if (!isTrustedInternalJobRequest(req)) {
+    return res.status(401).json({ error: "Unauthorized job runner request." });
+  }
+  try {
+    const result = await processLecturerPayoutQueue({
+      req: createSystemActorRequest("system-payout", "system-payout"),
+      triggerSource: String(req.body?.triggerSource || "internal_job").trim().slice(0, 80) || "internal_job",
+      requestedBy: "system-payout",
+    });
+    return res.json({ ok: true, result });
+  } catch (_err) {
+    return res.status(500).json({ error: "Could not run payout queue." });
+  }
+});
+
+app.post("/api/internal/ops/receipt-dispatch/:id/run", async (req, res) => {
+  if (!isTrustedInternalJobRequest(req)) {
+    return res.status(401).json({ error: "Unauthorized job runner request." });
+  }
+  const receiptId = parseResourceId(req.params.id);
+  if (!receiptId) {
+    return res.status(400).json({ error: "Invalid payment receipt id." });
+  }
+  try {
+    const result = await receiptService.triggerApprovedReceiptDispatchForReceipt(receiptId, {
+      actorUsername: "system-receipts",
+      forceEnabled: parseBooleanEnv(req.body?.forceEnabled, false),
+      forceRegenerate: parseBooleanEnv(req.body?.forceRegenerate, false),
+    });
+    return res.json({ ok: true, receiptId, result });
+  } catch (_err) {
+    return res.status(500).json({ error: "Could not process approved receipt dispatch." });
   }
 });
 
