@@ -1,4 +1,3 @@
-const sqlite3 = require("sqlite3").verbose();
 const { AsyncLocalStorage } = require("async_hooks");
 
 const transactionStorage = new AsyncLocalStorage();
@@ -171,6 +170,16 @@ function buildPgTableExistsQuery(tableName) {
 }
 
 function createSqliteClient(dbPath) {
+  let sqlite3;
+  try {
+    sqlite3 = require("sqlite3").verbose();
+  } catch (err) {
+    if (err && err.code === "MODULE_NOT_FOUND") {
+      throw new Error('Missing dependency "sqlite3". Install it with: npm install sqlite3');
+    }
+    throw err;
+  }
+
   const db = new sqlite3.Database(dbPath);
   db.run("PRAGMA foreign_keys = ON");
 

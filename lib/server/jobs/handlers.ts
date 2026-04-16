@@ -3,6 +3,7 @@ import fs from "fs";
 import path from "path";
 
 import { generateApprovedStudentReceipts } from "@/services/approved-receipt-generator";
+import { normalizeNodeEnv, resolveWritableRuntimePath } from "@/lib/server/runtime/runtime-paths";
 
 type DbLike = {
   run: (sql: string, params?: any[]) => Promise<any>;
@@ -68,7 +69,13 @@ async function runApprovedReceiptDispatchJob(db: DbLike, payload: any) {
   if (!Number.isFinite(paymentReceiptId) || paymentReceiptId <= 0) {
     throw new Error("Missing valid paymentReceiptId for receipt dispatch job.");
   }
-  const outputDir = path.resolve(process.env.RECEIPT_OUTPUT_DIR || path.join(process.cwd(), "tmp", "receipts"));
+  const outputDir = resolveWritableRuntimePath({
+    configuredPath: process.env.RECEIPT_OUTPUT_DIR,
+    envName: "RECEIPT_OUTPUT_DIR",
+    nodeEnv: normalizeNodeEnv(process.env.NODE_ENV),
+    productionDefault: "/tmp/paytec/receipts",
+    developmentDefault: path.join(process.cwd(), "outputs", "receipts"),
+  });
   fs.mkdirSync(outputDir, { recursive: true });
   const summary = await generateApprovedStudentReceipts({
     db,
